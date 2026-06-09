@@ -480,6 +480,22 @@ function upsertIssues(issues: IpoCatalogIssue[]): void {
   tx(issues);
 }
 
+/**
+ * Purge cache rows whose close_date is more than 7 days in the past.
+ * Keeps the DB tidy so old closed IPOs never show up in the dropdown.
+ */
+function purgeStaleEntries(): void {
+  try {
+    getDb().exec(`
+      DELETE FROM ipo_master_cache
+      WHERE close_date IS NOT NULL
+        AND close_date < date('now', '-7 days')
+    `);
+  } catch {
+    // Best-effort — don't break anything if the cleanup fails.
+  }
+}
+
 export function listCachedIpoIssues(): IpoCatalogIssue[] {
   const db = getDb();
   return db.prepare(`
@@ -499,6 +515,7 @@ export function listCachedIpoIssues(): IpoCatalogIssue[] {
            fetched_at as fetchedAt
     FROM ipo_master_cache
     WHERE status IN ('LIVE', 'FORTHCOMING')
+      AND (close_date IS NULL OR close_date >= date('now', '-1 day'))
     ORDER BY
       CASE status WHEN 'LIVE' THEN 0 WHEN 'FORTHCOMING' THEN 1 ELSE 2 END,
       close_date,
@@ -517,6 +534,8 @@ export async function refreshIpoCatalog(): Promise<{ ok: true; issues: IpoCatalo
     }
     if (!issues.length) throw new Error('No IPO issues could be parsed from official sources');
     upsertIssues(issues);
+    // Remove old closed entries after upsert so the list stays current.
+    purgeStaleEntries();
     return { ok: true, issues: listCachedIpoIssues(), source };
   } catch (e: any) {
     return { ok: false, error: e?.message || String(e), issues: listCachedIpoIssues() };

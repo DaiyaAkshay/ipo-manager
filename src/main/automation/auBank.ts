@@ -2170,7 +2170,28 @@ async function continueAuIpoRedirect(page: Page): Promise<boolean> {
   return continueClicked;
 }
 
+/**
+ * Navigate from the AU Bank dashboard to the IPO Smart portal.
+ *
+ * AU Bank's website layout has changed over time. This function attempts
+ * multiple navigation paths in order:
+ *
+ *   Path A — new UI (as of 2025-2026 website update):
+ *     Dashboard → "Investments" / "Invest & Trade" / "Invest"
+ *               → "IPO / ASBA" / "Apply IPO" / "ASBA" / "IPO Application"
+ *               → Continue redirect → iposmart.au.bank.in
+ *
+ *   Path B — old UI fallback (still works on some account types):
+ *     Dashboard → "Services" / "e-Services" → "ASBA" / "IPO"
+ *               → Continue redirect
+ *
+ *   Path C — direct URL navigation to the IPO portal (last resort):
+ *     Navigate page to https://iposmart.au.bank.in/
+ *     The portal either loads directly or shows its own login gate
+ *     (handled by handleAuIpoPortalAuth later in the bid flow).
+ */
 async function openAuIpoArea(page: Page, warnings: string[]): Promise<Page | null> {
+  // ── Already on the IPO page? ────────────────────────────────────────────
   if (await isAuIpoPage(page)) {
     await page.bringToFront().catch(() => {});
     return page;
@@ -2182,74 +2203,148 @@ async function openAuIpoArea(page: Page, warnings: string[]): Promise<Page | nul
     return alreadyOpen;
   }
 
+  // ── Path A / B: navigate via the dashboard menu ─────────────────────────
+  // Step 1: Click the top-level investments / services section.
   const investmentClicked =
     await clickFirstVisible(page, [
+      // New AU UI labels (2025-2026 update)
       'a:has-text("Investments")',
       'button:has-text("Investments")',
       '[role="button"]:has-text("Investments")',
+      'a:has-text("Invest & Trade")',
+      'button:has-text("Invest & Trade")',
+      '[role="button"]:has-text("Invest & Trade")',
+      // Older UI labels
       'a:has-text("Investment")',
-      'button:has-text("Investment")'
-    ]) || await clickVisibleLabeledTile(page, ['Investments', 'Investment'])
-      || await clickFirstText(page, ['Investments', 'Investment']);
+      'button:has-text("Investment")',
+      // Services path (some account types)
+      'a:has-text("Services")',
+      'button:has-text("Services")',
+      '[role="button"]:has-text("Services")',
+      'a:has-text("e-Services")',
+      'button:has-text("e-Services")',
+    ]) || await clickVisibleLabeledTile(page, [
+      'Investments', 'Invest & Trade', 'Invest', 'Investment', 'Services', 'e-Services',
+    ]) || await clickFirstText(page, [
+      'Investments', 'Invest & Trade', 'Investment',
+    ]);
 
   if (!investmentClicked) {
-    console.warn('[AU Bank] Investments tile was not found on the dashboard.');
+    console.warn('[AU Bank] Investments/Services tile was not found on the dashboard.');
   }
 
-  if (investmentClicked) await page.waitForTimeout(1_200);
+  if (investmentClicked) await page.waitForTimeout(1_500);
 
+  // Check if clicking investments already opened the IPO page directly
   if (await isAuIpoPage(page)) {
     await page.bringToFront().catch(() => {});
     return page;
   }
+  const afterInvest = await findOpenAuIpoPage(page);
+  if (afterInvest) {
+    await afterInvest.bringToFront().catch(() => {});
+    return afterInvest;
+  }
 
+  // Step 2: Click the ASBA / IPO sub-menu item.
   const asbaClicked =
     await clickFirstVisible(page, [
+      // New AU UI — common labels after the 2025-2026 redesign
+      'a:has-text("IPO / ASBA")',
+      'button:has-text("IPO / ASBA")',
+      '[role="button"]:has-text("IPO / ASBA")',
+      'a:has-text("Apply IPO")',
+      'button:has-text("Apply IPO")',
+      '[role="button"]:has-text("Apply IPO")',
+      'a:has-text("IPO Application")',
+      'button:has-text("IPO Application")',
+      'a:has-text("ASBA Application")',
+      'button:has-text("ASBA Application")',
+      // Classic labels
       'a:has-text("ASBA")',
       'button:has-text("ASBA")',
       '[role="button"]:has-text("ASBA")',
       'a:has-text("IPO")',
       'button:has-text("IPO")',
-      '[role="button"]:has-text("IPO")'
-    ]) || await clickVisibleLabeledTile(page, ['IPO (ASBA)', 'ASBA', 'IPO', 'Initial Public Offering'])
-      || await clickFirstText(page, ['IPO (ASBA)', 'ASBA', 'IPO', 'Initial Public Offering']);
+      '[role="button"]:has-text("IPO")',
+    ]) || await clickVisibleLabeledTile(page, [
+      'IPO / ASBA', 'Apply IPO', 'IPO Application', 'ASBA Application',
+      'IPO (ASBA)', 'ASBA', 'IPO', 'Initial Public Offering',
+    ]) || await clickFirstText(page, [
+      'IPO / ASBA', 'Apply IPO', 'IPO Application', 'ASBA Application',
+      'IPO (ASBA)', 'ASBA',
+    ]);
 
-  if (!asbaClicked) {
-    warnings.push('AU IPO / ASBA tile was not found after opening Investments.');
-    return null;
-  }
+  if (asbaClicked) {
+    await page.waitForTimeout(1_200);
 
-  await page.waitForTimeout(1_000);
+    const openedPage = await clickForAuIpoPage(page, async () => {
+      if (await continueAuIpoRedirect(page)) return true;
+      return false;
+    });
 
-  const openedPage = await clickForAuIpoPage(page, async () => {
-    if (await continueAuIpoRedirect(page)) return true;
-    return false;
-  });
-
-  if (openedPage) {
-    if (await isAuIpoPage(openedPage)) {
-      await openedPage.bringToFront().catch(() => {});
-      console.log('[AU Bank] Opened AU IPO page via dashboard handoff:', openedPage.url());
-      return openedPage;
+    if (openedPage) {
+      if (await isAuIpoPage(openedPage)) {
+        await openedPage.bringToFront().catch(() => {});
+        console.log('[AU Bank] Opened AU IPO page via dashboard handoff:', openedPage.url());
+        return openedPage;
+      }
+      if (openedPage.url().includes('/error-view')) {
+        warnings.push('AU IPO Smart opened an error page. The dashboard handoff token may not have completed.');
+      }
     }
 
-    if (openedPage.url().includes('/error-view')) {
-      warnings.push('AU IPO Smart opened an error page. The dashboard handoff token may not have completed.');
+    if (await isAuIpoPage(page)) {
+      await page.bringToFront().catch(() => {});
+      return page;
     }
+    const maybeOpen = await findOpenAuIpoPage(page);
+    if (maybeOpen) {
+      await maybeOpen.bringToFront().catch(() => {});
+      return maybeOpen;
+    }
+  } else {
+    console.warn('[AU Bank] IPO/ASBA sub-menu was not found after opening Investments.');
   }
 
-  if (await isAuIpoPage(page)) {
-    await page.bringToFront().catch(() => {});
+  // ── Path C: direct URL navigation to the IPO portal ─────────────────────
+  // If both menu paths failed, navigate the current tab directly.
+  // The portal may open on the same tab or in a new popup.
+  console.warn('[AU Bank] Dashboard navigation failed — falling back to direct URL: https://iposmart.au.bank.in/');
+  appendAutomationLog('AU_IPO', 'Dashboard navigation failed; navigating directly to iposmart.au.bank.in.');
+
+  try {
+    const directPage = await clickForAuIpoPage(page, async () => {
+      await page.goto('https://iposmart.au.bank.in/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 20_000,
+      }).catch(() => {});
+      return true;
+    });
+
+    if (directPage && await isAuIpoPage(directPage)) {
+      await directPage.bringToFront().catch(() => {});
+      console.log('[AU Bank] Opened AU IPO page via direct URL navigation.');
+      return directPage;
+    }
+  } catch (e) {
+    console.warn('[AU Bank] Direct URL navigation error:', (e as Error).message);
+  }
+
+  // Check if current page is now the IPO portal (even if not yet showing the listing —
+  // handleAuIpoPortalAuth will handle the login gate on iposmart.au.bank.in)
+  const curUrl = page.url().toLowerCase();
+  if (curUrl.includes('iposmart.au.bank.in')) {
+    console.log('[AU Bank] Current page is iposmart.au.bank.in — passing to auth handler.');
     return page;
   }
-
-  const maybeOpen = await findOpenAuIpoPage(page);
-  if (maybeOpen) {
-    await maybeOpen.bringToFront().catch(() => {});
-    return maybeOpen;
+  const finalCheck = await findOpenAuIpoPage(page);
+  if (finalCheck) {
+    await finalCheck.bringToFront().catch(() => {});
+    return finalCheck;
   }
 
-  warnings.push('AU IPO / ASBA section could not be opened automatically from the dashboard. The AU session is open for manual navigation.');
+  warnings.push('AU IPO portal could not be opened automatically. Please navigate to iposmart.au.bank.in manually or use the Investments → IPO/ASBA menu.');
   return null;
 }
 

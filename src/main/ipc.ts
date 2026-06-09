@@ -52,14 +52,29 @@ import {
   autoSyncFromBackup,
 } from './backup/engine';
 
-let currentMasterPassword: string | null = null;
+// Store the master password as a Buffer so we can zero the bytes on lock,
+// preventing the string from lingering in V8's heap (JS strings are immutable
+// and can't be overwritten; a Buffer can). All callers use getMasterPassword()
+// which returns a temporary string copy — minimise the lifetime of that copy.
+let currentMasterPasswordBuf: Buffer | null = null;
 let currentMasterKey: Buffer | null = null;
 
+function getMasterPassword(): string | null {
+  return currentMasterPasswordBuf ? currentMasterPasswordBuf.toString('utf8') : null;
+}
+
+// ── Unlock rate-limiter ────────────────────────────────────────────────────
+// Exponential back-off after consecutive wrong-password attempts so brute-force
+// over IPC (e.g. via a malicious Electron renderer exploit) is expensive.
+// Resets fully on a successful unlock.
+let failedUnlockAttempts = 0;
+let unlockCooldownUntil = 0;
+
 export function clearVaultSessionSecrets(): void {
-  // Zero the master key buffer before nulling the reference so the bytes
-  // don't linger in V8's heap even if the GC delays.
+  // Zero the master key and password buffers before nulling the references so
+  // the bytes don't linger in V8's heap even if the GC delays.
   if (currentMasterKey) currentMasterKey.fill(0);
-  currentMasterPassword = null;
+  if (currentMasterPasswordBuf) { currentMasterPasswordBuf.fill(0); currentMasterPasswordBuf = null; }
   currentMasterKey = null;
   // Wipe the field-encryption key cached in field.ts. Without this, any IPC
   // handler that calls decryptField after lock would re-fetch from the OS
@@ -188,6 +203,17 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   }));
 
   ipc.handle('vault:unlock', async (_, password: string) => {
+    // ── Rate-limit check ──────────────────────────────────────────────────
+    const now = Date.now();
+    if (unlockCooldownUntil > now) {
+      const secs = Math.ceil((unlockCooldownUntil - now) / 1000);
+      return {
+        ok: false,
+        error: `Too many failed attempts. Please wait ${secs} second${secs === 1 ? '' : 's'} before trying again.`,
+        cooldownSeconds: secs,
+      };
+    }
+
     if (!vaultInitialized() && !dbExists()) {
       const issues = passwordStrengthIssues(password);
       if (issues.length) return { ok: false, issues };
@@ -195,8 +221,14 @@ export function registerIpcHandlers(ipc: IpcMain): void {
     try {
       const key = await deriveMasterKey(password);
       openDb(key);
-      currentMasterPassword = password;
+      // Store password as a Buffer so the bytes can be zeroed on lock.
+      if (currentMasterPasswordBuf) currentMasterPasswordBuf.fill(0);
+      currentMasterPasswordBuf = Buffer.from(password, 'utf8');
       currentMasterKey = Buffer.from(key);
+
+      // Successful unlock — reset rate-limiter.
+      failedUnlockAttempts = 0;
+      unlockCooldownUntil = 0;
 
       // Auto-sync: silently restore a newer snapshot if one exists in the
       // backup folder (e.g. PC1 backed up → shared cloud folder → PC2 unlocks).
@@ -224,7 +256,22 @@ export function registerIpcHandlers(ipc: IpcMain): void {
 
       return { ok: true };
     } catch (e: any) {
-      return { ok: false, error: e.message || String(e) };
+      // Wrong password — bump the failure counter and apply back-off.
+      if ((e as Error).message === 'INVALID_MASTER_PASSWORD') {
+        failedUnlockAttempts++;
+        if (failedUnlockAttempts >= 3) {
+          // 2s, 4s, 8s, 16s … capped at 5 minutes.
+          const delaySecs = Math.min(2 * Math.pow(2, failedUnlockAttempts - 3), 300);
+          unlockCooldownUntil = Date.now() + delaySecs * 1000;
+          return {
+            ok: false,
+            error: `Incorrect password (attempt ${failedUnlockAttempts}). Wait ${delaySecs}s before trying again.`,
+            cooldownSeconds: delaySecs,
+          };
+        }
+        return { ok: false, error: 'Incorrect master password.' };
+      }
+      return { ok: false, error: (e as Error).message || String(e) };
     }
   });
 
@@ -294,7 +341,8 @@ export function registerIpcHandlers(ipc: IpcMain): void {
 
       const newKey = await deriveMasterKey(newPassword);
       rekeyDb(newKey);
-      currentMasterPassword = newPassword;
+      if (currentMasterPasswordBuf) currentMasterPasswordBuf.fill(0);
+      currentMasterPasswordBuf = Buffer.from(newPassword, 'utf8');
       currentMasterKey = Buffer.from(newKey);
       return { ok: true };
     } catch (e: any) {
@@ -476,9 +524,13 @@ export function registerIpcHandlers(ipc: IpcMain): void {
 
   ipc.handle('members:byFamily', async (_, familyId: number) => {
     const db = getDb();
+    // Only fetch last-4 suffixes here — do NOT decrypt full PAN/Aadhaar in the
+    // list view. Full values are loaded on-demand via member:fullDetail when the
+    // user opens the detail modal. This avoids decrypting credentials for every
+    // member just to paint the family list.
     const members = db.prepare(`
       SELECT id, full_name, member_type, dob, mobile, email,
-             pan_enc, aadhaar_enc, pan_last4, aadhaar_last4, display_order
+             pan_last4, aadhaar_last4, display_order
       FROM members WHERE family_id = ?
       ORDER BY display_order, full_name
     `).all(familyId) as any[];
@@ -536,16 +588,14 @@ export function registerIpcHandlers(ipc: IpcMain): void {
       ) AS portfolio_fetched_at,
       CASE WHEN password_enc IS NOT NULL AND password_enc != '' THEN 1 ELSE 0 END AS has_password
       FROM broker_accounts ba WHERE ba.member_id = ?`);
-    return Promise.all(
-      members.map(async m => ({
-        ...m,
-        pan: await decryptField(m.pan_enc).catch(() => null),
-        aadhaar: await decryptField(m.aadhaar_enc).catch(() => null),
-        documents: getMemberDocumentSummaryMap(db, m.id),
-        banks: banksStmt.all(m.id),
-        brokers: brokersStmt.all(m.id),
-      }))
-    );
+    return members.map(m => ({
+      ...m,
+      pan: null,      // populated on-demand via member:fullDetail
+      aadhaar: null,  // populated on-demand via member:fullDetail
+      documents: getMemberDocumentSummaryMap(db, m.id),
+      banks: banksStmt.all(m.id),
+      brokers: brokersStmt.all(m.id),
+    }));
   });
 
   ipc.handle('member:fullDetail', async (_, memberId: number) => {
@@ -822,6 +872,7 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   // ── Manual OTP dialog (for banks that send OTP to mobile only) ──────────
 
   ipc.handle('otp:provide', (_, otp: string) => {
+    clearOtpTimeout();
     if (pendingOtpResolve) {
       pendingOtpResolve(otp.trim());
       pendingOtpResolve = null;
@@ -831,6 +882,7 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   });
 
   ipc.handle('otp:cancel', () => {
+    clearOtpTimeout();
     if (pendingOtpReject) {
       pendingOtpReject(new Error('OTP_CANCELLED'));
       pendingOtpResolve = null;
@@ -857,7 +909,8 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   });
 
   ipc.handle('export:pickAndRun', async () => {
-    if (!currentMasterPassword) {
+    const masterPwd = getMasterPassword();
+    if (!masterPwd) {
       return { ok: false, error: 'Unlock the vault again before exporting.' };
     }
     const date = new Date().toISOString().slice(0, 10);
@@ -868,7 +921,7 @@ export function registerIpcHandlers(ipc: IpcMain): void {
     });
     if (result.canceled || !result.filePath) return { ok: false, cancelled: true };
     try {
-      const summary = await exportExcel(result.filePath, currentMasterPassword);
+      const summary = await exportExcel(result.filePath, masterPwd);
       return { ok: true, filePath: result.filePath, ...summary };
     } catch (e: any) {
       return { ok: false, error: e.message };
@@ -876,6 +929,7 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   });
 
   ipc.handle('automation:cancelCurrent', async () => {
+    clearOtpTimeout();
     if (pendingOtpReject) {
       pendingOtpReject(new Error('USER_CANCELLED'));
       pendingOtpResolve = null;
@@ -1000,9 +1054,10 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   });
 
   ipc.handle('backup:restore', async (_, payload: { snapshotId: string; sourceFolder?: string }) => {
-    if (!currentMasterPassword) return { ok: false, error: 'Vault is locked.' };
+    const masterPwdForRestore = getMasterPassword();
+    if (!masterPwdForRestore) return { ok: false, error: 'Vault is locked.' };
     if (!payload?.snapshotId) return { ok: false, error: 'No snapshot id provided.' };
-    const result: any = await backupRestoreSnapshot(payload.snapshotId, currentMasterPassword, {
+    const result: any = await backupRestoreSnapshot(payload.snapshotId, masterPwdForRestore, {
       sourceFolder: payload.sourceFolder,
     });
     // The restored snapshot may have a different salt → new derived key.
@@ -1010,7 +1065,7 @@ export function registerIpcHandlers(ipc: IpcMain): void {
     // use the correct one without forcing the user to lock+unlock.
     if (result?.ok) {
       try {
-        const newKey = await deriveMasterKey(currentMasterPassword);
+        const newKey = await deriveMasterKey(masterPwdForRestore);
         currentMasterKey = Buffer.from(newKey);
       } catch { /* DB is already reopened with the right key; ignore */ }
     }
@@ -1038,6 +1093,18 @@ export function registerIpcHandlers(ipc: IpcMain): void {
 
 let pendingOtpResolve: ((otp: string) => void) | null = null;
 let pendingOtpReject:  ((err: Error)  => void) | null = null;
+// Store the timeout handle so we can cancel it when the OTP is provided,
+// cancelled, or superseded by a new request. Without this, the old timer fires
+// 3 minutes after a superseded request and incorrectly rejects the new request
+// (because pendingOtpReject still points at the new Promise's reject function).
+let otpTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
+
+function clearOtpTimeout(): void {
+  if (otpTimeoutHandle) {
+    clearTimeout(otpTimeoutHandle);
+    otpTimeoutHandle = null;
+  }
+}
 
 /**
  * Sends an 'otp:needed' event to the renderer window, which shows an input
@@ -1045,7 +1112,8 @@ let pendingOtpReject:  ((err: Error)  => void) | null = null;
  */
 function requestOtpFromUser(label: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    // Cancel any previous pending request
+    // Cancel any previous pending request AND its timer.
+    clearOtpTimeout();
     if (pendingOtpReject) pendingOtpReject(new Error('OTP_SUPERSEDED'));
 
     pendingOtpResolve = resolve;
@@ -1054,8 +1122,9 @@ function requestOtpFromUser(label: string): Promise<string> {
     const win = BrowserWindow.getAllWindows()[0];
     if (win) win.webContents.send('otp:needed', { label });
 
-    // Auto-cancel after 3 minutes
-    setTimeout(() => {
+    // Auto-cancel after 3 minutes. Store handle so it can be cleared.
+    otpTimeoutHandle = setTimeout(() => {
+      otpTimeoutHandle = null;
       if (pendingOtpReject) {
         pendingOtpReject(new Error('OTP_TIMEOUT'));
         pendingOtpResolve = null;

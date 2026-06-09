@@ -641,6 +641,7 @@ export default function Dashboard() {
   const [portfolioAssetScope, setPortfolioAssetScope] = useState<'EQUITY' | 'MUTUAL_FUNDS' | 'COMBINED'>('EQUITY');
   const [auBidOptions, setAuBidOptions] = useState<AuBidDraftOptions | null>(null);
   const [ipoCatalog, setIpoCatalog] = useState<IpoCatalogIssue[]>([]);
+  const [ipoCategory, setIpoCategory] = useState<'mainboard' | 'sme'>('mainboard');
   const [auBidForm, setAuBidForm] = useState<AuBidForm>(emptyAuBidForm());
   const [auBidHistory, setAuBidHistory] = useState<IpoBidHistoryEntry[]>([]);
   const [preparedAuBid, setPreparedAuBid] = useState<PreparedAuBid | null>(null);
@@ -1437,12 +1438,23 @@ export default function Dashboard() {
     }
   }
 
+  /** Returns true when an issue is an SME IPO (NSE Emerge / BSE SME). */
+  function isSmeListing(issue: IpoCatalogIssue): boolean {
+    const platform = (issue.exchangePlatform || '').toLowerCase();
+    const type = (issue.issueType || '').toLowerCase();
+    return platform === 'sme' || type.includes('sme');
+  }
+
   function getDefaultIpoIssue(issues: IpoCatalogIssue[], preferredIssueName?: string | null): IpoCatalogIssue | null {
     if (preferredIssueName) {
       const matched = issues.find(issue => issue.issueName === preferredIssueName);
       if (matched) return matched;
     }
-    return issues.find(issue => issue.status === 'LIVE') ?? issues[0] ?? null;
+    // Default to a live mainboard issue first, then any live issue, then the first one.
+    return issues.find(issue => issue.status === 'LIVE' && !isSmeListing(issue))
+      ?? issues.find(issue => issue.status === 'LIVE')
+      ?? issues[0]
+      ?? null;
   }
 
   function buildAuBidFormForIssue(bankId: number | null, issue: IpoCatalogIssue | null): AuBidForm {
@@ -3699,18 +3711,71 @@ export default function Dashboard() {
                         </button>
                       </div>
                       {ipoCatalog.length > 0 ? (
-                        <select
-                          autoFocus
-                          value={auBidForm.issueName}
-                          onChange={e => applyIpoSelectionToForm(e.target.value)}
-                        >
-                          <option value="">Select IPO issue</option>
-                          {ipoCatalog.map(issue => (
-                            <option key={issue.issueName} value={issue.issueName}>
-                              {issue.issueName} · {issue.status === 'LIVE' ? 'Live' : issue.status === 'FORTHCOMING' ? 'Forthcoming' : 'Issue'}
-                            </option>
-                          ))}
-                        </select>
+                        <>
+                          {/* Category tabs — Mainboard (default) / SME */}
+                          {(() => {
+                            const mainboardList = ipoCatalog.filter(i => !isSmeListing(i));
+                            const smeList = ipoCatalog.filter(i => isSmeListing(i));
+                            const activeList = ipoCategory === 'sme' ? smeList : mainboardList;
+                            return (
+                              <>
+                                <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+                                  <button
+                                    type="button"
+                                    className={`btn-row${ipoCategory === 'mainboard' ? ' active' : ''}`}
+                                    style={{
+                                      padding: '3px 10px', fontSize: 12,
+                                      background: ipoCategory === 'mainboard' ? '#3b82f6' : undefined,
+                                      color: ipoCategory === 'mainboard' ? '#fff' : undefined,
+                                    }}
+                                    onClick={() => setIpoCategory('mainboard')}
+                                  >
+                                    Mainboard {mainboardList.length > 0 ? `(${mainboardList.length})` : ''}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className={`btn-row${ipoCategory === 'sme' ? ' active' : ''}`}
+                                    style={{
+                                      padding: '3px 10px', fontSize: 12,
+                                      background: ipoCategory === 'sme' ? '#3b82f6' : undefined,
+                                      color: ipoCategory === 'sme' ? '#fff' : undefined,
+                                    }}
+                                    onClick={() => setIpoCategory('sme')}
+                                  >
+                                    SME {smeList.length > 0 ? `(${smeList.length})` : ''}
+                                  </button>
+                                </div>
+                                {activeList.length > 0 ? (
+                                  <select
+                                    autoFocus
+                                    value={auBidForm.issueName}
+                                    onChange={e => applyIpoSelectionToForm(e.target.value)}
+                                  >
+                                    <option value="">Select {ipoCategory === 'sme' ? 'SME' : 'mainboard'} IPO</option>
+                                    {activeList.map(issue => (
+                                      <option key={issue.issueName} value={issue.issueName}>
+                                        {issue.issueName}{issue.status === 'LIVE' ? ' · Live' : issue.status === 'FORTHCOMING' ? ' · Forthcoming' : ''}
+                                      </option>
+                                    ))}
+                                  </select>
+                                ) : (
+                                  <div style={{ fontSize: 12, color: '#666', padding: '6px 0' }}>
+                                    No {ipoCategory === 'sme' ? 'SME' : 'mainboard'} IPOs in the current list.
+                                    {ipoCategory === 'sme'
+                                      ? ' Switch to Mainboard or type the name manually below.'
+                                      : ' Try refreshing or type the name manually below.'}
+                                  </div>
+                                )}
+                                <input
+                                  style={{ marginTop: 6 }}
+                                  value={auBidForm.issueName}
+                                  onChange={e => setAuBidForm(f => ({ ...f, issueName: e.target.value }))}
+                                  placeholder="Or type issue name manually…"
+                                />
+                              </>
+                            );
+                          })()}
+                        </>
                       ) : (
                         <input
                           autoFocus
