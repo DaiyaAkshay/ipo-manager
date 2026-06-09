@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build output
+out/
+dist/
+dist-*
+*.tsbuildinfo
+
+# Temporary debug captures (Playwright dumps, page snapshots, etc.)
+tmp_*
+*.spec.png
+*.spec.html
+
+# Installer artifacts (we re-build these anytime)
+*.exe.blockmap
+win-unpacked/
+
+# *** CRITICAL: NEVER COMMIT THESE ***
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.enc
+documents/
+backups/
+gmail-token.json
+gmail-credentials.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*

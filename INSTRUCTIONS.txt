@@ -1,0 +1,144 @@
+================================================================================
+  IPO MANAGER - Desktop Instructions
+  Developed by CA Akshay Daiya | akshaybkn@gmail.com | +91 99290 89598
+================================================================================
+
+IPO Manager is now a desktop-only Windows app. It manages family IPO
+applications, bank/broker credentials, portfolio reports, and identity document
+softcopies in an encrypted local vault on your PC.
+
+No web server mode is included.
+
+================================================================================
+  PART 1 - INSTALLING PREREQUISITES
+================================================================================
+
+Install Node.js if you need to build the app from source:
+
+  1. Go to https://nodejs.org
+  2. Download and install the LTS version.
+  3. Open Command Prompt and verify:
+       node --version
+
+================================================================================
+  PART 2 - SETTING UP FROM SOURCE
+================================================================================
+
+  1. Open Command Prompt.
+
+  2. Go to the project folder:
+       cd H:\ipo-manager_1\ipo-manager
+
+  3. Install packages:
+       npm install
+
+  4. Install the Chromium browser used for bank/broker automation:
+       npx playwright install chromium
+
+  5. Build the app:
+       npm run build
+
+================================================================================
+  PART 3 - BUILDING AND RUNNING THE DESKTOP APP
+================================================================================
+
+Build the Windows installer:
+
+  1. Open Command Prompt and go to the project folder:
+       cd H:\ipo-manager_1\ipo-manager
+
+  2. Run:
+       npm run build:win
+
+  3. The installer is created here:
+       H:\ipo-manager_1\ipo-manager\dist\IPO Manager Setup 0.1.0.exe
+
+The unpacked desktop executable is here:
+
+       H:\ipo-manager_1\ipo-manager\dist\win-unpacked\IPO Manager.exe
+
+A desktop shortcut is available at:
+
+       C:\Users\aksha\Desktop\IPO Manager.lnk
+
+================================================================================
+  PART 4 - DAILY USE
+================================================================================
+
+First launch:
+
+  - Create a master password.
+  - Keep it safe. There is no password recovery because the vault is encrypted.
+
+Importing data:
+
+  - Click "Import Excel" in the left sidebar.
+  - Select the Demat-style Excel file.
+
+Exporting data:
+
+  - Click "Export Excel" in the left sidebar.
+  - Choose the save location in the Windows Save dialog.
+
+Bank/broker login automation:
+
+  - Click the bank or broker button for the member.
+  - A controlled headed browser window opens.
+  - The app fills saved credentials where supported.
+  - Complete CAPTCHA/OTP/manual steps when required.
+
+Downloads:
+
+  - Browser/report downloads are configured to use:
+       C:\Users\aksha\Downloads
+  - Member document downloads also use:
+       C:\Users\aksha\Downloads
+  - Chrome download notification clicks may not work reliably in the
+    automation-controlled browser. Use the normal Downloads folder if needed.
+
+================================================================================
+  PART 5 - BACKUP AND DATA SAFETY
+================================================================================
+
+Back up these files regularly:
+
+  - C:\Users\aksha\AppData\Roaming\ipo-manager\data\vault.db
+  - C:\Users\aksha\AppData\Roaming\ipo-manager\data\vault.meta.json
+
+Without the database, metadata file, and master password, encrypted data cannot
+be recovered.
+
+================================================================================
+  PART 6 - TROUBLESHOOTING
+================================================================================
+
+Problem: "npm install" gives an error about Python or Visual Studio.
+Fix: Install Visual Studio Build Tools from:
+     https://visualstudio.microsoft.com/visual-cpp-build-tools/
+
+Problem: Bank/broker browser does not open.
+Fix: Run this in the project folder:
+     npx playwright install chromium
+
+Problem: Automation browser profile appears locked.
+Fix: Close old IPO Manager-launched Chrome/Chromium windows, then retry.
+
+Problem: Forgot master password.
+Fix: There is no recovery option. Restore an older backup if available.
+
+================================================================================
+  QUICK REFERENCE - COMMANDS
+================================================================================
+
+Run these from:
+
+  H:\ipo-manager_1\ipo-manager
+
+Commands:
+
+  npm install            Install or update packages
+  npm run dev            Developer mode
+  npm run build          Build the app
+  npm run build:win      Build the Windows desktop installer
+
+================================================================================

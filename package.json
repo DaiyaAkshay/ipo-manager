@@ -1,0 +1,97 @@
+{
+  "name": "ipo-manager",
+  "version": "0.2.0",
+  "description": "Encrypted vault and login automation for managing family IPO applications",
+  "main": "out/main/index.js",
+  "author": "private",
+  "private": true,
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "build:win": "electron-vite build && electron-builder --win",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "postinstall": "electron-builder install-app-deps && playwright install chromium"
+  },
+  "dependencies": {
+    "@electron-toolkit/preload": "^3.0.1",
+    "@electron-toolkit/utils": "^3.0.0",
+    "argon2": "^0.41.1",
+    "better-sqlite3-multiple-ciphers": "^11.5.0",
+    "electron-updater": "^6.8.9",
+    "googleapis": "^144.0.0",
+    "keytar": "^7.9.0",
+    "playwright": "^1.48.0",
+    "pngjs": "^7.0.0",
+    "tesseract.js": "^7.0.0",
+    "totp-generator": "^2.0.1",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.2",
+    "@vitest/expect": "^4.1.7",
+    "electron": "^32.1.2",
+    "electron-builder": "^25.0.5",
+    "electron-vite": "^2.3.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.8",
+    "vitest": "^4.1.7"
+  },
+  "build": {
+    "appId": "private.ipomanager",
+    "productName": "IPO Manager",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*",
+      "!**/node_modules/playwright-core/.local-browsers/**",
+      "!**/node_modules/playwright/.local-browsers/**"
+    ],
+    "asarUnpack": [
+      "**/node_modules/playwright/**",
+      "**/node_modules/playwright-core/**",
+      "**/node_modules/@playwright/**",
+      "**/node_modules/argon2/**",
+      "**/node_modules/better-sqlite3-multiple-ciphers/**",
+      "**/node_modules/keytar/**",
+      "**/node_modules/pngjs/**",
+      "**/node_modules/tesseract.js/**",
+      "**/node_modules/tesseract.js-core/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "IPO-Manager-Setup-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "IPO Manager",
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true,
+      "uninstallDisplayName": "IPO Manager"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "DaiyaAkshay",
+        "repo": "ipo-manager"
+      }
+    ]
+  }
+}
