@@ -6,6 +6,14 @@ const KEYTAR_SERVICE = 'ipo-manager';
 const KEYTAR_ACCOUNT_API_KEY = 'anthropic-api-key-v1';
 const DEFAULT_MODEL = 'claude-sonnet-4-20250514';
 
+// Tracks the last authentication failure so getClaudeCaptchaStatus can
+// surface it in the sidebar pill without needing a live API probe.
+// Cleared whenever the user saves a new key.
+let lastApiAuthError: string | null = null;
+
+export function getLastApiAuthError(): string | null { return lastApiAuthError; }
+export function clearLastApiAuthError(): void { lastApiAuthError = null; }
+
 export type ClaudeCaptchaState =
   | 'connected'
   | 'not_connected'
@@ -59,6 +67,17 @@ export async function getClaudeCaptchaStatus(): Promise<ClaudeCaptchaStatus> {
   try {
     const envKey = (process.env.ANTHROPIC_API_KEY || '').trim();
     if (envKey) {
+      // Even env keys can be invalid — surface auth errors if one occurred.
+      if (lastApiAuthError) {
+        return {
+          state: 'error',
+          configured: true,
+          label: 'Claude CAPTCHA — invalid key',
+          detail: lastApiAuthError,
+          model: configuredModel(),
+          source: 'environment',
+        };
+      }
       return {
         state: 'connected',
         configured: true,
@@ -71,6 +90,16 @@ export async function getClaudeCaptchaStatus(): Promise<ClaudeCaptchaStatus> {
 
     const key = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_ACCOUNT_API_KEY);
     if (key) {
+      if (lastApiAuthError) {
+        return {
+          state: 'error',
+          configured: true,
+          label: 'Claude CAPTCHA — invalid key',
+          detail: lastApiAuthError,
+          model: configuredModel(),
+          source: 'keychain',
+        };
+      }
       return {
         state: 'connected',
         configured: true,
@@ -105,6 +134,7 @@ export async function saveClaudeCaptchaApiKey(apiKey: string): Promise<ClaudeCap
   const trimmed = apiKey.trim();
   if (!trimmed) throw new Error('Anthropic API key is required.');
   await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_ACCOUNT_API_KEY, trimmed);
+  clearLastApiAuthError(); // new key — reset any prior auth error
   return getClaudeCaptchaStatus();
 }
 
@@ -190,6 +220,11 @@ export async function solveCaptchaTextWithClaude(imageBytes: Buffer, mediaType =
       appendAutomationLog('AU_CAPTCHA', `Anthropic API error from ${model}: ${lastError.message}`);
       // Count the failed attempt too — the request was billable.
       recordCaptchaCall({ inputTokens: 0, outputTokens: 0, ok: false });
+      if (response.status === 401 || response.status === 403) {
+        // Authentication failure — flag it so the status pill turns red.
+        lastApiAuthError = `API key rejected (${response.status}). Please update your Anthropic API key in Settings → CAPTCHA AI.`;
+        throw lastError;
+      }
       if (response.status === 400 || response.status === 404) continue;
       throw lastError;
     }

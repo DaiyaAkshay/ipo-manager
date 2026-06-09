@@ -881,9 +881,10 @@ export default function Dashboard() {
     // App will quit and restart — nothing more to do here.
   }
 
-  // Refresh CAPTCHA usage periodically — the pill shows today's call count.
+  // Refresh CAPTCHA usage + status periodically — shows today's call count and
+  // surfaces auth errors (e.g. invalid API key returning 401) in the pill.
   useEffect(() => {
-    const t = setInterval(loadCaptchaUsage, 60_000);
+    const t = setInterval(() => { void loadCaptchaUsage(); void loadCaptchaAiStatus(); }, 60_000);
     return () => clearInterval(t);
   }, []);
 
