@@ -7,8 +7,8 @@ const api = {
     lock: () => ipcRenderer.invoke('vault:lock'),
     changePassword: (currentPassword: string, newPassword: string) =>
       ipcRenderer.invoke('vault:changePassword', { currentPassword, newPassword }),
-    reset: (confirmation: string) =>
-      ipcRenderer.invoke('vault:reset', { confirmation })
+    reset: (confirmation: string, password?: string) =>
+      ipcRenderer.invoke('vault:reset', { confirmation, password })
   },
   gmail: {
     status: () => ipcRenderer.invoke('gmail:status'),

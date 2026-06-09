@@ -1,6 +1,6 @@
 {
   "name": "ipo-manager",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Encrypted vault and login automation for managing family IPO applications",
   "main": "out/main/index.js",
   "author": "private",

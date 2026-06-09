@@ -5,8 +5,8 @@ import { dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { dbExists, openDb, getDb, rekeyDb, closeDb, getDataDir } from './db/connection';
 import { vaultInitialized, deriveMasterKey, passwordStrengthIssues } from './crypto/master';
-import { encryptField, decryptField, lastN } from './crypto/field';
-import { beginAutomation, endAutomation } from './activity';
+import { encryptField, decryptField, lastN, clearKeyCache as clearFieldKeyCache } from './crypto/field';
+import { beginAutomation, endAutomation, activeAutomations } from './activity';
 import { getBankAdapter, getBrokerAdapter, getOtpPreset } from './automation/registry';
 import {
   waitForOtp,
@@ -56,8 +56,17 @@ let currentMasterPassword: string | null = null;
 let currentMasterKey: Buffer | null = null;
 
 export function clearVaultSessionSecrets(): void {
+  // Zero the master key buffer before nulling the reference so the bytes
+  // don't linger in V8's heap even if the GC delays.
+  if (currentMasterKey) currentMasterKey.fill(0);
   currentMasterPassword = null;
   currentMasterKey = null;
+  // Wipe the field-encryption key cached in field.ts. Without this, any IPC
+  // handler that calls decryptField after lock would re-fetch from the OS
+  // keychain successfully. With this, a future decrypt call needs the keychain
+  // service to still be authorised — which means the OS lock state controls
+  // access, not just our in-memory flag.
+  clearFieldKeyCache();
   if (autoBackupTimer) {
     clearInterval(autoBackupTimer);
     autoBackupTimer = null;
@@ -222,7 +231,22 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   // Manually lock the vault — same effect as auto-lock after 30 min idle.
   // Closes the encrypted DB, wipes in-memory secrets, purges Playwright
   // browser profiles (cached bank/broker session cookies), notifies renderer.
+  //
+  // Refuses to lock if an automation is in flight. Locking mid-Playwright would
+  // null currentMasterKey while a SQL write (balance update / bid log) is
+  // still running, throwing DB_NOT_OPEN and potentially leaving the bank/
+  // broker session in an inconsistent state. The renderer should show the
+  // returned reason to the user.
   ipc.handle('vault:lock', async () => {
+    if (activeAutomations() > 0) {
+      return {
+        ok: false,
+        error: `Cannot lock — ${activeAutomations()} automation(s) still running. ` +
+          'Wait for the current browser session to finish, or use ' +
+          '"Stop" on the activity panel first.',
+        reason: 'AUTOMATION_IN_FLIGHT',
+      };
+    }
     try {
       await flushBackupOnExit();
       try { closeDb(); } catch { /* */ }
@@ -286,9 +310,46 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   // The renderer is responsible for confirming with the user before calling
   // this. Once called, the next vault:status will report initialized=false
   // and the app will boot into first-time-setup.
-  ipc.handle('vault:reset', async (_, payload: { confirmation: string }) => {
+  ipc.handle('vault:reset', async (_, payload: { confirmation: string; password?: string }) => {
     if (payload?.confirmation !== 'RESET') {
       return { ok: false, error: 'Confirmation phrase missing — type RESET to confirm.' };
+    }
+
+    // Require the current master password before destroying data. This stops
+    // a hijacked renderer (XSS in a loaded external page, malicious extension,
+    // or any non-UI IPC caller) from wiping the vault by just sending the
+    // string "RESET". Only callers who know the password can wipe.
+    //
+    // Edge case: if the vault is locked (no currentMasterKey), we still allow
+    // reset with the correct password — the user might be locked out and want
+    // to start over. We re-derive the key and compare against the SQLCipher
+    // header by attempting an open.
+    if (vaultInitialized() && dbExists()) {
+      const password = payload?.password || '';
+      if (!password) {
+        return { ok: false, error: 'Current master password is required to reset the vault.' };
+      }
+      try {
+        const probeKey = await deriveMasterKey(password);
+        if (currentMasterKey) {
+          // Vault is unlocked — direct buffer compare.
+          if (!probeKey.equals(currentMasterKey)) {
+            return { ok: false, error: 'Master password is incorrect.' };
+          }
+        } else {
+          // Vault is locked — verify by attempting to open the DB. openDb()
+          // throws INVALID_MASTER_PASSWORD on wrong key. We close again
+          // immediately if it succeeds.
+          try {
+            openDb(probeKey);
+            closeDb();
+          } catch {
+            return { ok: false, error: 'Master password is incorrect.' };
+          }
+        }
+      } catch (e: any) {
+        return { ok: false, error: e?.message || 'Password verification failed.' };
+      }
     }
 
     try {

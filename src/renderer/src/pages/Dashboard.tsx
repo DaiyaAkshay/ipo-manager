@@ -2277,9 +2277,19 @@ export default function Dashboard() {
       if (phrase !== null) showToast('error', 'Confirmation phrase did not match — nothing was deleted.');
       return;
     }
+    // Require the current master password too — second factor protecting
+    // against accidental confirmation OR a malicious script that knows the
+    // RESET phrase but not the password.
+    const password = window.prompt(
+      'Enter your current master password to confirm reset:'
+    );
+    if (!password) {
+      showToast('error', 'Password not entered — nothing was deleted.');
+      return;
+    }
     setBusy('vault-reset');
     try {
-      const result: any = await window.api.vault.reset(phrase);
+      const result: any = await window.api.vault.reset(phrase, password);
       if (result?.ok) {
         showToast('success', 'Vault reset — restart on the unlock screen now.');
       } else {

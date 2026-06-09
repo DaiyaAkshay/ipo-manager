@@ -77,33 +77,69 @@ export function openDb(rawKey: Buffer): Database.Database {
   }
 
   if (!newDb) {
-    // ── Migrations for existing databases ──────────────────────────────────
-    const memberCols = db.prepare("PRAGMA table_info(members)").all() as any[];
-    if (!memberCols.find((c: any) => c.name === 'display_order')) {
-      db.exec('ALTER TABLE members ADD COLUMN display_order INTEGER DEFAULT 0');
-      db.exec('UPDATE members SET display_order = rowid');
-    }
-    if (!memberCols.find((c: any) => c.name === 'email_password_enc')) {
-      db.exec('ALTER TABLE members ADD COLUMN email_password_enc BLOB');
-    }
-    const bankCols = db.prepare("PRAGMA table_info(bank_accounts)").all() as any[];
-    if (!bankCols.find((c: any) => c.name === 'balance')) {
-      db.exec('ALTER TABLE bank_accounts ADD COLUMN balance TEXT');
-      db.exec('ALTER TABLE bank_accounts ADD COLUMN balance_fetched_at DATETIME');
+    // ── Versioned migration system ──────────────────────────────────────────
+    // Each step is gated by SQLite's PRAGMA user_version. We start at whatever
+    // the DB currently reports, run pending steps in order, and end with the
+    // pragma updated to CURRENT_SCHEMA_VERSION. Idempotent across re-runs: a
+    // DB already at the latest version runs zero migration SQL.
+    //
+    // CURRENT_SCHEMA_VERSION must match the highest step number below AND
+    // the schema produced by schema.ts on fresh installs (which bumps the
+    // pragma in its own INSERT at the bottom of SCHEMA_SQL).
+    const CURRENT_SCHEMA_VERSION = 3;
+    const startVersion = (db.pragma('user_version', { simple: true }) as number) || 0;
+
+    if (startVersion < CURRENT_SCHEMA_VERSION) {
+      console.log(`[DB] Migrating schema from v${startVersion} → v${CURRENT_SCHEMA_VERSION}`);
     }
 
-    const brokerCols = db.prepare("PRAGMA table_info(broker_accounts)").all() as any[];
-    if (!brokerCols.find((c: any) => c.name === 'balance')) {
-      db.exec('ALTER TABLE broker_accounts ADD COLUMN balance TEXT');
-      db.exec('ALTER TABLE broker_accounts ADD COLUMN balance_fetched_at DATETIME');
-    }
+    // Helper: column-exists check used by several legacy migrations.
+    const hasColumn = (table: string, col: string): boolean => {
+      const cols = db!.prepare(`PRAGMA table_info(${table})`).all() as any[];
+      return cols.some((c: any) => c.name === col);
+    };
 
-    const familyCols = db.prepare("PRAGMA table_info(families)").all() as any[];
-    if (!familyCols.find((c: any) => c.name === 'min_balance')) {
-      db.exec('ALTER TABLE families ADD COLUMN min_balance INTEGER DEFAULT 0');
-    }
+    // Run each migration step inside a transaction so a half-applied schema
+    // never persists. Bumps user_version on success.
+    const runStep = (target: number, fn: () => void): void => {
+      if (startVersion >= target) return;
+      const txn = db!.transaction(() => {
+        fn();
+        db!.pragma(`user_version = ${target}`);
+      });
+      txn();
+      console.log(`[DB] Migration v${target} applied.`);
+    };
 
-    db.exec(`
+    // ── v1: legacy migrations (pre-versioning era) ─────────────────────────
+    // These are the column-presence checks that existed before we introduced
+    // user_version. They were already idempotent, so we wrap them and stamp
+    // the DB as v1.
+    runStep(1, () => {
+      if (!hasColumn('members', 'display_order')) {
+        db!.exec('ALTER TABLE members ADD COLUMN display_order INTEGER DEFAULT 0');
+        db!.exec('UPDATE members SET display_order = rowid');
+      }
+      if (!hasColumn('members', 'email_password_enc')) {
+        db!.exec('ALTER TABLE members ADD COLUMN email_password_enc BLOB');
+      }
+      if (!hasColumn('bank_accounts', 'balance')) {
+        db!.exec('ALTER TABLE bank_accounts ADD COLUMN balance TEXT');
+        db!.exec('ALTER TABLE bank_accounts ADD COLUMN balance_fetched_at DATETIME');
+      }
+      if (!hasColumn('broker_accounts', 'balance')) {
+        db!.exec('ALTER TABLE broker_accounts ADD COLUMN balance TEXT');
+        db!.exec('ALTER TABLE broker_accounts ADD COLUMN balance_fetched_at DATETIME');
+      }
+      if (!hasColumn('families', 'min_balance')) {
+        db!.exec('ALTER TABLE families ADD COLUMN min_balance INTEGER DEFAULT 0');
+      }
+    });
+
+    // ── v2: secondary tables (added in 2025-2026) ──────────────────────────
+    // These are idempotent CREATE TABLE IF NOT EXISTS — safe to re-run.
+    runStep(2, () => {
+      db!.exec(`
       CREATE TABLE IF NOT EXISTS documents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
@@ -229,7 +265,6 @@ export function openDb(rawKey: Buffer): Database.Database {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         mobile_number TEXT NOT NULL,
-        mobile_model TEXT,
         recharge_date TEXT,
         validity_days INTEGER,
         notes TEXT,
@@ -237,14 +272,22 @@ export function openDb(rawKey: Buffer): Database.Database {
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    });
 
-    const rechargeCols = db.prepare("PRAGMA table_info(mobile_recharge_tracking)").all() as any[];
-    if (rechargeCols.length && !rechargeCols.find((c: any) => c.name === 'mobile_model')) {
-      db.exec('ALTER TABLE mobile_recharge_tracking ADD COLUMN mobile_model TEXT');
-    }
-    if (rechargeCols.length && !rechargeCols.find((c: any) => c.name === 'display_order')) {
-      db.exec('ALTER TABLE mobile_recharge_tracking ADD COLUMN display_order INTEGER DEFAULT 0');
-      db.exec('UPDATE mobile_recharge_tracking SET display_order = id');
+    // ── v3: mobile_recharge_tracking augmentations ─────────────────────────
+    // Adds mobile_model and display_order columns and backfills display_order.
+    runStep(3, () => {
+      if (!hasColumn('mobile_recharge_tracking', 'mobile_model')) {
+        db!.exec('ALTER TABLE mobile_recharge_tracking ADD COLUMN mobile_model TEXT');
+      }
+      if (!hasColumn('mobile_recharge_tracking', 'display_order')) {
+        db!.exec('ALTER TABLE mobile_recharge_tracking ADD COLUMN display_order INTEGER DEFAULT 0');
+        db!.exec('UPDATE mobile_recharge_tracking SET display_order = id');
+      }
+    });
+
+    if (startVersion < CURRENT_SCHEMA_VERSION) {
+      console.log(`[DB] Schema is now at v${CURRENT_SCHEMA_VERSION}.`);
     }
   }
 

@@ -313,7 +313,18 @@ async function handleAuIpoPortalAuth(page: Page, draft: IpoBidDraft): Promise<vo
     if (captchaSolved) {
       console.log('[AU Bank][ipo-auth] CAPTCHA solved on IPO portal — waiting for listing.');
     } else {
-      console.warn('[AU Bank][ipo-auth] CAPTCHA not auto-solved on IPO portal — user may need to complete manually.');
+      console.warn('[AU Bank][ipo-auth] CAPTCHA not auto-solved on IPO portal — showing manual overlay.');
+      // Show banner and give the user 2 minutes to solve it themselves before
+      // proceeding. The listing-page poll below will pick up successful manual
+      // completion automatically.
+      const captchaInput = await findAuCaptchaInput(page, draft.username || '', passwordFieldRef);
+      if (captchaInput) {
+        await showAuCaptchaManualOverlay(
+          page,
+          'Please type the CAPTCHA shown above and click Login. The app will continue automatically once you submit.',
+        );
+        await waitForManualCaptchaSubmit(page, captchaInput, 120_000);
+      }
     }
 
     // ── Wait for the listing page to load (up to 20 s) ────────────────────
@@ -782,6 +793,81 @@ async function installAuCaptchaInputTracker(captchaInput: Locator): Promise<void
   }).catch(() => {});
 }
 
+/**
+ * Inject a high-z-index banner into the bank page when auto-CAPTCHA fails.
+ * Tells the user exactly what to do — solve it manually and click Login.
+ *
+ * This is the visible-handoff that stops the user from staring at a stuck
+ * browser. Best-effort; if injection fails (CSP, page already navigated),
+ * we silently swallow.
+ */
+async function showAuCaptchaManualOverlay(page: Page, reason: string): Promise<void> {
+  try {
+    await page.evaluate((msg) => {
+      const ID = 'ipo-manager-captcha-overlay';
+      const prior = document.getElementById(ID);
+      if (prior) prior.remove();
+      const div = document.createElement('div');
+      div.id = ID;
+      div.style.cssText = [
+        'position:fixed',
+        'top:0',
+        'left:0',
+        'right:0',
+        'background:linear-gradient(90deg,#b45309,#f59e0b)',
+        'color:#fff',
+        'padding:14px 24px',
+        'z-index:2147483647',
+        'font-family:-apple-system,BlinkMacSystemFont,sans-serif',
+        'font-size:14px',
+        'box-shadow:0 4px 16px rgba(0,0,0,0.45)',
+        'display:flex',
+        'align-items:center',
+        'gap:14px',
+      ].join(';');
+      div.innerHTML =
+        '<div style="font-size:24px;line-height:1">⚠️</div>' +
+        '<div>' +
+        '<div style="font-weight:700;font-size:15px">Auto-CAPTCHA failed</div>' +
+        '<div style="opacity:0.95;margin-top:2px">' + msg + '</div>' +
+        '</div>';
+      document.body.appendChild(div);
+    }, reason);
+  } catch {
+    // Overlay is best-effort.
+  }
+}
+
+/**
+ * Wait up to `timeoutMs` for the user to manually solve the CAPTCHA and submit.
+ * Returns true if progress was detected (URL changed or CAPTCHA input disappeared),
+ * false if we timed out. The browser window stays open either way so the user
+ * can still complete the flow themselves after this returns.
+ */
+async function waitForManualCaptchaSubmit(
+  page: Page,
+  captchaInput: Locator,
+  timeoutMs = 120_000,
+): Promise<boolean> {
+  const startUrl = page.url();
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (page.isClosed()) return false;
+    if (page.url() !== startUrl) {
+      appendAutomationLog('AU_CAPTCHA', 'Manual CAPTCHA: detected URL change — proceeding.');
+      return true;
+    }
+    const stillVisible = await captchaInput.isVisible().catch(() => false);
+    if (!stillVisible) {
+      appendAutomationLog('AU_CAPTCHA', 'Manual CAPTCHA: CAPTCHA input no longer visible — proceeding.');
+      return true;
+    }
+    await page.waitForTimeout(800);
+  }
+  appendAutomationLog('AU_CAPTCHA', `Manual CAPTCHA: timed out after ${Math.round(timeoutMs / 1000)}s waiting for user.`);
+  return false;
+}
+
 async function clickAuCaptchaRefresh(page: Page): Promise<boolean> {
   const selectors = [
     'a:has-text("Refresh")',
@@ -811,6 +897,12 @@ async function trySolveAuCaptcha(page: Page, username: string, passwordField?: L
       const artifactPath = writeAutomationArtifact('au-captcha-miss.png', snapshot);
       if (artifactPath) appendAutomationLog('AU_CAPTCHA', `Saved AU full-page screenshot for detection failure to ${artifactPath}`);
     }
+    // The CAPTCHA input couldn't be located — the page may have changed.
+    // Show a banner so the user knows to look around themselves.
+    await showAuCaptchaManualOverlay(
+      page,
+      'The CAPTCHA field could not be located automatically. Please enter the CAPTCHA below and click Login.',
+    );
     return false;
   }
 
@@ -2272,6 +2364,17 @@ export const auBankAdapter: LoginAdapter = {
     const captchaAutoSubmitted = await trySolveAuCaptcha(page, creds.username, passwordFieldRef);
     if (!captchaAutoSubmitted) {
       console.log('[AU Bank] Type the CAPTCHA and click Login in the browser.');
+      // Show overlay + wait so the user gets a visible cue instead of a stuck
+      // browser. The OTP-screen wait below will still kick in once the user
+      // submits successfully.
+      const captchaInput = await findAuCaptchaInput(page, creds.username, passwordFieldRef);
+      if (captchaInput) {
+        await showAuCaptchaManualOverlay(
+          page,
+          'Please type the CAPTCHA shown above and click Login. The app will continue automatically once you submit.',
+        );
+        await waitForManualCaptchaSubmit(page, captchaInput, 120_000);
+      }
     }
 
     const otpBoxes = page.locator('input.mx-rw-input-otp');

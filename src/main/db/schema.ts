@@ -252,4 +252,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_member ON audit_log(member_id);
 
 INSERT OR IGNORE INTO schema_version (version) VALUES (1);
+
+-- Stamp the SQLite-native user_version pragma so the migration system in
+-- connection.ts knows a fresh install is already at the latest schema and
+-- skips all numbered migration steps. MUST match CURRENT_SCHEMA_VERSION in
+-- connection.ts.
+PRAGMA user_version = 3;
 `;

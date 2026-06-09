@@ -21,3 +21,8 @@ export function shouldAutolock(now = Date.now()): boolean {
   if (activeAutomationCount > 0) return false;
   return now - lastActivity > AUTOLOCK_MS;
 }
+
+/** Read-only snapshot of the in-flight automation counter. */
+export function activeAutomations(): number {
+  return activeAutomationCount;
+}
