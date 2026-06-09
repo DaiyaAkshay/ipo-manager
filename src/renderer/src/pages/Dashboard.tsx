@@ -4054,12 +4054,12 @@ export default function Dashboard() {
                             checked={!!captchaUsage?.consented}
                             onChange={e => toggleCaptchaConsent(e.target.checked)}
                           />
-                          I consent to uploading bank CAPTCHA images to api.anthropic.com
+                          Allow uploading CAPTCHA images to api.anthropic.com
                         </label>
                         <div className="empty-sub" style={{ marginTop: 4 }}>
-                          Required before the first call. Each captcha solve sends one
-                          screenshot off-machine to Anthropic. No images are stored, but
-                          the bytes leave your computer.
+                          Each solve sends one screenshot to Anthropic for OCR.
+                          Enabled automatically when an API key is configured.
+                          Uncheck to stop all uploads without removing the key.
                         </div>
                       </div>
 

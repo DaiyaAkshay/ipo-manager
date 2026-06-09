@@ -1,6 +1,6 @@
 import keytar from 'keytar';
 import { appendAutomationLog } from '../logging';
-import { canMakeCaptchaCall, recordCaptchaCall } from './usage';
+import { canMakeCaptchaCall, recordCaptchaCall, setCaptchaConsent } from './usage';
 
 const KEYTAR_SERVICE = 'ipo-manager';
 const KEYTAR_ACCOUNT_API_KEY = 'anthropic-api-key-v1';
@@ -120,18 +120,24 @@ export async function solveCaptchaTextWithClaude(imageBytes: Buffer, mediaType =
     return null;
   }
 
-  // Cost-safety gates: explicit consent + daily cap. Both stop runaway
-  // spending and ensure the user has acknowledged that bank CAPTCHA images
-  // are being uploaded to api.anthropic.com.
-  const gate = canMakeCaptchaCall();
+  // Cost-safety gates: consent check + daily cap.
+  //
+  // Consent migration: if the usage file was never written (e.g. the API key
+  // was saved before the consent-gating feature existed), having a valid API
+  // key in the keychain IS implicit consent — the user explicitly configured
+  // this key for CAPTCHA solving. Auto-grant so they are not silently broken.
+  let gate = canMakeCaptchaCall();
+  if (!gate.ok && gate.reason === 'CONSENT_REQUIRED') {
+    appendAutomationLog(
+      'AU_CAPTCHA',
+      'Consent file missing but API key is configured — auto-granting consent (key presence = consent). ' +
+      'You can revoke this in the CAPTCHA AI settings.'
+    );
+    setCaptchaConsent(true);
+    gate = canMakeCaptchaCall(); // re-check (now only daily cap can block)
+  }
   if (!gate.ok) {
-    if (gate.reason === 'CONSENT_REQUIRED') {
-      appendAutomationLog(
-        'AU_CAPTCHA',
-        'Claude solve skipped: user has not yet consented to uploading CAPTCHA images to Anthropic. ' +
-        'Open the CAPTCHA AI pill in the sidebar to give consent.'
-      );
-    } else if (gate.reason === 'DAILY_CAP_REACHED') {
+    if (gate.reason === 'DAILY_CAP_REACHED') {
       appendAutomationLog(
         'AU_CAPTCHA',
         `Claude solve skipped: daily cap of ${gate.state.cap} calls reached (made ${gate.state.calls} today). ` +
