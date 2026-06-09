@@ -595,6 +595,7 @@ export default function Dashboard() {
   const [selectedView,  setSelectedView]  = useState<SelectedView>('all');
   const [updater,       setUpdater]       = useState<UpdaterState>({ kind: 'idle' });
   const [installing,    setInstalling]    = useState(false);
+  const [appVersion,    setAppVersion]    = useState<string>('');
   const [members,       setMembers]       = useState<Record<number, Member[]>>({});
   const [busy,          setBusy]          = useState<string | null>(null);
   const [bulkBusy,      setBulkBusy]      = useState<string | null>(null);
@@ -835,7 +836,30 @@ export default function Dashboard() {
   }, []);
 
   // Auto-updater — listen for update lifecycle events from main process.
+  // We also fetch the app version and the last known status on mount so we
+  // never miss events that fired before this component subscribed (the
+  // updater caches its last status in main and we pull it synchronously here).
   useEffect(() => {
+    // Fetch the running app version once and display it in the sidebar.
+    window.api.updater.currentVersion().then((v: string) => {
+      if (v) setAppVersion(v);
+    }).catch(() => {});
+
+    // Catch up: if the update check already ran before we subscribed, pull
+    // the cached status so the banner/toast shows immediately.
+    window.api.updater.getStatus().then((s: any) => {
+      if (s && s.kind !== 'idle') {
+        setUpdater(s as UpdaterState);
+        // Show the toast only for the most actionable states.
+        if (s.kind === 'available') {
+          showToast('info', `Update available: v${s.version}. Downloading…`);
+        } else if (s.kind === 'downloaded') {
+          showToast('success', `Update v${s.version} ready. Click "Restart now" in the banner.`);
+        }
+      }
+    }).catch(() => {});
+
+    // Subscribe to live events for everything that happens after mount.
     const unsub = window.api.updater.onStatus((s) => {
       setUpdater(s as UpdaterState);
       if (s.kind === 'available') {
@@ -2819,7 +2843,14 @@ export default function Dashboard() {
 
         {/* Brand — always visible at top */}
         <div className="brand">
-          <div className="brand-mark">IPO Manager</div>
+          <div className="brand-mark" style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+            IPO Manager
+            {appVersion && (
+              <span style={{ fontSize: 11, fontWeight: 400, color: '#555', letterSpacing: 0 }}>
+                v{appVersion}
+              </span>
+            )}
+          </div>
           <div className="brand-sub">
             <span className="status-dot" />vault unlocked
             <button

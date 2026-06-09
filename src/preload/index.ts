@@ -165,6 +165,9 @@ const api = {
       ipcRenderer.on('updater:status', handler);
       return () => ipcRenderer.off('updater:status', handler);
     },
+    /** Get the last known update status — call on mount to catch up with
+     *  any events that fired before the renderer subscribed. */
+    getStatus: () => ipcRenderer.invoke('updater:getStatus'),
     checkNow: () => ipcRenderer.invoke('updater:checkNow'),
     installNow: () => ipcRenderer.invoke('updater:installNow'),
     currentVersion: () => ipcRenderer.invoke('updater:currentVersion'),

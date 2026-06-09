@@ -2,10 +2,17 @@
  * Auto-update plumbing using electron-updater.
  *
  * Flow:
- *   - On app start (after window ready), we check GitHub Releases for a
- *     newer `latest.yml` than the running app's version.
- *   - If newer → download in background → on completion, notify renderer.
- *   - User sees a toast/banner; clicking "Restart now" calls back to install.
+ *   - On app start, we wait for the first browser window to finish loading its
+ *     renderer (did-finish-load) and then wait 1 more second for React to
+ *     hydrate. Only then do we fire the first update check. This guarantees
+ *     the renderer is always subscribed to `updater:status` before any events
+ *     broadcast.
+ *   - The last known status is cached in `lastStatus`. The renderer calls
+ *     `updater:getStatus` on mount so it catches up with anything that fired
+ *     before its subscription was set up (e.g. if update was already
+ *     downloaded by the time the vault is unlocked and the component mounts).
+ *   - On network error, we retry once after 30 seconds (handles the case
+ *     where the network isn't fully up when the app launches).
  *
  * Notes:
  *   - Public GitHub repo means no token needed — anonymous fetch works.
@@ -20,12 +27,24 @@ import { autoUpdater } from 'electron-updater';
 let initialized = false;
 let updateDownloaded = false;
 
+// ── Status cache ─────────────────────────────────────────────────────────────
+// Keeps the last known update status so the renderer can call
+// `updater:getStatus` on mount and immediately sync state, regardless of
+// whether it was alive when the events originally broadcast.
+let lastStatus: Record<string, any> = { kind: 'idle' };
+
 function broadcast(channel: string, payload?: any): void {
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) {
       try { win.webContents.send(channel, payload); } catch { /* */ }
     }
   }
+}
+
+/** Update the cache and broadcast to all windows. */
+function setStatus(payload: Record<string, any>): void {
+  lastStatus = payload;
+  broadcast('updater:status', payload);
 }
 
 export function initAutoUpdater(): void {
@@ -40,8 +59,8 @@ export function initAutoUpdater(): void {
 
   // Log everything for debugging.
   autoUpdater.logger = {
-    info: (m: string) => console.log('[Updater]', m),
-    warn: (m: string) => console.warn('[Updater]', m),
+    info:  (m: string) => console.log('[Updater]', m),
+    warn:  (m: string) => console.warn('[Updater]', m),
     error: (m: string) => console.error('[Updater]', m),
     debug: (m: string) => console.log('[Updater]', m),
   } as any;
@@ -50,20 +69,22 @@ export function initAutoUpdater(): void {
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = false;
 
+  // ── Event handlers ────────────────────────────────────────────────────────
+
   autoUpdater.on('checking-for-update', () => {
-    broadcast('updater:status', { kind: 'checking' });
+    setStatus({ kind: 'checking' });
   });
 
   autoUpdater.on('update-available', (info) => {
-    broadcast('updater:status', { kind: 'available', version: info.version });
+    setStatus({ kind: 'available', version: info.version });
   });
 
   autoUpdater.on('update-not-available', (info) => {
-    broadcast('updater:status', { kind: 'up-to-date', version: info.version });
+    setStatus({ kind: 'up-to-date', version: info.version });
   });
 
   autoUpdater.on('download-progress', (p) => {
-    broadcast('updater:status', {
+    setStatus({
       kind: 'downloading',
       percent: Math.round(p.percent),
       bytesPerSecond: p.bytesPerSecond,
@@ -74,12 +95,25 @@ export function initAutoUpdater(): void {
 
   autoUpdater.on('update-downloaded', (info) => {
     updateDownloaded = true;
-    broadcast('updater:status', { kind: 'downloaded', version: info.version });
+    setStatus({ kind: 'downloaded', version: info.version });
   });
 
   autoUpdater.on('error', (err) => {
-    broadcast('updater:status', { kind: 'error', message: err?.message || String(err) });
+    setStatus({ kind: 'error', message: err?.message || String(err) });
+    // Retry once after 30 seconds — handles the case where the network
+    // isn't fully up yet when the app first launches.
+    setTimeout(() => {
+      autoUpdater.checkForUpdates().catch(e => {
+        console.warn('[Updater] Retry check failed:', e?.message || e);
+      });
+    }, 30_000);
   });
+
+  // ── IPC handlers ──────────────────────────────────────────────────────────
+
+  // Renderer calls this on mount to immediately get the current status and
+  // skip the race with the broadcast-based event system.
+  ipcMain.handle('updater:getStatus', () => lastStatus);
 
   // Renderer triggers install when user clicks "Restart and install".
   ipcMain.handle('updater:installNow', () => {
@@ -102,10 +136,41 @@ export function initAutoUpdater(): void {
 
   ipcMain.handle('updater:currentVersion', () => app.getVersion());
 
-  // Initial check ~3 seconds after startup so the app is responsive first.
+  // ── Initial check timing ──────────────────────────────────────────────────
+  // We fire the first update check ONLY after the first browser window has
+  // finished loading AND React has had 1 second to hydrate. This guarantees
+  // the renderer is subscribed to `updater:status` before any events fire.
+  //
+  // Previously we used setTimeout(3000) from app-start, which raced with
+  // renderer load time on slow machines and caused events to fire into the
+  // void.
+  let firstCheckScheduled = false;
+
+  const scheduleFirstCheck = (): void => {
+    if (firstCheckScheduled) return;
+    firstCheckScheduled = true;
+    // 1-second buffer after did-finish-load for React to hydrate + subscribe.
+    setTimeout(() => {
+      autoUpdater.checkForUpdates().catch(e => {
+        console.warn('[Updater] Initial check failed:', e?.message || e);
+      });
+    }, 1_000);
+  };
+
+  // Primary trigger: first window finishes loading.
+  app.on('browser-window-created', (_, win) => {
+    win.webContents.once('did-finish-load', scheduleFirstCheck);
+  });
+
+  // Fallback: if somehow no did-finish-load fires within 15 seconds, check
+  // anyway so we don't silently skip updates on unusual launch paths.
   setTimeout(() => {
-    autoUpdater.checkForUpdates().catch(e => {
-      console.warn('[Updater] Initial check failed:', e?.message || e);
-    });
-  }, 3_000);
+    if (!firstCheckScheduled) {
+      console.warn('[Updater] Fallback check (did-finish-load never fired)');
+      firstCheckScheduled = true;
+      autoUpdater.checkForUpdates().catch(e => {
+        console.warn('[Updater] Fallback check failed:', e?.message || e);
+      });
+    }
+  }, 15_000);
 }
