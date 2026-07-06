@@ -1,6 +1,6 @@
 {
   "name": "ipo-manager",
-  "version": "0.3.4",
+  "version": "0.3.6",
   "description": "Encrypted vault and login automation for managing family IPO applications",
   "main": "out/main/index.js",
   "author": "private",
@@ -9,6 +9,7 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "build:win": "electron-vite build && electron-builder --win",
+    "release": "electron-vite build && electron-builder --win --publish always",
     "test": "vitest run",
     "test:watch": "vitest",
     "postinstall": "electron-builder install-app-deps && playwright install chromium"

@@ -294,7 +294,7 @@ export const miraeAdapter: LoginAdapter = {
 
     try {
       const otp = await fetchOtp();
-      console.log('[mStock] ✓ OTP received:', otp);
+      console.log(`[mStock] ✓ OTP received (${otp.length} digits)`);
       const filled = await fillDigits(page, otp, 'OTP');
       if (!filled) {
         console.warn('[mStock] Could not find OTP input(s) to fill.');

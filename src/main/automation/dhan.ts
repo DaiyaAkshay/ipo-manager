@@ -329,7 +329,7 @@ export const dhanAdapter: LoginAdapter = {
     if (nextStep === 'otp') {
       try {
         const otp = await fetchOtp();
-        console.log('[Dhan] ✓ OTP received:', otp);
+        console.log(`[Dhan] ✓ OTP received (${otp.length} digits)`);
         const filled = await fillDigits(page, otp, 'OTP');
         if (!filled) {
           console.warn('[Dhan] Could not find OTP input(s) to fill.');

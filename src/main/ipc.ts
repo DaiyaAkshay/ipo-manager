@@ -2,7 +2,6 @@ import type { IpcMain } from 'electron';
 import { dialog, app, BrowserWindow, shell } from 'electron';
 import { copyFileSync, existsSync, statSync, rmSync, readdirSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { spawn } from 'node:child_process';
 import { dbExists, openDb, getDb, rekeyDb, closeDb, getDataDir } from './db/connection';
 import { vaultInitialized, deriveMasterKey, passwordStrengthIssues } from './crypto/master';
 import { encryptField, decryptField, lastN, clearKeyCache as clearFieldKeyCache } from './crypto/field';
@@ -169,31 +168,25 @@ function documentTypeLabel(docType: MemberDocumentType): string {
 }
 
 async function openFolderContainingFile(filePath: string): Promise<string | null> {
-  const folderPath = dirname(filePath);
-
-  if (process.platform === 'win32') {
-    try {
-      const child = spawn('explorer.exe', [`/select,${filePath}`], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: false,
-      });
-      child.unref();
-      return null;
-    } catch (error: any) {
-      console.warn('[Open Folder] explorer.exe /select failed:', error?.message || error);
-    }
-  }
-
-  const folderOpenError = await shell.openPath(folderPath);
-  if (!folderOpenError) return null;
-
+  // Prefer Electron's built-in: it opens the file manager at the file's folder
+  // and selects the file, handling spaces/quoting correctly on every platform.
+  //
+  // We used to spawn `explorer.exe /select,<path>` ourselves, but Node's spawn
+  // auto-quotes the whole argument to `"/select,C:\...\pan (1).pdf"`. When the
+  // filename contains a space (which it does on every repeat download —
+  // "pan (1).pdf", "pan (2).pdf", …), explorer can't parse that form and
+  // silently falls back to opening the default Documents/This-PC folder instead
+  // of Downloads. showItemInFolder avoids the whole problem.
   try {
     shell.showItemInFolder(filePath);
     return null;
   } catch (error: any) {
-    return error?.message || folderOpenError;
+    console.warn('[Open Folder] showItemInFolder failed:', error?.message || error);
   }
+
+  // Fallback: at least open the containing folder (without selecting the file).
+  const folderOpenError = await shell.openPath(dirname(filePath));
+  return folderOpenError || null;
 }
 
 export function registerIpcHandlers(ipc: IpcMain): void {
@@ -1045,11 +1038,9 @@ export function registerIpcHandlers(ipc: IpcMain): void {
     // Used when restoring from another machine's backup folder before
     // committing it as the local backup config.
     if (!folder || typeof folder !== 'string') return { ok: false, error: 'No folder provided.' };
-    const original = backupGetConfig();
-    // Temporarily swap config so listSnapshots reads the foreign folder.
-    backupSetConfig({ folder });
-    const snapshots = backupListSnapshots();
-    backupSetConfig({ folder: original.folder });
+    // Read the foreign folder directly — no global-config swap, so this can't
+    // race with an auto-backup or leave the wrong folder persisted on error.
+    const snapshots = backupListSnapshots(folder);
     return { ok: true, snapshots };
   });
 
@@ -1283,20 +1274,48 @@ async function runLogin(
         balance = null;
       }
       const tbl = kind === 'BANK' ? 'bank_accounts' : 'broker_accounts';
-      balanceFetchedAt = new Date().toISOString();
       if (balance) {
         // Successful scrape — write both the new value and timestamp.
+        // `balance_fetched_at` only moves on a real read, so the "age" shown in
+        // the UI always reflects when the displayed number was actually fetched.
+        balanceFetchedAt = new Date().toISOString();
         db.prepare(
           `UPDATE ${tbl} SET balance = ?, balance_fetched_at = CURRENT_TIMESTAMP WHERE id = ?`
         ).run(balance, accountId);
-      } else {
-        // Login worked, but scraping returned nothing. Bump only the
-        // timestamp so the user sees the refresh attempt landed — the old
-        // balance string stays untouched.
-        db.prepare(
-          `UPDATE ${tbl} SET balance_fetched_at = CURRENT_TIMESTAMP WHERE id = ?`
-        ).run(accountId);
       }
+      // else: login worked but scraping returned nothing — leave the old balance
+      // AND its timestamp untouched, so the age doesn't falsely reset on a value
+      // that wasn't actually refreshed.
+    }
+
+    // If the browser stays open (e.g. AU Bank IPO flow), give the user an
+    // in-page button to re-fetch the balance on demand — useful right after
+    // they transfer funds out to another account and the number goes stale.
+    if (shouldFetchBalance && !shouldCloseAfterFetch && adapter.fetchBalance && adapter.injectBalanceRefreshButton) {
+      const tbl = kind === 'BANK' ? 'bank_accounts' : 'broker_accounts';
+      await adapter.injectBalanceRefreshButton(page, async () => {
+        const fresh = await adapter.fetchBalance!(page);
+        // Only persist + broadcast on a real read. A failed re-fetch leaves the
+        // stored balance and its timestamp untouched, so the "age" never resets
+        // onto a value that wasn't actually refreshed.
+        if (fresh) {
+          const liveDb = getDb();
+          liveDb.prepare(
+            `UPDATE ${tbl} SET balance = ?, balance_fetched_at = CURRENT_TIMESTAMP WHERE id = ?`
+          ).run(fresh, accountId);
+          const freshAt = new Date().toISOString();
+          BrowserWindow.getAllWindows().forEach(w => {
+            try {
+              w.webContents.send('account:balanceUpdated', {
+                kind, accountId, memberId, balance: fresh, balanceFetchedAt: freshAt,
+              });
+            } catch { /* renderer may be gone */ }
+          });
+        }
+        return fresh;
+      }).catch((err: any) => {
+        console.warn('[login] Could not inject balance refresh button:', err?.message || err);
+      });
     }
 
     const auditDetails = balance
@@ -1770,6 +1789,17 @@ async function confirmAuIpoBid(bidRunId: number) {
   `).get(bidRunId) as any;
   if (!bid) return { ok: false, error: 'IPO bid run not found' };
   if (bid.bank_code !== 'AU') return { ok: false, error: 'Only AU IPO bids are supported here' };
+  // Refuse to re-submit a bid that was already placed (or is mid-flight). Without
+  // this, a double-click or a replayed IPC would drive a SECOND real-money
+  // application — the success path never cleared ready_to_submit, so the row
+  // stayed armed. The atomic claim below is the real race guard; these checks
+  // just return friendlier messages on the common (non-racing) path.
+  if (bid.status === 'SUBMITTED') {
+    return { ok: false, error: 'This bid has already been submitted — refusing to submit it again.' };
+  }
+  if (bid.status === 'IN_PROGRESS') {
+    return { ok: false, error: 'This bid is already being submitted. Wait for the current attempt to finish.' };
+  }
   if (!bid.ready_to_submit) return { ok: false, error: 'This AU bid is not marked ready to submit yet' };
 
   const member = db.prepare(`
@@ -1813,6 +1843,20 @@ async function confirmAuIpoBid(bidRunId: number) {
     blockedAmount: bid.blocked_amount,
   };
 
+  // Race-safe claim: atomically flip a still-submittable row to IN_PROGRESS.
+  // Only one concurrent caller can win the UPDATE (changes === 1); a duplicate
+  // call (double-click, retried IPC) sees changes === 0 and is refused. We claim
+  // AFTER all read-only validation above so an early error can't leave a row
+  // stuck IN_PROGRESS. PREPARED → first attempt; FAILED → user-initiated retry.
+  const claim = db.prepare(`
+    UPDATE ipo_bid_runs
+    SET status = 'IN_PROGRESS', updated_at = CURRENT_TIMESTAMP
+    WHERE id = ? AND ready_to_submit = 1 AND status IN ('PREPARED', 'FAILED')
+  `).run(bidRunId);
+  if (claim.changes === 0) {
+    return { ok: false, error: 'This bid is no longer in a submittable state (already submitted or in progress).' };
+  }
+
   const auditInsert = db.prepare('INSERT INTO audit_log (member_id, action, target, status, details) VALUES (?, ?, ?, ?, ?)');
   beginAutomation();
   try {
@@ -1829,6 +1873,7 @@ async function confirmAuIpoBid(bidRunId: number) {
     db.prepare(`
       UPDATE ipo_bid_runs
       SET status = 'SUBMITTED',
+          ready_to_submit = 0,
           bank_reference = ?,
           page_url = ?,
           prepare_warnings_json = ?,

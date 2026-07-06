@@ -138,6 +138,21 @@ const api = {
       ipcRenderer.on('vault:autoSynced', handler);
       return () => ipcRenderer.off('vault:autoSynced', handler);
     },
+    /** Push event: fires when the user re-fetches a balance via the in-browser
+     *  "↻ Balance" button. Returns a cleanup function — call it in useEffect. */
+    onBalanceUpdated: (
+      cb: (data: {
+        kind: 'BANK' | 'BROKER';
+        accountId: number;
+        memberId: number;
+        balance: string | null;
+        balanceFetchedAt: string;
+      }) => void,
+    ): (() => void) => {
+      const handler = (_: Electron.IpcRendererEvent, data: any) => cb(data);
+      ipcRenderer.on('account:balanceUpdated', handler);
+      return () => ipcRenderer.off('account:balanceUpdated', handler);
+    },
   },
   otp: {
     /** Called by the renderer to register a handler for when main needs an OTP. */

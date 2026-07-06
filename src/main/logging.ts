@@ -1,6 +1,11 @@
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getDataDir } from './db/connection';
+
+// Cap the automation log so it can't grow without bound. When it crosses the
+// cap we rotate it to a single `.1` backup (overwriting any previous backup),
+// so at most ~2× MAX_LOG_BYTES of log ever sits on disk.
+const MAX_LOG_BYTES = 2 * 1024 * 1024; // 2 MB
 
 function ensureLogDir(): string {
   const dir = join(getDataDir(), 'logs');
@@ -12,10 +17,24 @@ export function getAutomationLogPath(): string {
   return join(ensureLogDir(), 'automation.log');
 }
 
+function rotateIfNeeded(logPath: string): void {
+  try {
+    if (!existsSync(logPath)) return;
+    if (statSync(logPath).size < MAX_LOG_BYTES) return;
+    const backup = `${logPath}.1`;
+    try { rmSync(backup, { force: true }); } catch { /* */ }
+    renameSync(logPath, backup);
+  } catch {
+    // Rotation is best-effort — never let it break logging.
+  }
+}
+
 export function appendAutomationLog(scope: string, message: string): void {
   const line = `[${new Date().toISOString()}] [${scope}] ${message}\n`;
   try {
-    appendFileSync(getAutomationLogPath(), line, 'utf8');
+    const logPath = getAutomationLogPath();
+    rotateIfNeeded(logPath);
+    appendFileSync(logPath, line, 'utf8');
   } catch {
     // Logging must never break automation.
   }
@@ -29,4 +48,36 @@ export function writeAutomationArtifact(fileName: string, bytes: Buffer): string
   } catch {
     return null;
   }
+}
+
+/**
+ * Wipe automation artifacts that may carry session-identifying content — the
+ * CAPTCHA crops and login-page screenshots written by writeAutomationArtifact,
+ * plus the rotated log backups. The login-page screenshots can show the typed
+ * username, so leaving them unencrypted beside the locked vault defeats the
+ * point of encryption-at-rest. Called on vault lock / reset / manual purge,
+ * alongside purgeBrowserProfiles. Best-effort: never throws.
+ */
+export function purgeAutomationArtifacts(): { artifactsDeleted: number } {
+  let artifactsDeleted = 0;
+  try {
+    const dir = join(getDataDir(), 'logs');
+    if (!existsSync(dir)) return { artifactsDeleted };
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      const lower = entry.name.toLowerCase();
+      // Delete screenshot artifacts and the rotated log backup. Keep the live
+      // automation.log (it no longer contains secrets after redaction) so a
+      // failure that just occurred is still inspectable this session.
+      if (lower.endsWith('.png') || lower === 'automation.log.1') {
+        try {
+          rmSync(join(dir, entry.name), { force: true });
+          artifactsDeleted += 1;
+        } catch { /* leave it for next time */ }
+      }
+    }
+  } catch {
+    // Best-effort cleanup.
+  }
+  return { artifactsDeleted };
 }

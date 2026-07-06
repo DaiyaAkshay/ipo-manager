@@ -85,6 +85,23 @@ export async function getCaptchaAiStatus(): Promise<CaptchaAiStatus> {
   };
 }
 
+/**
+ * Lightweight check: is the CAPTCHA AI actually usable right now?
+ * True only when an Anthropic API key is configured and not in an error state.
+ *
+ * Used to decide whether an "Auto-CAPTCHA failed" banner is meaningful. When no
+ * key is configured, auto-solving was never attempted in the first place, so the
+ * banner would be misleading noise — the user always types the CAPTCHA manually.
+ */
+export async function isCaptchaAiAvailable(): Promise<boolean> {
+  try {
+    const status = await getClaudeCaptchaStatus();
+    return status.configured && status.state === 'connected';
+  } catch {
+    return false;
+  }
+}
+
 export async function setCaptchaAiProvider(_provider: CaptchaAiProvider): Promise<CaptchaAiStatus> {
   writeStoredProviderPreference('anthropic');
   return getCaptchaAiStatus();

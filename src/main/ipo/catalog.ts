@@ -489,10 +489,12 @@ function purgeStaleEntries(): void {
     getDb().exec(`
       DELETE FROM ipo_master_cache
       WHERE close_date IS NOT NULL
-        AND close_date < date('now', '-7 days')
+        AND close_date < date('now', '-7 days', 'localtime')
     `);
-  } catch {
-    // Best-effort — don't break anything if the cleanup fails.
+  } catch (e) {
+    // Best-effort — don't break anything if the cleanup fails, but surface it:
+    // a recurring purge failure means stale closed IPOs accumulate in the list.
+    console.warn('[catalog] purgeStaleEntries failed:', (e as any)?.message || e);
   }
 }
 
@@ -515,7 +517,10 @@ export function listCachedIpoIssues(): IpoCatalogIssue[] {
            fetched_at as fetchedAt
     FROM ipo_master_cache
     WHERE status IN ('LIVE', 'FORTHCOMING')
-      AND (close_date IS NULL OR close_date >= date('now', '-1 day'))
+      -- Use the local (IST) calendar day, not UTC: date('now') is up to ~5.5h
+      -- behind IST, which could otherwise keep a just-closed IPO listed. An IPO
+      -- closing today is still biddable; one that closed yesterday is not.
+      AND (close_date IS NULL OR close_date >= date('now', 'localtime'))
     ORDER BY
       CASE status WHEN 'LIVE' THEN 0 WHEN 'FORTHCOMING' THEN 1 ELSE 2 END,
       close_date,

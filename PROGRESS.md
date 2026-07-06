@@ -198,6 +198,71 @@ Fixed by:
 
 ---
 
+## Phase 7 — AU browser-window UX tweaks
+
+### In-browser "↻ Balance" refresh button
+
+- After AU login (whenever the Chromium window stays open), a small green **↻ Balance** button is injected bottom-left of the AU dashboard (opposite the bottom-right ⚡ APPLY button).
+- Clicking it re-runs the real `fetchBalance` scrape on demand — for when the user transfers funds out to another account and the on-screen / in-app number goes stale — without re-logging in.
+- Wiring: in-page button → `page.exposeFunction` binding → `runLogin` callback that re-scrapes, persists the new balance to the DB, and broadcasts `account:balanceUpdated`. The button flashes the fresh figure as confirmation; the dashboard patches it into state live (new `events.onBalanceUpdated` preload channel).
+- Generic: implemented via optional `LoginAdapter.injectBalanceRefreshButton`, only wired for AU today. Self-heals via MutationObserver and re-injects after full navigations.
+
+### Quieter CAPTCHA handoff when AI is off
+
+- The "Auto-CAPTCHA failed" / "CAPTCHA field could not be located" banners no longer appear when **no Anthropic API key is configured** — auto-solving never ran, so the banner was misleading noise. New `isCaptchaAiAvailable()` gate guards all three overlay sites (main login, IPO-portal auth, input-not-found). The app still waits for manual CAPTCHA entry; it just doesn't nag.
+
+### Bug: document download opened Documents instead of Downloads
+
+- Clicking a member's PAN/Aadhaar saves the file to the user's Downloads folder, then opens that folder with the file selected. It was instead opening the default **Documents / This-PC** folder.
+- Root cause: `openFolderContainingFile` spawned `explorer.exe /select,<path>`. Node's `spawn` auto-quotes the whole arg to `"/select,C:\…\pan (1).pdf"`. Every repeat download produces a spaced filename (`pan (1).pdf`, `pan (2).pdf`, …) via `uniquePath`, and explorer can't parse that quoted form — so it silently falls back to opening the default folder.
+- Fix: replaced the manual spawn with Electron's `shell.showItemInFolder(filePath)` (correct quoting + file selection on every platform), with `shell.openPath(dir)` as fallback. Removed the now-unused `spawn` import.
+
+### Auto-update: publish step + manual check affordance
+
+The end-to-end auto-update plumbing already existed (`updater.ts` with
+`electron-updater`, `initAutoUpdater()` in `index.ts`, the GitHub `publish`
+config, version display, and the download/install banner). Two gaps closed:
+
+- **Publishing.** `build:win` only builds the installer locally — it never
+  uploaded to GitHub, so there was no `latest.yml` for the app to find. Added an
+  `npm run release` script (`electron-vite build && electron-builder --win --publish always`) and a full [docs/RELEASING.md](docs/RELEASING.md) covering version bump, `GH_TOKEN`, and the draft-publish gotcha. **Verify `build.publish` owner/repo (`DaiyaAkshay/ipo-manager`) matches the real repo** — if wrong, updates are never found.
+- **"Am I on the latest?" affordance.** Auto-check runs on launch but showed
+  nothing when already current, and the `updater.checkNow` IPC wasn't surfaced.
+  Added a ⟳ button next to the sidebar version that triggers a manual check,
+  with explicit toast feedback ("You're on the latest version" / "Update
+  available" / failure). A `manualUpdateCheckRef` keeps the passive launch check
+  silent while giving manual checks real feedback.
+
+### Fix: `balance_fetched_at` only moves on a real read
+
+- Previously the timestamp was bumped after **every** post-login fetch attempt, including when the scrape returned nothing (login OK but couldn't read the number). That reset the UI "age" to "just now" on a balance that hadn't actually been refreshed — making stale numbers look fresh.
+- Now `balance_fetched_at` is written **only** alongside a successful balance value, in both paths (post-login fetch and the in-browser ⟳ refresh button). A failed scrape leaves the stored balance and its timestamp untouched, so the displayed age always reflects when the shown number was actually fetched. The refresh button also no longer broadcasts `account:balanceUpdated` on a failed re-fetch.
+
+### New broker: Suresh Rathi Securities
+
+- Added a login adapter for **Suresh Rathi Securities** (`SURESH`) targeting its Meon white-label IPO portal (`ipo.meon.co.in/sureshrathi`) — the IPO-specific login, which is what this app is for. Follows the same fill-and-handoff pattern as the other broker terminals: navigates to the portal, best-effort fills client code / PAN + password via generic selectors, then hands off for manual OTP/CAPTCHA (`otpMode: 'manual'`).
+- Wired through: new `automation/sureshRathi.ts`, registered in `automation/registry.ts` (`SURESH`), added to the renderer `BROKERS` list + `BROKER_THUMB` ('SR' initials — no logo, falls back gracefully), and the Excel importer's `BROKER_CODE_MAP` ("suresh" / "suresh rathi" / "rathi" → `SURESH`). Exporter picks it up automatically (reads codes from the DB). `broker_code` is free-text so no schema change was needed.
+- If Suresh Rathi is actually used via a different portal (mSauda trading terminal or investwell), only `LOGIN_URL` in the adapter needs changing.
+
+### New broker: Upstox
+
+- Added a login adapter for **Upstox** (`UPSTOX`) targeting the web terminal `pro.upstox.com` (unauthenticated visits redirect into Upstox's mobile → OTP → PIN/DOB 2-factor flow; IPOs are applied from inside the terminal). Same fill-and-handoff pattern: best-effort fills mobile number / user id + password/PIN via generic selectors, then hands off for manual OTP (`otpMode: 'manual'`).
+- Wired through: new `automation/upstox.ts`, registered in `registry.ts` (`UPSTOX`), added to renderer `BROKERS` + `BROKER_THUMB` ('UP'), and importer `BROKER_CODE_MAP` ("upstox" / "rksv" → `UPSTOX`).
+
+### Member detail card — reveal passwords
+
+- The click-to-copy member detail card masked passwords / PINs / TOTP secrets as bullets. Added a **👁 Show passwords / 🙈 Hide passwords** toggle in the card header — secrets stay masked by default (shoulder-surfing protection) but can be revealed on demand. Click-copy still copies the real value regardless of reveal state. `maskSecret(label, value, reveal)` gained the reveal flag.
+
+### Audit: cross-PC sync (backup auto-sync on unlock)
+
+Findings and fixes:
+- **FIXED — silent divergence under clock skew (the main "less than ideal").** `autoSyncFromBackup` decided "is there newer data?" by comparing the remote snapshot's wall-clock timestamp (source PC's clock) against the local `lastBackupAt` (this PC's clock). When the two machines' clocks differed, a genuinely newer snapshot could carry an older-looking timestamp and never get pulled — the PCs would stay permanently out of sync. Switched to **snapshot-ID identity**: `lastSnapshotId` is the id this machine last created or synced to; if the folder's newest snapshot id differs, pull it. Clock-independent and exact.
+- **FIXED — duplicate snapshots after a sync.** After restoring, the old code stamped `lastBackupAt` to the restored snapshot's (often old) timestamp, so the 10s post-unlock auto-backup would immediately re-snapshot identical data whenever that snapshot was >4h old — cluttering the folder and needlessly re-triggering the other PC's sync. Now stamps `lastBackupAt` to *now* after a sync.
+- **Open (not fixed) — last-write-wins with no conflict detection.** If both PCs edit while offline, whoever backs up last silently overwrites the other's changes. This is inherent to full-snapshot replace; resolving it needs snapshot lineage / merge, which is a larger design change.
+- **Open (not fixed) — `vaultId` is effectively dead.** `getBackupConfig()` mints a *random* vaultId per machine, and it's never validated on restore/sync, so it can't guard against pointing the folder at the wrong vault. Making it meaningful means adopting the folder's existing vaultId when a second machine attaches — deferred to avoid changing setup semantics here.
+
+---
+
 ## Status snapshot
 
 | Critical audit item                | Status |

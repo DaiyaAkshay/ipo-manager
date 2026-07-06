@@ -225,7 +225,7 @@ interface PreparedAuBid {
 }
 
 const BANKS = ['AU', 'YES', 'SBI', 'KOTAK', 'ICICI', 'BOB', 'PNB', 'HDFC', 'AXIS'];
-const BROKERS = ['ZERODHA', 'DHAN', 'ANGEL', 'MIRAE', 'SHOONYA', 'FYERS', 'GROWW'];
+const BROKERS = ['ZERODHA', 'DHAN', 'ANGEL', 'MIRAE', 'SHOONYA', 'FYERS', 'GROWW', 'SURESH', 'UPSTOX'];
 const MEMBER_DOCUMENT_TYPES: MemberDocumentType[] = ['PAN', 'AADHAAR', 'BIRTH_CERTIFICATE', 'CHEQUE'];
 
 const BANK_THUMB: Record<string, string> = {
@@ -249,6 +249,8 @@ const BROKER_THUMB: Record<string, string> = {
   FYERS: 'FY',
   FYRES: 'FY',
   GROWW: 'GW',
+  SURESH: 'SR',
+  UPSTOX: 'UP',
 };
 
 const BANK_LOGO_SRC: Record<string, string> = {
@@ -595,6 +597,7 @@ export default function Dashboard() {
   const [selectedView,  setSelectedView]  = useState<SelectedView>('all');
   const [updater,       setUpdater]       = useState<UpdaterState>({ kind: 'idle' });
   const [installing,    setInstalling]    = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [appVersion,    setAppVersion]    = useState<string>('');
   const [members,       setMembers]       = useState<Record<number, Member[]>>({});
   const [busy,          setBusy]          = useState<string | null>(null);
@@ -672,9 +675,19 @@ export default function Dashboard() {
       showToast('error', `${label} not available`);
       return;
     }
+    // Auto-clear the clipboard for credential-ish values so a copied password /
+    // TOTP / PAN doesn't sit on the OS clipboard (and Windows clipboard history)
+    // indefinitely. Only fires on the modern clipboard path and only clears if
+    // the clipboard still holds what we wrote — so it never wipes something the
+    // user copied afterwards.
+    const SENSITIVE = /password|pan|aadhaar|aadhar|totp|otp|secret|cvv|\bpin\b|account|customer/i;
+    const sensitive = SENSITIVE.test(label);
+    const CLEAR_AFTER_MS = 45_000;
     try {
+      let modernPath = false;
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(value);
+        modernPath = true;
       } else {
         const ta = document.createElement('textarea');
         ta.value = value;
@@ -685,7 +698,18 @@ export default function Dashboard() {
         document.execCommand('copy');
         document.body.removeChild(ta);
       }
-      showToast('success', `${label} copied`);
+      if (sensitive && modernPath) {
+        const snapshot = value;
+        window.setTimeout(async () => {
+          try {
+            const current = await navigator.clipboard.readText();
+            if (current === snapshot) await navigator.clipboard.writeText('');
+          } catch { /* clipboard unreadable — leave it rather than risk wiping new content */ }
+        }, CLEAR_AFTER_MS);
+        showToast('success', `${label} copied — clears in ${CLEAR_AFTER_MS / 1000}s`);
+      } else {
+        showToast('success', `${label} copied`);
+      }
     } catch {
       showToast('error', `Could not copy ${label}`);
     }
@@ -836,6 +860,40 @@ export default function Dashboard() {
     return () => { if (typeof unsub === 'function') unsub(); };
   }, []);
 
+  // Balance re-fetch — fires when the user clicks the in-browser "↻ Balance"
+  // button (e.g. after transferring funds out). The main process has already
+  // persisted the new value; here we patch it into the on-screen state.
+  useEffect(() => {
+    const unsub = window.api.events.onBalanceUpdated(({ kind, accountId, balance, balanceFetchedAt }) => {
+      if (!balance) return;
+      setMembers(prev => {
+        let changed = false;
+        const next: Record<number, Member[]> = {};
+        for (const [fid, list] of Object.entries(prev)) {
+          next[Number(fid)] = list.map(m => {
+            if (kind === 'BANK') {
+              if (!m.banks.some(b => b.id === accountId)) return m;
+              changed = true;
+              return { ...m, banks: m.banks.map(b => b.id === accountId ? { ...b, balance, balance_fetched_at: balanceFetchedAt } : b) };
+            }
+            if (!m.brokers.some(b => b.id === accountId)) return m;
+            changed = true;
+            return { ...m, brokers: m.brokers.map(b => b.id === accountId ? { ...b, balance, balance_fetched_at: balanceFetchedAt } : b) };
+          });
+        }
+        return changed ? next : prev;
+      });
+      showToast('success', `Balance refreshed . ${balance}`);
+    });
+    return () => { if (typeof unsub === 'function') unsub(); };
+  }, []);
+
+  // True while a *user-initiated* update check is in flight, so we can show
+  // explicit "you're on the latest version" feedback for manual checks without
+  // nagging on every silent launch check. A ref (not state) so the mount-time
+  // onStatus subscription reads the current value instead of a stale closure.
+  const manualUpdateCheckRef = useRef(false);
+
   // Auto-updater — listen for update lifecycle events from main process.
   // We also fetch the app version and the last known status on mount so we
   // never miss events that fired before this component subscribed (the
@@ -863,13 +921,28 @@ export default function Dashboard() {
     // Subscribe to live events for everything that happens after mount.
     const unsub = window.api.updater.onStatus((s) => {
       setUpdater(s as UpdaterState);
+      const wasManual = manualUpdateCheckRef.current;
       if (s.kind === 'available') {
+        manualUpdateCheckRef.current = false;
+        setCheckingUpdate(false);
         showToast('info', `Update available: v${s.version}. Downloading…`);
       } else if (s.kind === 'downloaded') {
+        manualUpdateCheckRef.current = false;
+        setCheckingUpdate(false);
         showToast('success', `Update v${s.version} ready. Click "Restart now" in the banner.`);
+      } else if (s.kind === 'up-to-date') {
+        // Only surface "you're on the latest" for a manual check — stay silent
+        // on the automatic launch check so we don't nag on every startup.
+        if (wasManual) {
+          showToast('success', `You're on the latest version${s.version ? ` (v${s.version})` : ''}.`);
+        }
+        manualUpdateCheckRef.current = false;
+        setCheckingUpdate(false);
       } else if (s.kind === 'error') {
-        // Silent — don't nag the user when GitHub is unreachable.
-        console.warn('[Updater]', s.message);
+        if (wasManual) showToast('error', `Update check failed: ${s.message || 'GitHub unreachable.'}`);
+        else console.warn('[Updater]', s.message); // silent on passive checks
+        manualUpdateCheckRef.current = false;
+        setCheckingUpdate(false);
       }
     });
     return () => { if (typeof unsub === 'function') unsub(); };
@@ -879,6 +952,39 @@ export default function Dashboard() {
     setInstalling(true);
     await window.api.updater.installNow();
     // App will quit and restart — nothing more to do here.
+  }
+
+  // Manual "check for updates" — gives the user an explicit way to confirm they
+  // are on the latest version. Feedback is delivered by the onStatus handler
+  // above (which reads manualUpdateCheckRef), so this just kicks off the check.
+  async function checkForUpdates() {
+    if (checkingUpdate) return;
+    manualUpdateCheckRef.current = true;
+    setCheckingUpdate(true);
+    showToast('info', 'Checking for updates…');
+    try {
+      const res: any = await window.api.updater.checkNow();
+      if (!res?.ok) {
+        manualUpdateCheckRef.current = false;
+        setCheckingUpdate(false);
+        // In dev mode the updater is disabled; surface a clear message.
+        showToast('error', `Update check failed: ${res?.error || 'updates are only available in the installed app.'}`);
+        return;
+      }
+      // On success, feedback comes from the broadcast status events (handled in
+      // the onStatus subscription). Safety net: if no terminal event arrives
+      // within 20s, clear the in-flight flag so the spinner can't get stuck.
+      setTimeout(() => {
+        if (manualUpdateCheckRef.current) {
+          manualUpdateCheckRef.current = false;
+          setCheckingUpdate(false);
+        }
+      }, 20_000);
+    } catch (e: any) {
+      manualUpdateCheckRef.current = false;
+      setCheckingUpdate(false);
+      showToast('error', `Update check failed: ${e?.message || String(e)}`);
+    }
   }
 
   // Refresh CAPTCHA usage + status periodically — shows today's call count and
@@ -2863,6 +2969,25 @@ export default function Dashboard() {
                 v{appVersion}
               </span>
             )}
+            <button
+              onClick={checkForUpdates}
+              disabled={checkingUpdate}
+              title="Check for updates"
+              aria-label="Check for updates"
+              style={{
+                background: 'none',
+                border: 'none',
+                color: '#777',
+                cursor: checkingUpdate ? 'wait' : 'pointer',
+                fontSize: 12,
+                padding: 0,
+                lineHeight: 1,
+                display: 'inline-flex',
+                alignItems: 'center',
+              }}
+            >
+              <span style={{ display: 'inline-block', animation: checkingUpdate ? 'splash-spin 0.9s linear infinite' : 'none' }}>⟳</span>
+            </button>
           </div>
           <div className="brand-sub">
             <span className="status-dot" />vault unlocked
@@ -4404,13 +4529,7 @@ export default function Dashboard() {
                   {memberDetailLoading || !memberDetail ? (
                     <div className="empty"><div className="empty-title">Loading...</div></div>
                   ) : (
-                    <MemberCardBody detail={memberDetail} onCopy={(label, value) => {
-                      if (!value) { showToast('error', `${label} is empty`); return; }
-                      navigator.clipboard.writeText(value).then(
-                        () => showToast('success', `${label} copied`),
-                        () => showToast('error', `Could not copy ${label}`),
-                      );
-                    }} />
+                    <MemberCardBody detail={memberDetail} onCopy={(label, value) => { void copyText(label, value); }} />
                   )}
                 </div>
                 <div className="modal-foot">
@@ -4730,6 +4849,12 @@ export default function Dashboard() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function MemberCardBody({ detail, onCopy }: { detail: any; onCopy: (label: string, value: string) => void }) {
+  // Secrets (passwords / PINs / TOTP) are masked by default so they aren't
+  // exposed to shoulder-surfers the moment the card opens. The user can reveal
+  // them on demand with the toggle below; click-copy always copies the real
+  // value regardless of reveal state.
+  const [revealSecrets, setRevealSecrets] = useState(false);
+
   // A copyable cell — click anywhere on it copies the raw value
   const Cell = ({ label, value }: { label: string; value: string | null | undefined }) => {
     const v = value || '';
@@ -4739,7 +4864,7 @@ function MemberCardBody({ detail, onCopy }: { detail: any; onCopy: (label: strin
         onClick={() => onCopy(label, v)}
         title={v ? `Click to copy ${label}` : `${label} is empty`}
       >
-        {v ? maskSecret(label, v) : '—'}
+        {v ? maskSecret(label, v, revealSecrets) : '—'}
       </td>
     );
   };
@@ -4749,6 +4874,19 @@ function MemberCardBody({ detail, onCopy }: { detail: any; onCopy: (label: strin
 
   return (
     <div className="member-card">
+      {/* Reveal toggle — masked by default; passwords/PINs/TOTP shown on demand. */}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 8 }}>
+        <button
+          type="button"
+          className="btn btn-ghost"
+          onClick={() => setRevealSecrets(r => !r)}
+          title={revealSecrets ? 'Hide passwords, PINs and TOTP secrets' : 'Show passwords, PINs and TOTP secrets'}
+          style={{ fontSize: 12, padding: '4px 10px' }}
+        >
+          {revealSecrets ? '🙈 Hide passwords' : '👁 Show passwords'}
+        </button>
+      </div>
+
       {/* ── Identity — two compact tables stacked, each auto-sized to content ── */}
       <div className="mc-section">Identity</div>
       <table className="mc-table">
@@ -4853,11 +4991,12 @@ function MemberCardBody({ detail, onCopy }: { detail: any; onCopy: (label: strin
   );
 }
 
-function maskSecret(label: string, value: string): string {
-  // Display passwords/PINs/TOTP secrets as bullets in the card; the click-copy
-  // still copies the real value to the clipboard.
+function maskSecret(label: string, value: string, reveal = false): string {
+  // Display passwords/PINs/TOTP secrets as bullets in the card unless the user
+  // has toggled reveal on. The click-copy still copies the real value to the
+  // clipboard either way.
   const isSecret = /password|pin|secret|totp/i.test(label);
-  if (!isSecret) return value;
+  if (!isSecret || reveal) return value;
   return '•'.repeat(Math.min(value.length, 12));
 }
 
@@ -4930,9 +5069,19 @@ function ZerodhaTotpPage() {
 
   function copyOtp() {
     if (!otp) return;
-    navigator.clipboard.writeText(otp);
+    const snapshot = otp;
+    navigator.clipboard.writeText(snapshot);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+    // Clear the OTP from the clipboard after 45s (compare-and-clear so we don't
+    // wipe anything copied afterwards). The TOTP itself rotates every 30s, but
+    // this keeps it from lingering in clipboard history.
+    window.setTimeout(async () => {
+      try {
+        const current = await navigator.clipboard.readText();
+        if (current === snapshot) await navigator.clipboard.writeText('');
+      } catch { /* leave it */ }
+    }, 45_000);
   }
 
   const progressPct = (secondsLeft / 30) * 100;

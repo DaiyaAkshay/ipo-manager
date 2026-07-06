@@ -8,7 +8,7 @@ import {
   PreparedIpoBidResult,
   SubmittedIpoBidResult
 } from './browser';
-import { solveCaptchaText } from '../ai/captcha';
+import { solveCaptchaText, isCaptchaAiAvailable } from '../ai/captcha';
 import { recordCaptchaFeedback, type CaptchaFeedbackRecordInput } from '../ai/captchaFeedback';
 import { appendAutomationLog, writeAutomationArtifact } from '../logging';
 
@@ -258,6 +258,143 @@ async function injectFloatingApplyButton(page: Page): Promise<void> {
 }
 
 /**
+ * Inject the "↻ Balance" button DOM into the current page. Split out from
+ * injectFloatingRefreshBalanceButton so it can be re-run after a full page
+ * navigation (the exposeFunction binding persists, but the DOM does not).
+ */
+async function injectRefreshBalanceButtonDom(page: Page, bindingName: string): Promise<void> {
+  await page.evaluate((binding) => {
+    const BUTTON_ID = '__ipo_manager_refresh_balance__';
+    const IDLE = '↻  Balance';
+    const OK_BG = 'linear-gradient(135deg, #a7d8b0, #6fbf87)';
+
+    function buildButton(): HTMLButtonElement {
+      const existing = document.getElementById(BUTTON_ID);
+      if (existing) existing.remove();
+
+      const btn = document.createElement('button');
+      btn.id = BUTTON_ID;
+      btn.type = 'button';
+      btn.textContent = IDLE;
+      btn.title = 'Re-fetch the available balance — use this after you transfer funds out and the number goes stale';
+
+      Object.assign(btn.style, {
+        position: 'fixed',
+        bottom: '28px',
+        left: '28px',                            // bottom-LEFT so it never overlaps the bottom-right APPLY button
+        zIndex: '2147483647',
+        padding: '12px 20px',
+        fontSize: '14px',
+        fontWeight: '700',
+        letterSpacing: '0.04em',
+        color: '#10281a',
+        background: OK_BG,
+        border: '2px solid #3f9c6d',
+        borderRadius: '10px',
+        cursor: 'pointer',
+        boxShadow: '0 8px 24px rgba(0,0,0,0.4), 0 2px 6px rgba(0,0,0,0.2)',
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
+        transition: 'transform 120ms, box-shadow 120ms, filter 120ms',
+        userSelect: 'none',
+      } as Partial<CSSStyleDeclaration>);
+
+      btn.addEventListener('mouseenter', () => {
+        btn.style.transform = 'translateY(-2px) scale(1.03)';
+      });
+      btn.addEventListener('mouseleave', () => {
+        btn.style.transform = '';
+      });
+
+      let busy = false;
+      btn.addEventListener('click', async () => {
+        if (busy) return;
+        busy = true;
+        btn.style.filter = 'grayscale(0.35)';
+        btn.textContent = '⏳  Refreshing…';
+        try {
+          const fn = (window as any)[binding];
+          const res = fn ? await fn() : null;
+          if (res && res.ok && res.balance) {
+            btn.style.background = OK_BG;
+            btn.textContent = '✓  ' + res.balance;
+          } else if (res && res.ok) {
+            btn.style.background = 'linear-gradient(135deg, #e8d28c, #d4b25a)';
+            btn.textContent = '✓  No balance found';
+          } else {
+            btn.style.background = 'linear-gradient(135deg, #e89090, #c46060)';
+            btn.textContent = '✗  Refresh failed';
+          }
+        } catch {
+          btn.style.background = 'linear-gradient(135deg, #e89090, #c46060)';
+          btn.textContent = '✗  Refresh failed';
+        } finally {
+          setTimeout(() => {
+            btn.style.background = OK_BG;
+            btn.style.filter = '';
+            btn.textContent = IDLE;
+            busy = false;
+          }, 4500);
+        }
+      });
+
+      document.body.appendChild(btn);
+      return btn;
+    }
+
+    buildButton();
+
+    // Self-heal: if AU's React rerender removes our button, re-add it.
+    if (!(window as any).__ipoManagerRefreshBalanceObserver) {
+      const observer = new MutationObserver(() => {
+        if (!document.getElementById(BUTTON_ID)) {
+          try { buildButton(); } catch { /* */ }
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: false });
+      (window as any).__ipoManagerRefreshBalanceObserver = observer;
+    }
+  }, bindingName);
+}
+
+/**
+ * Inject a small fixed-position "↻ Balance" button into the still-open AU
+ * dashboard window so the user can re-fetch the balance on demand — handy right
+ * after they transfer funds out to another account and the on-screen number
+ * (and the value in the app) goes stale.
+ *
+ * Wiring: the in-page button calls a Node-side binding (page.exposeFunction)
+ * that re-runs the real balance scrape, persists it, notifies the renderer, and
+ * returns the fresh string, which the button flashes back as confirmation.
+ * Idempotent — safe to call more than once on the same page.
+ */
+async function injectFloatingRefreshBalanceButton(
+  page: Page,
+  onRefresh: () => Promise<string | null>,
+): Promise<void> {
+  const BINDING = '__ipoManagerRefreshBalance';
+  try {
+    if (!(page as any).__ipoRefreshBalanceBound) {
+      await page.exposeFunction(BINDING, async () => {
+        try {
+          const balance = await onRefresh();
+          return { ok: true, balance };
+        } catch (e: any) {
+          return { ok: false, error: e?.message || String(e) };
+        }
+      });
+      (page as any).__ipoRefreshBalanceBound = true;
+      // The binding survives navigations, but the injected DOM does not — re-add
+      // the button after any full page load.
+      page.on('load', () => { injectRefreshBalanceButtonDom(page, BINDING).catch(() => {}); });
+    }
+    await injectRefreshBalanceButtonDom(page, BINDING);
+    console.log('[AU Bank] Floating Refresh Balance button injected.');
+  } catch (e) {
+    console.warn('[AU Bank] Could not inject Refresh Balance button:', (e as Error).message);
+  }
+}
+
+/**
  * Handle the AU IPO portal (iposmart.au.bank.in) authentication gate.
  *
  * The IPO subdomain uses the SAME Angular-Material login form as the main
@@ -319,10 +456,15 @@ async function handleAuIpoPortalAuth(page: Page, draft: IpoBidDraft): Promise<vo
       // completion automatically.
       const captchaInput = await findAuCaptchaInput(page, draft.username || '', passwordFieldRef);
       if (captchaInput) {
-        await showAuCaptchaManualOverlay(
-          page,
-          'Please type the CAPTCHA shown above and click Login. The app will continue automatically once you submit.',
-        );
+        // Only surface the "Auto-CAPTCHA failed" banner when the AI was actually
+        // available to attempt a solve. With no API key configured, auto-solving
+        // never ran, so the banner is just misleading noise.
+        if (await isCaptchaAiAvailable()) {
+          await showAuCaptchaManualOverlay(
+            page,
+            'Please type the CAPTCHA shown above and click Login. The app will continue automatically once you submit.',
+          );
+        }
         await waitForManualCaptchaSubmit(page, captchaInput, 120_000);
       }
     }
@@ -898,11 +1040,15 @@ async function trySolveAuCaptcha(page: Page, username: string, passwordField?: L
       if (artifactPath) appendAutomationLog('AU_CAPTCHA', `Saved AU full-page screenshot for detection failure to ${artifactPath}`);
     }
     // The CAPTCHA input couldn't be located — the page may have changed.
-    // Show a banner so the user knows to look around themselves.
-    await showAuCaptchaManualOverlay(
-      page,
-      'The CAPTCHA field could not be located automatically. Please enter the CAPTCHA below and click Login.',
-    );
+    // Show a banner so the user knows to look around themselves, but only when
+    // the AI was actually available; otherwise there is no "auto" step to fail
+    // and the banner would just be noise.
+    if (await isCaptchaAiAvailable()) {
+      await showAuCaptchaManualOverlay(
+        page,
+        'The CAPTCHA field could not be located automatically. Please enter the CAPTCHA below and click Login.',
+      );
+    }
     return false;
   }
 
@@ -981,7 +1127,7 @@ async function trySolveAuCaptcha(page: Page, username: string, passwordField?: L
       await captchaInput.dispatchEvent('blur').catch(() => {});
       if (!accepted) {
         console.warn('[AU Bank] CAPTCHA field did not accept autofill.');
-        appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: CAPTCHA field rejected autofill value "${solution}".`);
+        appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: CAPTCHA field rejected autofill (${solution.length}-char value).`);
         return false;
       }
 
@@ -998,7 +1144,7 @@ async function trySolveAuCaptcha(page: Page, username: string, passwordField?: L
 
       await page.waitForTimeout(1_200);
       const finalValue = await captchaInput.inputValue().then(v => v.trim()).catch(() => '');
-      appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: CAPTCHA field value before submit: "${finalValue}" (expected "${solution}").`);
+      appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: CAPTCHA field holds ${finalValue.length} chars before submit (expected ${solution.length}; match=${finalValue.toLowerCase() === solution.toLowerCase()}).`);
       if (finalValue.toLowerCase() !== solution.toLowerCase()) {
         console.warn('[AU Bank] CAPTCHA value changed before submit; skipping auto-submit.');
         appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: CAPTCHA value changed before submit; skipped automatic login click.`);
@@ -2464,10 +2610,16 @@ export const auBankAdapter: LoginAdapter = {
       // submits successfully.
       const captchaInput = await findAuCaptchaInput(page, creds.username, passwordFieldRef);
       if (captchaInput) {
-        await showAuCaptchaManualOverlay(
-          page,
-          'Please type the CAPTCHA shown above and click Login. The app will continue automatically once you submit.',
-        );
+        // Only surface the "Auto-CAPTCHA failed" banner when the AI was actually
+        // available to attempt a solve. With no API key configured, auto-solving
+        // never ran, so the banner is just misleading noise — the user always
+        // types the CAPTCHA in manually anyway.
+        if (await isCaptchaAiAvailable()) {
+          await showAuCaptchaManualOverlay(
+            page,
+            'Please type the CAPTCHA shown above and click Login. The app will continue automatically once you submit.',
+          );
+        }
         await waitForManualCaptchaSubmit(page, captchaInput, 120_000);
       }
     }
@@ -2510,7 +2662,7 @@ export const auBankAdapter: LoginAdapter = {
     try {
       if (boxCount > 0) {
         const otp = await fetchOtp();
-        console.log('[AU Bank] Got OTP:', otp);
+        console.log(`[AU Bank] OTP received (${otp.length} digits)`);
         await otpBoxes.first().click();
         await page.keyboard.type(otp.slice(0, boxCount), { delay: 0 });
         console.log('[AU Bank] Filled OTP digits');
@@ -2541,6 +2693,10 @@ export const auBankAdapter: LoginAdapter = {
     startAuKeepAlive(page);
 
     console.log('[AU Bank] Browser remains open for IPO application.');
+  },
+
+  async injectBalanceRefreshButton(page: Page, onRefresh: () => Promise<string | null>): Promise<void> {
+    return injectFloatingRefreshBalanceButton(page, onRefresh);
   },
 
   async fetchBalance(page: Page): Promise<string | null> {

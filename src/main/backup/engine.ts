@@ -35,6 +35,7 @@ import {
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { getDataDir, getDbPath, getDb, closeDb, openDb } from '../db/connection';
 import { getEncryptedDocumentPath } from '../documents/storage';
 import { deriveMasterKeyFromMeta, type VaultMeta } from '../crypto/master';
@@ -353,11 +354,15 @@ export async function createSnapshot(masterKey: Buffer): Promise<CreateSnapshotR
 
 // ── Snapshot listing ────────────────────────────────────────────────────────
 
-export function listSnapshots(): SnapshotInfo[] {
-  const config = getBackupConfig();
-  if (!config.folder || !existsSync(getSnapshotsDir(config.folder))) return [];
+export function listSnapshots(sourceFolder?: string): SnapshotInfo[] {
+  // Read from the given folder if provided (e.g. previewing another machine's
+  // backup before adopting it), else the configured local folder. Taking the
+  // folder as an argument avoids mutating the persistent backup config just to
+  // peek at a foreign folder — a swap that could race with an auto-backup.
+  const folder = sourceFolder || getBackupConfig().folder;
+  if (!folder || !existsSync(getSnapshotsDir(folder))) return [];
 
-  const dirs = readdirSync(getSnapshotsDir(config.folder), { withFileTypes: true })
+  const dirs = readdirSync(getSnapshotsDir(folder), { withFileTypes: true })
     .filter(e => e.isDirectory())
     .map(e => e.name);
 
@@ -366,7 +371,7 @@ export function listSnapshots(): SnapshotInfo[] {
   for (const id of dirs) {
     const ts = parseSnapshotIdTimestamp(id);
     if (!ts) continue;
-    const manifestPath = join(getSnapshotsDir(config.folder), id, 'manifest.json');
+    const manifestPath = join(getSnapshotsDir(folder), id, 'manifest.json');
     if (!existsSync(manifestPath)) continue;
     let manifest: SnapshotManifest;
     try {
@@ -499,6 +504,64 @@ export interface RestoreResult {
  *   - Copy each referenced blob into <dataDir>/documents/<file_uuid>.enc
  *   - Re-open the DB with the snapshot-era master key
  */
+/**
+ * Open a snapshot's vault.db read-only with its derived key and confirm it is
+ * intact BEFORE we let it overwrite the live vault. An interrupted cloud sync
+ * (OneDrive/Dropbox) can leave a truncated or torn DB file; restoring that over
+ * a good live vault would be silent data loss. Returns ok only if the key works
+ * AND PRAGMA integrity passes AND the expected schema is present.
+ */
+function validateSnapshotDb(dbPath: string, rawKey: Buffer): { ok: true } | { ok: false; error: string } {
+  let probe: Database.Database | null = null;
+  try {
+    probe = new Database(dbPath, { readonly: true });
+    probe.pragma(`key = "x'${rawKey.toString('hex')}'"`);
+    probe.pragma('cipher_compatibility = 4');
+    // Wrong key throws here; a truncated/corrupt file fails quick_check.
+    const result = probe.pragma('quick_check', { simple: true }) as string;
+    if (result !== 'ok') {
+      return { ok: false, error: `Snapshot failed integrity check (${result}). The backup file may be corrupt or a cloud sync was interrupted.` };
+    }
+    // Sanity-check that this is actually our schema, not just any readable DB.
+    probe.prepare('SELECT 1 FROM members LIMIT 1').get();
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: `Snapshot database could not be verified: ${e?.message || e}` };
+  } finally {
+    try { probe?.close(); } catch { /* */ }
+  }
+}
+
+/**
+ * Keep only the most recent few `.pre-restore-*` sidecars per base file. Each
+ * restore (including the automatic auto-sync-on-unlock) leaves a full encrypted
+ * DB copy behind; without pruning these grow without bound on a two-machine
+ * cloud-sync setup. We keep the latest KEEP so a recent restore is still
+ * recoverable, and delete the rest.
+ */
+function pruneOldPreRestoreSidecars(dataDir: string, keep = 3): void {
+  try {
+    const entries = readdirSync(dataDir, { withFileTypes: true })
+      .filter(e => e.isFile() && e.name.includes('.pre-restore-'))
+      .map(e => e.name);
+    // Group by the base file (e.g. "vault.db", "vault.meta.json").
+    const groups = new Map<string, string[]>();
+    for (const name of entries) {
+      const base = name.slice(0, name.indexOf('.pre-restore-'));
+      const list = groups.get(base) || [];
+      list.push(name);
+      groups.set(base, list);
+    }
+    for (const list of groups.values()) {
+      // Timestamp is embedded in the name, so a lexical sort is chronological.
+      list.sort((a, b) => b.localeCompare(a));
+      for (const stale of list.slice(keep)) {
+        try { unlinkSync(join(dataDir, stale)); } catch { /* */ }
+      }
+    }
+  } catch { /* best-effort */ }
+}
+
 export async function restoreSnapshot(
   snapshotId: string,
   masterPassword: string,
@@ -571,19 +634,37 @@ export async function restoreSnapshot(
       }
     }
 
-    // 2) Restore the DB. Move the existing DB to a .pre-restore-<ts> sidecar
-    //    so the user can roll back manually if something goes wrong.
+    // 2) Validate the snapshot DB BEFORE we touch the live vault. This runs
+    //    while the live DB is still open and untouched, so a corrupt/truncated
+    //    snapshot aborts the restore with zero data loss.
+    const dbValidation = validateSnapshotDb(snapshotDbPath, snapshotMasterKey);
+    if (!dbValidation.ok) return dbValidation;
+
+    // 3) Restore the DB. Move the existing DB to a .pre-restore-<ts> sidecar so
+    //    the user can roll back manually. If we CANNOT preserve the current
+    //    vault, abort rather than overwrite it with no backup — better to fail
+    //    the restore than to destroy the only copy of the live data.
     const targetDbPath = getDbPath();
     closeDb();
     if (existsSync(targetDbPath)) {
       const stamp = new Date().toISOString().replace(/:/g, '-');
       const sidecar = `${targetDbPath}.pre-restore-${stamp}`;
-      try { renameSync(targetDbPath, sidecar); } catch { /* */ }
+      try {
+        renameSync(targetDbPath, sidecar);
+      } catch (e: any) {
+        return {
+          ok: false,
+          error: `Could not back up the current vault before restoring (${e?.message || e}). ` +
+            'Restore aborted — your existing data is unchanged. Close any program that may be ' +
+            'holding the database open and try again.',
+        };
+      }
     }
     copyFileSync(snapshotDbPath, targetDbPath);
     const dbBytes = statSync(targetDbPath).size;
+    pruneOldPreRestoreSidecars(getDataDir());
 
-    // 3) Restore the meta file (so future unlocks on this machine derive the
+    // 4) Restore the meta file (so future unlocks on this machine derive the
     //    same key as the snapshot was encrypted with).
     const liveMetaPath = join(getDataDir(), 'vault.meta.json');
     if (existsSync(liveMetaPath)) {
@@ -592,10 +673,10 @@ export async function restoreSnapshot(
     }
     copyFileSync(snapshotMetaPath, liveMetaPath);
 
-    // 4) Write the field key into OS keychain.
+    // 5) Write the field key into OS keychain.
     if (fieldKey) await writeFieldKey(fieldKey);
 
-    // 5) Restore documents from blobs/ → <dataDir>/documents/
+    // 6) Restore documents from blobs/ → <dataDir>/documents/
     const dataDocsDir = ensureDir(join(getDataDir(), 'documents'));
     const blobsDir = getBlobsDir(root);
     let restored = 0;
@@ -608,7 +689,7 @@ export async function restoreSnapshot(
       restored += 1;
     }
 
-    // 6) Re-open the DB with the snapshot-era master key.
+    // 7) Re-open the DB with the snapshot-era master key.
     openDb(snapshotMasterKey);
 
     return { ok: true, documentsRestored: restored, dbBytes };
@@ -651,6 +732,25 @@ export async function autoSyncFromBackup(masterPassword: string): Promise<AutoSy
   const latest = latestSnapshotId(config.folder);
   if (!latest) return { synced: false };
 
+  const state = getBackupState();
+
+  // Identity-based "already applied" check.
+  //
+  // `lastSnapshotId` is the id of the snapshot this machine most recently
+  // CREATED (createSnapshot) or SYNCED TO (this function). If the folder's
+  // newest snapshot is that same id, we already hold its data — nothing to do.
+  //
+  // This deliberately replaces the old wall-clock comparison
+  // (snapshotTime <= lastBackupAt). Comparing a remote snapshot's timestamp
+  // (source machine's clock) against our local lastBackupAt (our clock) fails
+  // silently whenever the two PCs' clocks differ: a genuinely newer snapshot
+  // could carry an older-looking timestamp and never get pulled, leaving the
+  // machines permanently diverged. Snapshot ids are unique per snapshot, so
+  // identity is clock-independent and exact.
+  if (state.lastSnapshotId && latest === state.lastSnapshotId) {
+    return { synced: false };
+  }
+
   const snapsDir = getSnapshotsDir(config.folder);
   const manifestPath = join(snapsDir, latest, 'manifest.json');
   if (!existsSync(manifestPath)) return { synced: false };
@@ -658,13 +758,6 @@ export async function autoSyncFromBackup(masterPassword: string): Promise<AutoSy
   let manifest: SnapshotManifest;
   try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')); }
   catch { return { synced: false }; }
-
-  const snapshotTime = new Date(manifest.timestamp).getTime();
-  const state = getBackupState();
-  const localLastBackup = state.lastBackupAt ? new Date(state.lastBackupAt).getTime() : 0;
-
-  // Nothing to do — our local data is already as new as the latest snapshot.
-  if (snapshotTime <= localLastBackup) return { synced: false };
 
   // Read the snapshot's vault.meta.json to derive the correct master key.
   const snapshotMetaPath = join(snapsDir, latest, 'vault.meta.json');
@@ -683,10 +776,14 @@ export async function autoSyncFromBackup(masterPassword: string): Promise<AutoSy
   const result = await restoreSnapshot(latest, masterPassword);
   if (!result.ok) return { synced: false, error: result.error };
 
-  // Update local state to match the restored snapshot so the next unlock won't
-  // try to restore the same snapshot again.
+  // We are now in sync with `latest`. Record it as lastSnapshotId so we won't
+  // restore it again, and stamp lastBackupAt to NOW: the local data already
+  // matches the folder's newest snapshot, so the post-unlock auto-backup must
+  // NOT immediately re-snapshot identical data (which the old code did whenever
+  // the restored snapshot happened to be >4h old, littering the folder with
+  // duplicates and needlessly re-triggering the other PC's sync).
   writeState({
-    lastBackupAt: manifest.timestamp,
+    lastBackupAt: new Date().toISOString(),
     lastBackupError: null,
     lastSnapshotId: latest,
     inProgress: false,

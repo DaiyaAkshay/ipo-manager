@@ -211,7 +211,7 @@ async function completeZerodhaCredentialFlow(
     const otp = creds.totpSecret
       ? (await TOTP.generate(creds.totpSecret)).otp
       : await fetchOtp();
-    console.log('[Zerodha] TOTP generated:', otp);
+    console.log(`[Zerodha] TOTP generated (${otp.length} digits)`);
     await pinField.clear();
     await pinField.fill(otp);
 

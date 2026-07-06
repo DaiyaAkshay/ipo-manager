@@ -16,6 +16,7 @@ import { basename, dirname, extname, join } from 'node:path';
 import { mkdirSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { spawn } from 'node:child_process';
+import { purgeAutomationArtifacts } from '../logging';
 
 const sessionCache = new Map<string, BrowserContext>();
 const contextDownloadDirs = new WeakMap<BrowserContext, string>();
@@ -546,6 +547,10 @@ export async function purgeBrowserProfiles(): Promise<{ contextsClosed: number; 
       }
     }
   } catch { /* */ }
+  // Also wipe automation screenshots / log backups left in data/logs — these
+  // can show the typed username and shouldn't outlive the session beside the
+  // locked, encrypted vault.
+  try { purgeAutomationArtifacts(); } catch { /* */ }
   return { contextsClosed, profilesDeleted };
 }
 
@@ -719,6 +724,14 @@ export interface LoginAdapter {
    * Returns a formatted string like "₹1,23,456.78" or null if not found.
    */
   fetchBalance?(page: Page): Promise<string | null>;
+  /**
+   * Optional: inject a small in-page control into the still-open Chromium
+   * window that lets the user re-run the balance scrape on demand — e.g. after
+   * they transfer funds out and the on-screen balance goes stale. `onRefresh`
+   * performs the actual re-fetch + persistence + renderer notification and
+   * resolves with the fresh balance string (or null).
+   */
+  injectBalanceRefreshButton?(page: Page, onRefresh: () => Promise<string | null>): Promise<void>;
   downloadPortfolioReport?(
     page: Page,
     creds: LoginCredentials,

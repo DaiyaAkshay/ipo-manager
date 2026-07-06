@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, ipcMain } from 'electron';
+import { app, BrowserWindow, Menu, ipcMain, shell } from 'electron';
 import { join } from 'node:path';
 import { markActivity, shouldAutolock } from './activity';
 import { closeDb } from './db/connection';
@@ -24,6 +24,21 @@ function createWindow(): void {
     }
   });
   mainWindow.setMenu(null);
+
+  // ── Navigation hardening ──────────────────────────────────────────────────
+  // The renderer is a local SPA that never legitimately opens child windows or
+  // top-navigates away from its own bundle (external links go through the
+  // https-only shell:openExternal IPC). Deny window.open and block any
+  // top-level navigation to a different URL, so a compromised renderer can't
+  // load an attacker page that would inherit the privileged preload bridge.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https:\/\//i.test(url)) void shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const current = mainWindow?.webContents.getURL();
+    if (current && url !== current) event.preventDefault();
+  });
 
   mainWindow.on('ready-to-show', () => mainWindow?.show());
 

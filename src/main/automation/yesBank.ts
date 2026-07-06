@@ -104,7 +104,7 @@ export const yesBankAdapter: LoginAdapter = {
     // ── Fetch OTP from Gmail ──────────────────────────────────────────────────
     try {
       const otp = await fetchOtp();
-      console.log('[YES Bank] ✓ OTP received:', otp);
+      console.log(`[YES Bank] ✓ OTP received (${otp.length} digits)`);
       await otpField.clear();
       await otpField.fill(otp);
 

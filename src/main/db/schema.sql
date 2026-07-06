@@ -229,6 +229,19 @@ CREATE TABLE IF NOT EXISTS ipo_master_cache (
 CREATE INDEX IF NOT EXISTS idx_ipo_master_cache_status
   ON ipo_master_cache(status, open_date, close_date);
 
+CREATE TABLE IF NOT EXISTS mobile_recharge_tracking (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  mobile_number TEXT NOT NULL,
+  mobile_model TEXT,
+  recharge_date TEXT,
+  validity_days INTEGER,
+  display_order INTEGER DEFAULT 0,
+  notes TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -242,3 +255,9 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_member ON audit_log(member_id);
 
 INSERT OR IGNORE INTO schema_version (version) VALUES (1);
+
+-- Stamp the SQLite-native user_version pragma so the migration system in
+-- connection.ts knows a fresh install is already at the latest schema and
+-- skips all numbered migration steps. MUST match CURRENT_SCHEMA_VERSION in
+-- connection.ts and the PRAGMA in schema.ts (the runtime source of truth).
+PRAGMA user_version = 3;

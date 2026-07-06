@@ -248,7 +248,9 @@ export async function solveCaptchaTextWithClaude(imageBytes: Buffer, mediaType =
 
     const cleaned = cleanCaptchaResponse(rawText);
 
-    appendAutomationLog('AU_CAPTCHA', `Anthropic raw response from ${model}: "${rawText}" => cleaned "${cleaned}" (in=${usage.input_tokens || 0} out=${usage.output_tokens || 0} tokens)`);
+    // Do NOT log the decoded CAPTCHA characters — log only shape/length so a
+    // shared or stolen automation.log never reveals solved login challenges.
+    appendAutomationLog('AU_CAPTCHA', `Anthropic response from ${model}: ${rawText.length} raw chars => ${cleaned ? `${cleaned.length}-char solution` : 'no usable text'} (in=${usage.input_tokens || 0} out=${usage.output_tokens || 0} tokens)`);
     if (!cleaned) return null;
     return cleaned;
   }

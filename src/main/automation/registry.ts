@@ -15,6 +15,8 @@ import { miraeAdapter }   from './mirae';
 import { shoonyaAdapter } from './shoonya';
 import { fyersAdapter }   from './fyers';
 import { growwAdapter }   from './groww';
+import { sureshRathiAdapter } from './sureshRathi';
+import { upstoxAdapter }   from './upstox';
 import { OTP_PRESETS }    from '../email/gmail';
 
 const BANK_ADAPTERS: Record<string, LoginAdapter> = {
@@ -38,6 +40,8 @@ const BROKER_ADAPTERS: Record<string, LoginAdapter> = {
   FYERS:   fyersAdapter,
   FYRES:   fyersAdapter,
   GROWW:   growwAdapter,
+  SURESH:  sureshRathiAdapter,
+  UPSTOX:  upstoxAdapter,
 };
 
 const OTP_PRESET_BY_CODE: Record<string, { query: string; otpRegex: RegExp }> = {

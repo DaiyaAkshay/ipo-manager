@@ -58,7 +58,9 @@ const BROKER_CODE_MAP: Record<string, string> = {
   'mirae': 'MIRAE', 'mstock': 'MIRAE', 'm.stock': 'MIRAE', 'mirae asset': 'MIRAE',
   'shoonya': 'SHOONYA',
   'fyers': 'FYERS', 'fyres': 'FYERS',
-  'groww': 'GROWW'
+  'groww': 'GROWW',
+  'suresh': 'SURESH', 'suresh rathi': 'SURESH', 'rathi': 'SURESH', 'suresh rathi securities': 'SURESH',
+  'upstox': 'UPSTOX', 'rksv': 'UPSTOX'
 };
 
 const BANK_CODE_MAP: Record<string, string> = {
