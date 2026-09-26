@@ -79,7 +79,7 @@ export async function deriveMasterKeyFromMeta(password: string, meta: VaultMeta)
   const salt = Buffer.from(meta.saltHex, 'hex');
   const argonOpts = meta.argonOpts || ARGON_OPTS;
   const key = await argon2.hash(password, {
-    type: argonOpts.type ?? ARGON_OPTS.type,
+    type: (argonOpts.type ?? ARGON_OPTS.type) as 0 | 1 | 2,
     memoryCost: argonOpts.memoryCost ?? ARGON_OPTS.memoryCost,
     timeCost: argonOpts.timeCost ?? ARGON_OPTS.timeCost,
     parallelism: argonOpts.parallelism ?? ARGON_OPTS.parallelism,

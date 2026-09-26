@@ -1,10 +1,17 @@
 import keytar from 'keytar';
 import { appendAutomationLog } from '../logging';
-import { canMakeCaptchaCall, recordCaptchaCall, setCaptchaConsent } from './usage';
+import { canMakeCaptchaCall, hasCaptchaConsentDecision, recordCaptchaCall, setCaptchaConsent } from './usage';
+
+// A stalled connection must not hold a bank login hostage — the manual CAPTCHA
+// fallback takes over when this elapses.
+const CAPTCHA_REQUEST_TIMEOUT_MS = 20_000;
 
 const KEYTAR_SERVICE = 'ipo-manager';
 const KEYTAR_ACCOUNT_API_KEY = 'anthropic-api-key-v1';
-const DEFAULT_MODEL = 'claude-sonnet-4-20250514';
+// Current Sonnet (same tier the solver always used). claude-sonnet-4-20250514
+// is deprecated, and the old 3.7-Sonnet / 3.5-Haiku fallbacks were retired on
+// 2026-02-19 — they now return 404, so a stale list silently broke auto-solve.
+const DEFAULT_MODEL = 'claude-sonnet-5';
 
 // Tracks the last authentication failure so getClaudeCaptchaStatus can
 // surface it in the sidebar pill without needing a live API probe.
@@ -36,11 +43,24 @@ function configuredModel(): string {
 function candidateModels(): string[] {
   return Array.from(new Set([
     configuredModel(),
-    'claude-sonnet-4-20250514',
-    'claude-3-7-sonnet-20250219',
-    'claude-3-5-haiku-20241022',
-    'claude-3-5-haiku-latest',
+    'claude-sonnet-5',
+    'claude-sonnet-4-6',
+    'claude-haiku-4-5',
   ].filter(Boolean)));
+}
+
+/**
+ * Per-model request knobs. Sonnet 5 / Opus 5+ reject sampling parameters
+ * (temperature → 400) and think adaptively by default, and max_tokens counts
+ * thinking + answer — so keep thinking brief with effort "low" and leave room
+ * for it. Haiku 4.5 rejects `effort`; Sonnet 4.6 and older models don't think
+ * unless asked. No model gets `temperature` (the default is accepted everywhere).
+ */
+function requestKnobs(model: string): Record<string, unknown> {
+  if (/^claude-(sonnet-5|opus-5|opus-4-[5-9]|fable)/.test(model)) {
+    return { max_tokens: 1024, output_config: { effort: 'low' } };
+  }
+  return { max_tokens: 1024 };
 }
 
 function cleanCaptchaResponse(rawText: string): string | null {
@@ -157,6 +177,10 @@ export async function solveCaptchaTextWithClaude(imageBytes: Buffer, mediaType =
   // key in the keychain IS implicit consent — the user explicitly configured
   // this key for CAPTCHA solving. Auto-grant so they are not silently broken.
   let gate = canMakeCaptchaCall();
+  if (!gate.ok && gate.reason === 'CONSENT_REQUIRED' && hasCaptchaConsentDecision()) {
+    appendAutomationLog('AU_CAPTCHA', 'Claude solve skipped: CAPTCHA AI consent is switched off in settings.');
+    return null;
+  }
   if (!gate.ok && gate.reason === 'CONSENT_REQUIRED') {
     appendAutomationLog(
       'AU_CAPTCHA',
@@ -181,6 +205,7 @@ export async function solveCaptchaTextWithClaude(imageBytes: Buffer, mediaType =
   for (const model of candidateModels()) {
     appendAutomationLog('AU_CAPTCHA', `Calling Anthropic model ${model} with ${imageBytes.length} image bytes (today: ${gate.state.calls + 1}/${gate.state.cap || '∞'}).`);
     const response = await fetch('https://api.anthropic.com/v1/messages', {
+      signal: AbortSignal.timeout(CAPTCHA_REQUEST_TIMEOUT_MS),
       method: 'POST',
       headers: {
         'x-api-key': apiKey,
@@ -189,8 +214,7 @@ export async function solveCaptchaTextWithClaude(imageBytes: Buffer, mediaType =
       },
       body: JSON.stringify({
         model,
-        max_tokens: 24,
-        temperature: 0,
+        ...requestKnobs(model),
         system: 'You read AU Bank login CAPTCHA images. The CAPTCHA is exactly 6 characters: lowercase letters a-z and digits 0-9 only (no uppercase, no symbols). A single diagonal strike-through line crosses the characters from upper-left to lower-right; that line is NOT part of the text — read the characters underneath it. The glyphs are slightly wavy/distorted. Return ONLY the 6 characters with no spaces, quotes, or explanation. If genuinely unreadable, return UNKNOWN.',
         messages: [
           {

@@ -16,7 +16,7 @@ export default function App() {
     window.api.vault.status().then((s: any) => {
       setState({ kind: 'unlock', firstTime: !s.initialized });
     });
-    window.api.events.onLocked(() => {
+    return window.api.events.onLocked(() => {
       // Re-check vault status — after a Reset Vault, the meta + DB are gone
       // and we should boot into first-time setup, not the unlock screen.
       window.api.vault.status().then((s: any) => {

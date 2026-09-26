@@ -10,7 +10,8 @@ import { getBankAdapter, getBrokerAdapter, getOtpPreset } from './automation/reg
 import {
   waitForOtp,
   getGmailConnectionStatus,
-  reconnectGmail,
+  connectGmail,
+  isGmailAuthError,
   saveGmailCredentialsJson,
   clearGmailCredentialsConfig,
 } from './email/gmail';
@@ -40,7 +41,6 @@ import { parseDhanPortfolioReport } from './reports/dhanWorkbook';
 import { parseZerodhaPortfolioReport } from './reports/zerodhaWorkbook';
 import { listCachedIpoIssues, refreshIpoCatalog } from './ipo/catalog';
 import {
-  createSnapshot as backupCreateSnapshot,
   getBackupConfig as backupGetConfig,
   setBackupConfig as backupSetConfig,
   getBackupState as backupGetState,
@@ -48,7 +48,16 @@ import {
   listSnapshots as backupListSnapshots,
   restoreSnapshot as backupRestoreSnapshot,
   latestSnapshotId as backupLatestSnapshotId,
-  autoSyncFromBackup,
+  backupNow,
+  getLocalDbHash,
+  getSyncStatus,
+  publishRestoredVault,
+  pushBeforeClose,
+  resolveSyncConflict,
+  syncOnUnlock,
+  syncTick,
+  tryUnlockFromNewerBackup,
+  type SyncOutcome,
 } from './backup/engine';
 
 // Store the master password as a Buffer so we can zero the bytes on lock,
@@ -81,80 +90,103 @@ export function clearVaultSessionSecrets(): void {
   // service to still be authorised — which means the OS lock state controls
   // access, not just our in-memory flag.
   clearFieldKeyCache();
-  if (autoBackupTimer) {
-    clearInterval(autoBackupTimer);
-    autoBackupTimer = null;
+  stopSyncLoop();
+}
+
+function broadcast(channel: string, payload: unknown): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    try { if (!win.isDestroyed()) win.webContents.send(channel, payload); } catch { /* */ }
   }
 }
 
 /**
- * Synchronously flush a snapshot to the backup folder before the vault closes.
- * Called from: vault:lock handler, auto-lock interval, and before-quit handler.
- * Ensures short sessions (open → edit → close in a few minutes) still produce
- * a backup the other PC can pick up via auto-sync on its next unlock.
- *
- * No-op if the vault isn't open or backup isn't configured. Errors are logged
- * but never thrown — backup failure must not block app exit.
+ * Tell the renderer what a sync pass did: a pull means the vault was replaced
+ * underneath it (reload everything); a new conflict needs the user's choice;
+ * anything else just refreshes the backup pill.
+ */
+function reportSyncOutcome(outcome: SyncOutcome, reason: string): void {
+  if (outcome.newMasterKey) currentMasterKey = Buffer.from(outcome.newMasterKey);
+  if (outcome.action === 'pulled') {
+    console.log(`[Sync] (${reason}) pulled snapshot from ${outcome.sourceHost || 'another PC'}`);
+    broadcast('vault:autoSynced', {
+      snapshotTimestamp: outcome.snapshotTimestamp,
+      sourceHost: outcome.sourceHost ?? null,
+    });
+  } else if (outcome.action === 'conflict' && outcome.conflictIsNew) {
+    console.warn(`[Sync] (${reason}) conflict with ${outcome.conflict?.remoteHost || 'another PC'}: ${outcome.conflict?.reason}`);
+    broadcast('backup:syncConflict', outcome.conflict);
+  } else if (outcome.action === 'error' && outcome.error) {
+    console.warn(`[Sync] (${reason}) ${outcome.error}`);
+  }
+  if (outcome.action !== 'none' && outcome.action !== 'disabled') broadcast('backup:statusChanged', {});
+}
+
+/**
+ * Push local changes before the vault closes (lock, auto-lock, quit, Windows
+ * shutdown). Only pushes when data actually changed and no other PC pushed in
+ * the meantime — see pushBeforeClose. Never throws: backup must not block exit.
  */
 export async function flushBackupOnExit(): Promise<void> {
   if (!currentMasterKey) return;
-  const cfg = backupGetConfig();
-  if (!cfg.enabled || !cfg.folder) return;
-  if (backupInProgress()) return;
-  try {
-    const res = await backupCreateSnapshot(currentMasterKey);
-    if (res.ok) {
-      console.log(`[Backup] (on-exit) snapshot ${res.snapshotId} flushed before close`);
-    } else if (res.error) {
-      console.warn(`[Backup] (on-exit) failed: ${res.error}`);
-    }
-  } catch (e: any) {
-    console.warn(`[Backup] (on-exit) threw: ${e?.message || e}`);
-  }
-}
-
-// ── Auto-backup scheduler ────────────────────────────────────────────────────
-// Runs once 10s after unlock (giving the user time to start interacting),
-// then every 6h while the vault is unlocked and backup is enabled.
-let autoBackupTimer: ReturnType<typeof setInterval> | null = null;
-const AUTO_BACKUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const AUTO_BACKUP_FIRST_DELAY_MS = 10_000;
-
-function shouldRunAutoBackupNow(): boolean {
-  const cfg = backupGetConfig();
-  if (!cfg.enabled || !cfg.folder) return false;
-  const state = backupGetState();
-  if (!state.lastBackupAt) return true;
-  const ageMs = Date.now() - new Date(state.lastBackupAt).getTime();
-  // Only attempt at most every 4h even if the timer fires
-  return ageMs >= 4 * 60 * 60 * 1000;
-}
-
-async function runAutoBackup(reason: string): Promise<void> {
+  // Stop the loop and let an in-flight pass finish, so a pull can't re-open
+  // the vault after the caller closes it.
+  stopSyncLoop();
+  await waitForSyncIdle(15_000);
   if (!currentMasterKey) return;
-  if (backupInProgress()) return;
-  if (!shouldRunAutoBackupNow()) return;
   try {
-    const result = await backupCreateSnapshot(currentMasterKey);
-    if (result.ok) {
-      console.log(`[Backup] (${reason}) snapshot ${result.snapshotId} ` +
-        `db=${result.dbBytes}B docs=+${result.documentsCopied}/=${result.documentsReused} ` +
-        `${result.durationMs}ms`);
-    } else if (result.error) {
-      console.warn(`[Backup] (${reason}) failed: ${result.error}`);
-    }
+    const outcome = await pushBeforeClose(currentMasterKey);
+    if (outcome.action === 'pushed') console.log('[Sync] (on-close) pushed local changes');
+    else if (outcome.action === 'conflict') console.warn('[Sync] (on-close) not pushed: another PC saved newer data — resolve at next unlock');
+    else if (outcome.error) console.warn(`[Sync] (on-close) ${outcome.error}`);
   } catch (e: any) {
-    console.warn(`[Backup] (${reason}) threw: ${e?.message || e}`);
+    console.warn(`[Sync] (on-close) threw: ${e?.message || e}`);
   }
 }
 
-function scheduleAutoBackup(): void {
-  if (autoBackupTimer) {
-    clearInterval(autoBackupTimer);
-    autoBackupTimer = null;
+// ── Sync loop ────────────────────────────────────────────────────────────────
+// While unlocked: every SYNC_TICK_MS, pull a newer snapshot from another PC
+// (when nothing here is unsynced) and push local changes once they settle.
+// Replaces the old "once 10s after unlock, then every 6h" backup timer, which
+// left the other PC without this PC's changes for hours.
+const SYNC_TICK_MS = 30_000;
+let syncLoopTimer: ReturnType<typeof setInterval> | null = null;
+let syncTickRunning = false;
+
+async function runSyncTick(reason: string): Promise<void> {
+  if (syncTickRunning || !currentMasterKey) return;
+  const password = getMasterPassword();
+  if (!password) return;
+  syncTickRunning = true;
+  try {
+    // Never swap the DB under an in-flight login or push mid-run: balance
+    // writes from a bulk refresh land in one snapshot after it finishes.
+    const idle = activeAutomations() === 0;
+    const outcome = await syncTick({ masterPassword: password, liveKey: currentMasterKey, canPull: idle, canPush: idle });
+    reportSyncOutcome(outcome, reason);
+  } catch (e: any) {
+    console.warn(`[Sync] (${reason}) tick failed: ${e?.message || e}`);
+  } finally {
+    syncTickRunning = false;
   }
-  setTimeout(() => { void runAutoBackup('post-unlock'); }, AUTO_BACKUP_FIRST_DELAY_MS);
-  autoBackupTimer = setInterval(() => { void runAutoBackup('periodic'); }, AUTO_BACKUP_INTERVAL_MS);
+}
+
+async function waitForSyncIdle(timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while ((syncTickRunning || backupInProgress()) && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+}
+
+function startSyncLoop(): void {
+  stopSyncLoop();
+  syncLoopTimer = setInterval(() => { void runSyncTick('periodic'); }, SYNC_TICK_MS);
+}
+
+function stopSyncLoop(): void {
+  if (syncLoopTimer) {
+    clearInterval(syncLoopTimer);
+    syncLoopTimer = null;
+  }
 }
 
 function documentTypeLabel(docType: MemberDocumentType): string {
@@ -213,6 +245,9 @@ export function registerIpcHandlers(ipc: IpcMain): void {
     }
     try {
       const key = await deriveMasterKey(password);
+      // Fingerprint the vault BEFORE opening it: openDb() may run a schema
+      // migration, which must not be mistaken for an unsynced user edit.
+      const preOpenLocalHash = getLocalDbHash();
       openDb(key);
       // Store password as a Buffer so the bytes can be zeroed on lock.
       if (currentMasterPasswordBuf) currentMasterPasswordBuf.fill(0);
@@ -223,34 +258,47 @@ export function registerIpcHandlers(ipc: IpcMain): void {
       failedUnlockAttempts = 0;
       unlockCooldownUntil = 0;
 
-      // Auto-sync: silently restore a newer snapshot if one exists in the
-      // backup folder (e.g. PC1 backed up → shared cloud folder → PC2 unlocks).
-      let autoSyncedAt: string | undefined;
+      // Pull: take another PC's newer snapshot if it was built on this PC's
+      // data; if both sides changed, record a conflict for the user instead of
+      // silently overwriting either copy.
+      let outcome: SyncOutcome = { action: 'none' };
       try {
-        const sync = await autoSyncFromBackup(password);
-        if (sync.synced && sync.newMasterKey) {
-          currentMasterKey = sync.newMasterKey;
-          autoSyncedAt = sync.snapshotTimestamp;
-        }
-      } catch (e) {
-        console.warn('[AutoSync] failed silently:', e);
+        outcome = await syncOnUnlock({ masterPassword: password, liveKey: currentMasterKey, preOpenLocalHash });
+        if (outcome.newMasterKey) currentMasterKey = Buffer.from(outcome.newMasterKey);
+      } catch (e: any) {
+        console.warn('[Sync] unlock pull failed:', e?.message || e);
       }
 
-      scheduleAutoBackup();
+      startSyncLoop();
 
-      if (autoSyncedAt) {
-        // Notify the renderer after it has had a moment to mount.
-        setTimeout(() => {
-          for (const win of BrowserWindow.getAllWindows()) {
-            if (!win.isDestroyed()) win.webContents.send('vault:autoSynced', { snapshotTimestamp: autoSyncedAt });
-          }
-        }, 1500);
+      if (outcome.action !== 'none' && outcome.action !== 'disabled') {
+        // Notify the renderer after it has had a moment to mount. A conflict
+        // found at unlock is always news to this session.
+        setTimeout(() => reportSyncOutcome({ ...outcome, newMasterKey: undefined, conflictIsNew: true }, 'unlock'), 1500);
       }
 
       return { ok: true };
     } catch (e: any) {
-      // Wrong password — bump the failure counter and apply back-off.
       if ((e as Error).message === 'INVALID_MASTER_PASSWORD') {
+        // The master password may have been changed on another PC: this PC's
+        // vault still uses the old key, but the newer synced snapshot opens
+        // with the new one. Load it instead of reporting a wrong password.
+        try {
+          const pulled = await tryUnlockFromNewerBackup(password);
+          if (pulled?.newMasterKey) {
+            if (currentMasterPasswordBuf) currentMasterPasswordBuf.fill(0);
+            currentMasterPasswordBuf = Buffer.from(password, 'utf8');
+            currentMasterKey = Buffer.from(pulled.newMasterKey);
+            failedUnlockAttempts = 0;
+            unlockCooldownUntil = 0;
+            startSyncLoop();
+            setTimeout(() => reportSyncOutcome({ ...pulled, newMasterKey: undefined }, 'unlock:new-password'), 1500);
+            return { ok: true, passwordChangedElsewhere: true };
+          }
+        } catch (err: any) {
+          console.warn('[Sync] new-password unlock fallback failed:', err?.message || err);
+        }
+        // Wrong password — bump the failure counter and apply back-off.
         failedUnlockAttempts++;
         if (failedUnlockAttempts >= 3) {
           // 2s, 4s, 8s, 16s … capped at 5 minutes.
@@ -441,11 +489,12 @@ export function registerIpcHandlers(ipc: IpcMain): void {
     }
   });
 
-  ipc.handle('gmail:status', async () => getGmailConnectionStatus());
+  ipc.handle('gmail:status', async (_, opts?: { force?: boolean }) =>
+    getGmailConnectionStatus({ force: !!opts?.force }));
 
   ipc.handle('gmail:connect', async () => {
     try {
-      const status = await reconnectGmail();
+      const status = await connectGmail();
       return { ok: true, status };
     } catch (e: any) {
       return { ok: false, error: e.message || String(e) };
@@ -739,16 +788,21 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   });
 
   ipc.handle('totp:generate', async (_, { brokerAccountId }: { brokerAccountId: number }) => {
-    const { TOTP } = await import('totp-generator');
-    const db = getDb();
-    const row = db.prepare('SELECT totp_secret_enc FROM broker_accounts WHERE id = ?').get(brokerAccountId) as any;
-    if (!row?.totp_secret_enc) return { ok: false, error: 'No TOTP secret' };
-    const secret = await decryptField(row.totp_secret_enc);
-    if (!secret) return { ok: false, error: 'Could not decrypt TOTP secret' };
-    const { otp } = await TOTP.generate(secret);
-    const nowSec = Math.floor(Date.now() / 1000);
-    const secondsRemaining = 30 - (nowSec % 30);
-    return { ok: true, otp, secondsRemaining };
+    try {
+      const { TOTP } = await import('totp-generator');
+      const db = getDb();
+      const row = db.prepare('SELECT totp_secret_enc FROM broker_accounts WHERE id = ?').get(brokerAccountId) as any;
+      if (!row?.totp_secret_enc) return { ok: false, error: 'No TOTP secret' };
+      const secret = await decryptField(row.totp_secret_enc);
+      if (!secret) return { ok: false, error: 'Could not decrypt TOTP secret' };
+      const { otp } = await TOTP.generate(secret);
+      const nowSec = Math.floor(Date.now() / 1000);
+      const secondsRemaining = 30 - (nowSec % 30);
+      return { ok: true, otp, secondsRemaining };
+    } catch (e: any) {
+      // Malformed (non-base32) secret, or the vault locked — report, don't reject.
+      return { ok: false, error: e?.message || String(e) };
+    }
   });
 
   ipc.handle('documents:pick', async (_, payload: { docType: MemberDocumentType }) => {
@@ -1022,12 +1076,34 @@ export function registerIpcHandlers(ipc: IpcMain): void {
     return {
       config: backupGetConfig(),
       state: { ...state, inProgress: backupInProgress() },
+      sync: getSyncStatus(),
     };
   });
 
   ipc.handle('backup:runNow', async () => {
-    if (!currentMasterKey) return { ok: false, error: 'Vault is locked.' };
-    return backupCreateSnapshot(currentMasterKey);
+    const password = getMasterPassword();
+    if (!currentMasterKey || !password) return { ok: false, error: 'Vault is locked.' };
+    const result = await backupNow({ masterPassword: password, liveKey: currentMasterKey });
+    if (result.newMasterKey) {
+      currentMasterKey = Buffer.from(result.newMasterKey);
+      broadcast('vault:autoSynced', { snapshotTimestamp: new Date().toISOString(), sourceHost: result.pulledFrom ?? null });
+    }
+    broadcast('backup:statusChanged', {});
+    const { newMasterKey: _omit, ...rest } = result;
+    return rest;
+  });
+
+  ipc.handle('backup:resolveConflict', async (_, choice: 'keep-local' | 'use-remote') => {
+    const password = getMasterPassword();
+    if (!currentMasterKey || !password) return { ok: false, error: 'Vault is locked.' };
+    if (choice !== 'keep-local' && choice !== 'use-remote') return { ok: false, error: 'Invalid choice.' };
+    if (activeAutomations() > 0) {
+      return { ok: false, error: 'Wait for the running bank/broker login to finish, then try again.' };
+    }
+    const outcome = await resolveSyncConflict(choice, { masterPassword: password, liveKey: currentMasterKey });
+    reportSyncOutcome(outcome, `resolve:${choice}`);
+    if (outcome.action === 'pushed' || outcome.action === 'pulled') return { ok: true, action: outcome.action };
+    return { ok: false, error: outcome.error || 'The conflict could not be resolved yet.' };
   });
 
   ipc.handle('backup:listSnapshots', async () => {
@@ -1048,19 +1124,32 @@ export function registerIpcHandlers(ipc: IpcMain): void {
     const masterPwdForRestore = getMasterPassword();
     if (!masterPwdForRestore) return { ok: false, error: 'Vault is locked.' };
     if (!payload?.snapshotId) return { ok: false, error: 'No snapshot id provided.' };
-    const result: any = await backupRestoreSnapshot(payload.snapshotId, masterPwdForRestore, {
-      sourceFolder: payload.sourceFolder,
-    });
-    // The restored snapshot may have a different salt → new derived key.
-    // Refresh the in-memory master key so subsequent IPC calls (export, etc.)
-    // use the correct one without forcing the user to lock+unlock.
-    if (result?.ok) {
-      try {
-        const newKey = await deriveMasterKey(masterPwdForRestore);
-        currentMasterKey = Buffer.from(newKey);
-      } catch { /* DB is already reopened with the right key; ignore */ }
+    if (activeAutomations() > 0) {
+      return { ok: false, error: 'Wait for the running bank/broker login to finish, then restore.' };
     }
-    return result;
+    const result = await backupRestoreSnapshot(payload.snapshotId, masterPwdForRestore, {
+      sourceFolder: payload.sourceFolder,
+      liveKey: currentMasterKey ?? undefined,
+    });
+    if (!result.ok) return result;
+    // The restored snapshot may use a different salt → the vault is now open
+    // with the key restoreSnapshot derived. Adopt it for the session.
+    currentMasterKey = Buffer.from(result.masterKey);
+    // Make the restored data the new head for every synced PC; otherwise the
+    // next sync pass would fast-forward straight back and undo the restore.
+    let published = true;
+    if (!payload.sourceFolder || payload.sourceFolder === backupGetConfig().folder) {
+      const pub = await publishRestoredVault(currentMasterKey, payload.snapshotId, result.ancestors);
+      published = pub.ok;
+      if (!pub.ok) console.warn('[Sync] restored vault not published:', pub.error);
+    }
+    broadcast('backup:statusChanged', {});
+    return {
+      ok: true,
+      documentsRestored: result.documentsRestored,
+      dbBytes: result.dbBytes,
+      published,
+    };
   });
 
   ipc.handle('backup:latestSnapshotId', async (_, sourceFolder?: string) => {
@@ -1125,6 +1214,31 @@ function requestOtpFromUser(label: string): Promise<string> {
       }
     }, 3 * 60 * 1000);
   });
+}
+
+/**
+ * Email-OTP fetch shared by every login path. Reads the OTP from Gmail; if
+ * Gmail can't be used (not signed in, access expired/revoked, not set up) it
+ * falls straight back to the in-app OTP dialog — instead of the old behaviour
+ * of opening a Google sign-in tab mid-login and hanging while the bank's OTP
+ * expired — and tells the renderer to refresh the Gmail status pill.
+ */
+async function fetchEmailOtp(code: string, displayName: string, startTime: Date): Promise<string> {
+  const otpPreset = getOtpPreset(code);
+  if (!otpPreset) throw new Error(`No OTP preset for ${code}`);
+  try {
+    return await waitForOtp({ query: otpPreset.query, otpRegex: otpPreset.otpRegex, receivedAfter: startTime, timeoutMs: 90_000 });
+  } catch (e: any) {
+    if (!isGmailAuthError(e)) throw e;
+    BrowserWindow.getAllWindows().forEach(w => {
+      try { if (!w.isDestroyed()) w.webContents.send('gmail:statusChanged', { reason: e.code }); } catch { /* */ }
+    });
+    return requestOtpFromUser(
+      e.code === 'GMAIL_NOT_CONFIGURED'
+        ? `Gmail isn't set up, so the ${displayName} OTP can't be read automatically. Enter it here (or type it in the bank window):`
+        : `Gmail needs you to sign in again, so the ${displayName} OTP can't be read automatically. Enter it here (or type it in the bank window):`
+    );
+  }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1237,7 +1351,6 @@ async function runLogin(
   const totpSecret = kind === 'BROKER'
     ? await decryptField(account.totp_secret_enc).catch(() => null)
     : null;
-  const otpPreset = getOtpPreset(code);
   const shouldFetchBalance = options?.fetchBalance ?? true;
   const shouldCloseAfterFetch = !!options?.closeAfterFetch;
   const startTime = new Date();
@@ -1250,8 +1363,7 @@ async function runLogin(
     if (adapter.otpMode === 'manual') {
       return requestOtpFromUser(`Enter the OTP sent to your mobile for ${adapter.displayName}`);
     }
-    if (!otpPreset) throw new Error(`No OTP preset for ${code}`);
-    return waitForOtp({ query: otpPreset.query, otpRegex: otpPreset.otpRegex, receivedAfter: startTime, timeoutMs: 90_000 });
+    return fetchEmailOtp(code, adapter.displayName, startTime);
   };
   const auditInsert = db.prepare('INSERT INTO audit_log (member_id, action, target, status, details) VALUES (?, ?, ?, ?, ?)');
   beginAutomation();
@@ -1329,7 +1441,9 @@ async function runLogin(
     auditInsert.run(memberId, `LOGIN_${kind}`, code, 'FAILED', e.message);
     return { ok: false, error: e.message };
   } finally {
-    if (contextToClose && shouldFetchBalance && shouldCloseAfterFetch) {
+    // Honour an explicit close request even when no balance was fetched (a
+    // "verify credentials, then close" call used to leave the window open).
+    if (contextToClose && shouldCloseAfterFetch) {
       await contextToClose.close().catch(() => {});
     }
     endAutomation();
@@ -1355,7 +1469,6 @@ async function downloadBrokerPortfolioReport(memberId: number, brokerId: number)
 
   const customerId = await decryptField(account.client_id_enc).catch(() => null);
   const totpSecret = await decryptField(account.totp_secret_enc).catch(() => null);
-  const otpPreset = getOtpPreset(code);
   const startTime = new Date();
   const fetchOtp = async () => {
     if (adapter.otpMode === 'totp') {
@@ -1366,8 +1479,7 @@ async function downloadBrokerPortfolioReport(memberId: number, brokerId: number)
     if (adapter.otpMode === 'manual') {
       return requestOtpFromUser(`Enter the OTP sent to your mobile for ${adapter.displayName}`);
     }
-    if (!otpPreset) throw new Error(`No OTP preset for ${code}`);
-    return waitForOtp({ query: otpPreset.query, otpRegex: otpPreset.otpRegex, receivedAfter: startTime, timeoutMs: 90_000 });
+    return fetchEmailOtp(code, adapter.displayName, startTime);
   };
 
   const auditInsert = db.prepare('INSERT INTO audit_log (member_id, action, target, status, details) VALUES (?, ?, ?, ?, ?)');
@@ -1584,8 +1696,7 @@ async function getMemberAuBidDraftOptions(memberId: number) {
   };
 }
 
-async function buildOtpFetcher(kind: 'BANK' | 'BROKER', code: string, adapter: any, totpSecret: string | null, startTime: Date) {
-  const otpPreset = getOtpPreset(code);
+async function buildOtpFetcher(_kind: 'BANK' | 'BROKER', code: string, adapter: any, totpSecret: string | null, startTime: Date) {
   return async () => {
     if (adapter.otpMode === 'totp') {
       if (!totpSecret) throw new Error('TOTP secret not set for this account');
@@ -1595,12 +1706,7 @@ async function buildOtpFetcher(kind: 'BANK' | 'BROKER', code: string, adapter: a
     if (adapter.otpMode === 'manual') {
       return requestOtpFromUser(`Enter the OTP sent to your mobile for ${adapter.displayName}`);
     }
-    if (kind === 'BANK' && code === 'AU') {
-      if (!otpPreset) throw new Error(`No OTP preset for ${code}`);
-      return waitForOtp({ query: otpPreset.query, otpRegex: otpPreset.otpRegex, receivedAfter: startTime, timeoutMs: 90_000 });
-    }
-    if (!otpPreset) throw new Error(`No OTP preset for ${code}`);
-    return waitForOtp({ query: otpPreset.query, otpRegex: otpPreset.otpRegex, receivedAfter: startTime, timeoutMs: 90_000 });
+    return fetchEmailOtp(code, adapter.displayName, startTime);
   };
 }
 

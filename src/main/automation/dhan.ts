@@ -254,7 +254,7 @@ export const dhanAdapter: LoginAdapter = {
     // ── Step 2: Enter Mobile Number ───────────────────────────────────────────
     const mobile = (creds.username || '').replace(/\D/g, '').slice(-10);
     if (mobile.length !== 10) {
-      console.warn(`[Dhan] Mobile number "${creds.username}" is not 10 digits — proceeding anyway.`);
+      console.warn(`[Dhan] Stored mobile number has ${creds.username.length} characters, not 10 digits — proceeding anyway.`);
     }
 
     try {
@@ -530,14 +530,17 @@ async function fetchDhanTabValue(page: Page, opts: {
 
   const value = await page.evaluate((labels: string[]) => {
     const text = (document.body as HTMLElement | null)?.innerText || '';
-    const AMT = '(\\d[\\d,]*(?:\\.\\d{1,2})?)';
+    // Capture a leading minus on either side of the ₹ ("-₹1,234" or "₹-1,234"):
+    // without it a loss on the Positions tab was reported as a gain.
+    const AMT = '\\d[\\d,]*(?:\\.\\d{1,2})?';
+    const signed = (m: RegExpMatchArray | null) =>
+      m?.[2] ? (m[1] === '-' || m[2].startsWith('-') ? '-' : '') + m[2].replace(/^-/, '') : null;
     for (const lbl of labels) {
-      const re = new RegExp(`${lbl}[\\s\\S]{0,80}?(?:₹|INR|Rs\\.?)\\s*${AMT}`, 'i');
-      const m = text.match(re);
-      if (m?.[1]) return m[1];
+      const re = new RegExp(`${lbl}[\\s\\S]{0,80}?(-?)\\s*(?:₹|INR|Rs\\.?)\\s*(-?${AMT})`, 'i');
+      const v = signed(text.match(re));
+      if (v) return v;
     }
-    const first = text.match(new RegExp(`(?:₹|INR|Rs\\.?)\\s*${AMT}`, 'i'));
-    return first?.[1] || null;
+    return signed(text.match(new RegExp(`(-?)\\s*(?:₹|INR|Rs\\.?)\\s*(-?${AMT})`, 'i')));
   }, opts.labels);
 
   if (!value) {

@@ -353,12 +353,22 @@ const emptyAuBidForm = (): AuBidForm => ({
   bidPrice: '',
 });
 
+/**
+ * Parse a timestamp from the vault. SQLite's CURRENT_TIMESTAMP is UTC but has
+ * no zone marker ("2026-09-26 08:30:00"); plain `new Date()` reads that as
+ * LOCAL time — 5h30m off in IST — so normalise it to ISO-with-Z first.
+ */
+function parseDbTime(value: string | null | undefined): number {
+  if (!value) return NaN;
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)
+    ? value.replace(' ', 'T') + 'Z'
+    : value;
+  return new Date(normalized).getTime();
+}
+
 function formatAge(iso: string | null): string {
   if (!iso) return '';
-  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(iso)
-    ? iso.replace(' ', 'T') + 'Z'
-    : iso;
-  const parsed = new Date(normalized).getTime();
+  const parsed = parseDbTime(iso);
   if (!Number.isFinite(parsed)) return '';
   const diff = Date.now() - parsed;
   const m = Math.floor(diff / 60_000);
@@ -578,10 +588,42 @@ type Modal =
   | { type: 'change-master-password' }
   | { type: 'backup-settings' }
   | { type: 'restore-backup' }
+  | { type: 'sync-conflict' }
   | { type: 'member-card'; memberId: number; memberName: string };
 
-// 'all' = View All, 'recharge' = SIM recharge tracker, 'totp' = Zerodha TOTP, number = specific family id
-type SelectedView = 'all' | 'recharge' | 'totp' | number;
+interface SyncConflictInfo {
+  detectedAt: string;
+  reason: 'local-unsynced-changes' | 'diverged';
+  remoteSnapshotId: string;
+  remoteHost: string | null;
+  remoteTimestamp: string | null;
+  localBaseSnapshotId: string | null;
+}
+
+interface BackupInfo {
+  config: { enabled: boolean; folder: string | null; vaultId: string };
+  state: {
+    lastBackupAt: string | null;
+    lastBackupError: string | null;
+    lastSnapshotId: string | null;
+    inProgress: boolean;
+    lastPullAt?: string | null;
+    lastPullSourceHost?: string | null;
+    lastSyncError?: string | null;
+    conflict?: SyncConflictInfo | null;
+  };
+  sync?: {
+    thisHost: string;
+    dirty: boolean;
+    folderMissing: boolean;
+    head: { id: string; sourceHost: string | null; timestamp: string | null } | null;
+    pendingRemoteId: string | null;
+  };
+}
+
+// 'all' = View All, 'spreadsheet' = every member's balances in one table,
+// 'recharge' = SIM recharge tracker, 'totp' = Zerodha TOTP, number = specific family id
+type SelectedView = 'all' | 'spreadsheet' | 'recharge' | 'totp' | number;
 
 // â"€â"€ Dashboard â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
@@ -611,15 +653,16 @@ export default function Dashboard() {
   const [bankToAdd,     setBankToAdd]     = useState('');
   const [brokerToAdd,   setBrokerToAdd]   = useState('');
   const [totpCode,      setTotpCode]      = useState<{ broker_code: string; code: string } | null>(null);
+  // A generated code is keyed only by broker, so it must not survive a change
+  // of modal/member — otherwise member B's Zerodha row showed member A's code.
+  const modalMemberId = (modal as { memberId?: number }).memberId;
+  useEffect(() => { setTotpCode(null); }, [modal.type, modalMemberId]);
   const [otpRequest,    setOtpRequest]    = useState<{ label: string } | null>(null);
   const [otpValue,      setOtpValue]      = useState('');
   const [otpSubmitting, setOtpSubmitting] = useState(false);
   const [gmailStatus,   setGmailStatus]   = useState<GmailStatus | null>(null);
   const [captchaAiStatus, setCaptchaAiStatus] = useState<CaptchaAiStatus | null>(null);
-  const [backupInfo, setBackupInfo] = useState<{
-    config: { enabled: boolean; folder: string | null; vaultId: string };
-    state: { lastBackupAt: string | null; lastBackupError: string | null; lastSnapshotId: string | null; inProgress: boolean };
-  } | null>(null);
+  const [backupInfo, setBackupInfo] = useState<BackupInfo | null>(null);
   const [captchaUsage, setCaptchaUsage] = useState<{
     date: string;
     calls: number;
@@ -636,6 +679,7 @@ export default function Dashboard() {
   const [backupSnapshots, setBackupSnapshots] = useState<Array<{
     id: string; timestamp: string; dbBytes: number; documentCount: number; totalBlobBytes: number;
     band: 'last-24h' | 'last-7d' | 'last-30d' | 'last-6mo' | 'older';
+    sourceHost?: string | null; appVersion?: string | null;
   }>>([]);
   const [restoreSourceFolder, setRestoreSourceFolder] = useState<string | null>(null);
   const [serviceConfigValue, setServiceConfigValue] = useState('');
@@ -780,9 +824,9 @@ export default function Dashboard() {
     setFamilies(list as Family[]);
   }, []);
 
-  const loadGmailStatus = useCallback(async () => {
+  const loadGmailStatus = useCallback(async (force = false) => {
     try {
-      const status = await window.api.gmail.status();
+      const status = await window.api.gmail.status({ force });
       setGmailStatus(status as GmailStatus);
     } catch (e: any) {
       setGmailStatus({
@@ -848,16 +892,34 @@ export default function Dashboard() {
   // Initial load
   useEffect(() => { loadFamilies(); loadGmailStatus(); loadCaptchaAiStatus(); loadBackupStatus(); loadCaptchaUsage(); }, []);
 
-  // Auto-sync notification — fires when main process silently restored a newer snapshot on unlock.
+  // Sync notifications from main. A pull (at unlock or while open) replaces the
+  // vault underneath the UI, so drop every cached member list — balances
+  // included — and reload from scratch.
+  const lastGmailToastAt = useRef(0);
   useEffect(() => {
-    const unsub = window.api.events.onAutoSynced((data: { snapshotTimestamp: string }) => {
-      const when = new Date(data.snapshotTimestamp);
-      const diffMin = Math.round((Date.now() - when.getTime()) / 60000);
-      const ago = diffMin < 2 ? 'just now' : diffMin < 60 ? `${diffMin}m ago` : `${Math.round(diffMin / 60)}h ago`;
-      showToast('info', `Auto-synced from backup (${ago}). Data is up to date.`);
+    const offSynced = window.api.events.onAutoSynced(data => {
+      const diffMin = Math.round((Date.now() - new Date(data.snapshotTimestamp).getTime()) / 60000);
+      const ago = !Number.isFinite(diffMin) || diffMin < 2 ? 'just now' : diffMin < 60 ? `${diffMin}m ago` : `${Math.round(diffMin / 60)}h ago`;
+      showToast('info', `Synced changes from ${data.sourceHost || 'your other PC'} (saved ${ago}).`);
+      setMembers({});
       loadFamilies();
+      loadBackupStatus();
     });
-    return () => { if (typeof unsub === 'function') unsub(); };
+    const offConflict = window.api.events.onSyncConflict(() => {
+      loadBackupStatus();
+      setModal(m => (m.type === 'none' ? { type: 'sync-conflict' } : m));
+      showToast('error', 'Sync conflict — both PCs changed data. Choose which copy to keep.');
+    });
+    const offBackup = window.api.events.onBackupStatusChanged(() => { loadBackupStatus(); });
+    const offGmail = window.api.gmail.onStatusChanged(() => {
+      loadGmailStatus(true);
+      // One toast a minute is enough during a bulk run (each login re-reports it).
+      if (Date.now() - lastGmailToastAt.current > 60_000) {
+        lastGmailToastAt.current = Date.now();
+        showToast('error', 'Gmail needs you to sign in again — OTPs will be asked for here until then.');
+      }
+    });
+    return () => { offSynced(); offConflict(); offBackup(); offGmail(); };
   }, []);
 
   // Balance re-fetch — fires when the user clicks the in-browser "↻ Balance"
@@ -950,8 +1012,13 @@ export default function Dashboard() {
 
   async function installUpdateNow() {
     setInstalling(true);
-    await window.api.updater.installNow();
-    // App will quit and restart — nothing more to do here.
+    try {
+      await window.api.updater.installNow();
+      // App will quit and restart — nothing more to do here.
+    } catch (e: any) {
+      setInstalling(false);
+      showToast('error', `Could not install the update: ${e?.message || e}`);
+    }
   }
 
   // Manual "check for updates" — gives the user an explicit way to confirm they
@@ -1006,6 +1073,19 @@ export default function Dashboard() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
+  // Escape closes the open dialog — same effect as clicking its backdrop.
+  useEffect(() => {
+    if (modal.type === 'none' && !otpRequest) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== 'Escape') return;
+      if (otpRequest) { void cancelOtp(); return; }
+      if (modal.type === 'prepare-au-bid' || modal.type === 'review-au-bid') cancelAuIpoBatch();
+      else setModal({ type: 'none' });
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [modal.type, otpRequest]);
+
   // Poll backup status every 30s — picks up auto-backup completions
   useEffect(() => {
     const t = setInterval(loadBackupStatus, 30_000);
@@ -1026,8 +1106,11 @@ export default function Dashboard() {
 
   // OTP dialog - listen for requests from main process
   useEffect(() => {
-    window.api.otp.onNeeded(data => { setOtpValue(''); setOtpRequest(data); });
-    window.api.otp.onDismiss(() => { setOtpRequest(null); setOtpValue(''); });
+    // Dashboard remounts on every unlock, so these must unsubscribe — otherwise
+    // each lock/unlock cycle stacked another permanent listener.
+    const offNeeded = window.api.otp.onNeeded(data => { setOtpValue(''); setOtpRequest(data); });
+    const offDismiss = window.api.otp.onDismiss(() => { setOtpRequest(null); setOtpValue(''); });
+    return () => { offNeeded(); offDismiss(); };
   }, []);
 
   // Close AU IPO dropdown when clicking outside
@@ -1071,15 +1154,35 @@ export default function Dashboard() {
     });
   }, [auIpoMemberQueue, auIpoQueueIndex]); // re-register so closure is always fresh
 
+  /**
+   * Abandon the AU IPO flow entirely. Closing the modal alone left the batch
+   * queue armed, so closing a leftover AU window later popped the prepare
+   * dialog for the next member of a batch the user thought was cancelled.
+   */
+  function cancelAuIpoBatch() {
+    setAuIpoMemberQueue([]);
+    setAuIpoQueueIndex(0);
+    setPreparedAuBid(null);
+    setModal({ type: 'none' });
+  }
+
   async function submitOtp() {
-    if (!otpValue.trim()) return;
+    if (!otpValue.trim() || otpSubmitting) return;
     setOtpSubmitting(true);
-    await window.api.otp.provide(otpValue.trim());
-    setOtpRequest(null); setOtpValue(''); setOtpSubmitting(false);
+    try {
+      await window.api.otp.provide(otpValue.trim());
+    } catch (e: any) {
+      showToast('error', `Could not send the OTP: ${e?.message || e}`);
+    } finally {
+      setOtpRequest(null); setOtpValue(''); setOtpSubmitting(false);
+    }
   }
   async function cancelOtp() {
-    await window.api.otp.cancel();
-    setOtpRequest(null); setOtpValue('');
+    try {
+      await window.api.otp.cancel();
+    } catch { /* the request is gone either way */ } finally {
+      setOtpRequest(null); setOtpValue('');
+    }
   }
 
   // â"€â"€ View selection â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
@@ -1179,10 +1282,14 @@ export default function Dashboard() {
 
   async function deleteFamily(id: number, name: string) {
     if (!confirm(`Delete "${name}" and ALL its members? This cannot be undone.`)) return;
-    await window.api.families.delete(id);
-    setFamilies(f => f.filter(x => x.id !== id));
-    if (selectedView === id) setSelectedView('all');
-    showToast('success', 'Family deleted');
+    try {
+      await window.api.families.delete(id);
+      setFamilies(f => f.filter(x => x.id !== id));
+      if (selectedView === id) setSelectedView('all');
+      showToast('success', 'Family deleted');
+    } catch (e: any) {
+      showToast('error', `Could not delete ${name}: ${e?.message || e}`);
+    }
   }
 
   // â"€â"€ Member CRUD â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
@@ -1353,10 +1460,14 @@ export default function Dashboard() {
 
   async function deleteMember(memberId: number, familyId: number, name: string) {
     if (!confirm(`Delete "${name}"? This cannot be undone.`)) return;
-    await window.api.member.delete(memberId);
-    setMembers(m => ({ ...m, [familyId]: (m[familyId] || []).filter(x => x.id !== memberId) }));
-    setFamilies(f => f.map(x => x.id === familyId ? { ...x, member_count: x.member_count - 1 } : x));
-    showToast('success', 'Member deleted');
+    try {
+      await window.api.member.delete(memberId);
+      setMembers(m => ({ ...m, [familyId]: (m[familyId] || []).filter(x => x.id !== memberId) }));
+      setFamilies(f => f.map(x => x.id === familyId ? { ...x, member_count: x.member_count - 1 } : x));
+      showToast('success', 'Member deleted');
+    } catch (e: any) {
+      showToast('error', `Could not delete ${name}: ${e?.message || e}`);
+    }
   }
 
   function handleIdentityDocumentClick(member: Member, docType: MemberDocumentType) {
@@ -2174,38 +2285,58 @@ export default function Dashboard() {
   }
 
   async function runImport() {
+    if (busy === 'import') return; // nav items are divs — guard double-clicks
     setBusy('import');
-    const result: any = await window.api.importer.pickAndRun();
-    setBusy(null);
-    if (result.cancelled) return;
-    result.ok
-      ? (showToast('success', `Imported ${result.familiesImported} families, ${result.membersImported} members`), loadFamilies())
-      : showToast('error', result.error || 'Import failed');
+    try {
+      const result: any = await window.api.importer.pickAndRun();
+      if (result?.cancelled) return;
+      if (result?.ok) {
+        showToast('success', `Imported ${result.familiesImported} families, ${result.membersImported} members`);
+        setMembers({});
+        loadFamilies();
+      } else {
+        showToast('error', result?.error || 'Import failed');
+      }
+    } catch (e: any) {
+      showToast('error', `Import failed: ${e?.message || e}`);
+    } finally {
+      setBusy(null);
+    }
   }
 
   async function runExport() {
+    if (busy === 'export') return;
     setBusy('export');
-    const result: any = await window.api.exporter.pickAndRun();
-    setBusy(null);
-    if (result.cancelled) return;
-    result.ok
-      ? showToast('success', `Exported ${result.membersExported} members (${result.banksExported} banks, ${result.brokersExported} brokers)`)
-      : showToast('error', result.error || 'Export failed');
+    try {
+      const result: any = await window.api.exporter.pickAndRun();
+      if (result?.cancelled) return;
+      result?.ok
+        ? showToast('success', `Exported ${result.membersExported} members (${result.banksExported} banks, ${result.brokersExported} brokers)`)
+        : showToast('error', result?.error || 'Export failed');
+    } catch (e: any) {
+      showToast('error', `Export failed: ${e?.message || e}`);
+    } finally {
+      setBusy(null);
+    }
   }
 
   async function reconnectGmailStatus() {
     setBusy('gmail-connect');
+    showToast('info', 'Complete the Google sign-in that opened in your browser…');
     try {
       const result: any = await window.api.gmail.connect();
       if (result.ok && result.status) {
         setGmailStatus(result.status as GmailStatus);
-        showToast('success', 'Gmail connected');
+        showToast(result.status.state === 'connected' ? 'success' : 'error',
+          result.status.state === 'connected' ? 'Gmail connected' : (result.status.detail || result.status.label));
       } else {
         showToast('error', result.error || 'Gmail sign-in failed');
       }
+    } catch (e: any) {
+      showToast('error', e?.message || 'Gmail sign-in failed');
     } finally {
       setBusy(null);
-      await loadGmailStatus();
+      await loadGmailStatus(true);
     }
   }
 
@@ -2293,28 +2424,78 @@ export default function Dashboard() {
   }
 
   // ── Backup helpers ──────────────────────────────────────────────────────────
+  /** Most recent push or pull — when this PC last matched the backup folder. */
+  function lastSyncAt(): string | null {
+    const push = backupInfo?.state.lastBackupAt || null;
+    const pull = backupInfo?.state.lastPullAt || null;
+    if (!push) return pull;
+    if (!pull) return push;
+    return new Date(push).getTime() >= new Date(pull).getTime() ? push : pull;
+  }
+
   function backupTone(): 'good' | 'warn' | 'bad' | 'muted' {
     if (!backupInfo?.config.enabled || !backupInfo.config.folder) return 'muted';
+    if (backupInfo.state.conflict || backupInfo.sync?.folderMissing || backupInfo.state.lastBackupError) return 'bad';
     if (backupInfo.state.inProgress) return 'good';
-    if (!backupInfo.state.lastBackupAt) return 'warn';
-    const ageH = (Date.now() - new Date(backupInfo.state.lastBackupAt).getTime()) / 3_600_000;
-    if (ageH < 24) return 'good';
-    if (ageH < 72) return 'warn';
-    return 'bad';
+    if (backupInfo.state.lastSyncError || backupInfo.sync?.pendingRemoteId || !lastSyncAt()) return 'warn';
+    return 'good';
   }
 
   function backupLabel(): string {
-    if (!backupInfo) return 'Backup: checking...';
+    if (!backupInfo) return 'Sync: checking...';
     if (!backupInfo.config.enabled || !backupInfo.config.folder) return 'Backup: off';
-    if (backupInfo.state.inProgress) return 'Backup: syncing...';
-    if (!backupInfo.state.lastBackupAt) return 'Backup: pending';
-    const age = formatAge(backupInfo.state.lastBackupAt);
-    return `Backup: ${age}`;
+    if (backupInfo.state.conflict) return '⚠ Sync conflict — resolve';
+    if (backupInfo.sync?.folderMissing) return 'Sync: backup folder missing';
+    if (backupInfo.state.inProgress) return 'Sync: syncing...';
+    if (backupInfo.sync?.pendingRemoteId) return 'Sync: other PC uploading…';
+    if (backupInfo.state.lastSyncError || backupInfo.state.lastBackupError) return 'Sync: needs attention';
+    if (backupInfo.sync?.dirty) return 'Sync: saving changes…';
+    const last = lastSyncAt();
+    return last ? `Synced ${formatAge(last)}` : 'Sync: pending';
+  }
+
+  function backupTooltip(): string {
+    if (!backupInfo?.config.folder) return 'Click to set up backup & sync';
+    const s = backupInfo.state;
+    const lines = [
+      `This PC: ${backupInfo.sync?.thisHost || 'unknown'}`,
+      s.lastBackupAt ? `Last upload: ${formatAge(s.lastBackupAt)}` : 'Last upload: never',
+      s.lastPullAt ? `Last download: ${formatAge(s.lastPullAt)}${s.lastPullSourceHost ? ` from ${s.lastPullSourceHost}` : ''}` : null,
+      `Folder: ${backupInfo.config.folder}`,
+      s.lastSyncError ? `⚠ ${s.lastSyncError}` : null,
+      s.lastBackupError ? `⚠ Last upload failed: ${s.lastBackupError}` : null,
+    ];
+    return lines.filter(Boolean).join('\n');
   }
 
   function openBackupSettings() {
     void loadBackupStatus();
-    setModal({ type: 'backup-settings' });
+    setModal(backupInfo?.state.conflict ? { type: 'sync-conflict' } : { type: 'backup-settings' });
+  }
+
+  async function resolveSyncConflict(choice: 'keep-local' | 'use-remote') {
+    const other = backupInfo?.state.conflict?.remoteHost || 'the other PC';
+    const warning = choice === 'keep-local'
+      ? `Keep THIS PC's data?\n\nChanges saved on ${other} that this PC doesn't have will be discarded ` +
+        'on every synced PC (they remain in the backup folder\'s history for a while).'
+      : `Use ${other}'s data?\n\nChanges on this PC that were never synced will be replaced. ` +
+        'A copy of this PC\'s current vault is kept as a vault.db.pre-restore-* file.';
+    if (!confirm(warning)) return;
+    setBusy('sync-resolve');
+    try {
+      const result: any = await window.api.backup.resolveConflict(choice);
+      if (result?.ok) {
+        showToast('success', choice === 'keep-local' ? 'Kept this PC\'s data — other PCs will pick it up.' : `Now using ${other}'s data.`);
+        setModal({ type: 'none' });
+      } else {
+        showToast('error', result?.error || 'Could not resolve the conflict');
+      }
+    } catch (e: any) {
+      showToast('error', e?.message || String(e));
+    } finally {
+      setBusy(null);
+      await loadBackupStatus();
+    }
   }
 
   async function chooseBackupFolder() {
@@ -2342,9 +2523,11 @@ export default function Dashboard() {
     setBusy('backup-run');
     try {
       const result: any = await window.api.backup.runNow();
-      if (result?.ok) {
+      if (result?.ok && 'pulledFrom' in result) {
+        showToast('info', `This PC was behind — downloaded the newer data from ${result.pulledFrom || 'your other PC'} first.`);
+      } else if (result?.ok) {
         showToast('success',
-          `Backup done · ${result.documentsCopied || 0} new docs · ${result.documentsReused || 0} reused · ${result.durationMs || 0}ms`);
+          `Uploaded · ${result.documentsCopied || 0} new docs · ${result.documentsReused || 0} reused · ${result.durationMs || 0}ms`);
       } else {
         showToast('error', result?.error || 'Backup failed');
       }
@@ -2446,10 +2629,13 @@ export default function Dashboard() {
   }
 
   async function restoreSelectedSnapshot(snapshotId: string) {
+    const syncedFolder = !restoreSourceFolder || restoreSourceFolder === backupInfo?.config.folder;
     if (!confirm(
       `Restore from snapshot ${snapshotId}?\n\n` +
-      'This will REPLACE your current vault. A copy of the old vault will be ' +
-      'saved next to vault.db as a .pre-restore-* file in case you need to roll back.'
+      'This will REPLACE your current vault' +
+      (syncedFolder && backupInfo?.config.enabled ? ' on this PC AND on every PC syncing with this backup folder' : '') +
+      '. A copy of the old vault will be saved next to vault.db as a .pre-restore-* file ' +
+      'in case you need to roll back.'
     )) return;
     setBusy('backup-restore');
     try {
@@ -2458,11 +2644,14 @@ export default function Dashboard() {
         showToast('success', `Restored · ${result.documentsRestored || 0} documents`);
         setModal({ type: 'none' });
         // Reload everything from the restored DB
+        setMembers({});
         await loadFamilies();
         await loadBackupStatus();
       } else {
         showToast('error', result?.error || 'Restore failed');
       }
+    } catch (e: any) {
+      showToast('error', e?.message || String(e));
     } finally {
       setBusy(null);
     }
@@ -3034,13 +3223,8 @@ export default function Dashboard() {
             <button
               className={`gmail-status-pill ${backupTone()}`}
               onClick={openBackupSettings}
-              title={
-                backupInfo?.state.lastBackupError
-                  ? `Last error: ${backupInfo.state.lastBackupError}`
-                  : backupInfo?.config.folder
-                    ? `Backup folder: ${backupInfo.config.folder}`
-                    : 'Click to configure backup'
-              }
+              title={backupTooltip()}
+              aria-label={`${backupLabel()}. Open backup and sync settings`}
             >
               <span className="status-dot" />
               {backupLabel()}
@@ -3088,6 +3272,13 @@ export default function Dashboard() {
           ))}
 
           <div className="nav-section" style={{ marginTop: 24 }}>Tools</div>
+          <div
+            className={`nav-item ${selectedView === 'spreadsheet' ? 'active' : ''}`}
+            onClick={() => setSelectedView('spreadsheet')}
+            title="Every member's bank and broker balances in one sortable, filterable table"
+          >
+            <span className="nav-item-name">All Balances (table)</span>
+          </div>
           <div
             className={`nav-item ${selectedView === 'recharge' ? 'active' : ''}`}
             onClick={() => setSelectedView('recharge')}
@@ -3197,6 +3388,10 @@ export default function Dashboard() {
         )}
 
         {/* ── SIM Recharge Tracker ── */}
+        {selectedView === 'spreadsheet' && (
+          <SpreadsheetView families={families} members={members} onMemberClick={openMemberCard} />
+        )}
+
         {selectedView === 'recharge' && <RechargeTrackerPage />}
 
         {/* ── Zerodha TOTP ── */}
@@ -3402,7 +3597,7 @@ export default function Dashboard() {
 
               const staleRows = bmRows.filter(r => {
                 if (!r.fetchedAt) return false;
-                return (Date.now() - new Date(r.fetchedAt).getTime()) / 86_400_000 > STALE_DAYS;
+                return (Date.now() - parseDbTime(r.fetchedAt)) / 86_400_000 > STALE_DAYS;
               });
 
               const diffLabel = diff === null ? null
@@ -3529,7 +3724,7 @@ export default function Dashboard() {
                               <span>
                                 Stale balance (over {STALE_DAYS}d):{' '}
                                 {staleRows.map((r, i) => {
-                                  const days = Math.floor((Date.now() - new Date(r.fetchedAt!).getTime()) / 86_400_000);
+                                  const days = Math.floor((Date.now() - parseDbTime(r.fetchedAt)) / 86_400_000);
                                   return (
                                     <span key={i}>
                                       <strong>{r.member}</strong> ({r.bank}) — {days}d old{i < staleRows.length - 1 ? '; ' : ''}
@@ -3655,7 +3850,10 @@ export default function Dashboard() {
 
       {/* â"€â"€ Modals â"€â"€ */}
       {isModalOpen && (
-        <div className="modal-overlay" onClick={() => setModal({ type: 'none' })}>
+        <div
+          className="modal-overlay"
+          onClick={() => (modal.type === 'prepare-au-bid' || modal.type === 'review-au-bid' ? cancelAuIpoBatch() : setModal({ type: 'none' }))}
+        >
           <div className={`modal ${isPortfolioModal ? 'portfolio-modal' : ''} ${modal.type === 'member-card' ? 'member-card-modal' : ''}`} onClick={e => e.stopPropagation()}>
 
             {isPortfolioModal && (() => {
@@ -4031,7 +4229,9 @@ export default function Dashboard() {
                   )}
                 </div>
                 <div className="modal-foot">
-                  <button className="btn btn-ghost" onClick={() => setModal({ type: 'none' })}>Cancel</button>
+                  <button className="btn btn-ghost" onClick={cancelAuIpoBatch}>
+                    {auIpoMemberQueue.length > 1 ? 'Cancel batch' : 'Cancel'}
+                  </button>
                   {auIpoMemberQueue.length > 1 && (
                     <span style={{ color: 'var(--text-2)', fontSize: 12, margin: '0 auto' }}>
                       {auIpoQueueIndex + 1} of {auIpoMemberQueue.length}
@@ -4094,6 +4294,9 @@ export default function Dashboard() {
                   )}
                 </div>
                 <div className="modal-foot">
+                  <button className="btn btn-ghost" onClick={cancelAuIpoBatch} disabled={busy === `ipo-confirm-${preparedAuBid.id}`}>
+                    {auIpoMemberQueue.length > 1 ? 'Cancel batch' : 'Cancel'}
+                  </button>
                   <button className="btn btn-ghost" onClick={() => setModal({ type: 'prepare-au-bid', memberId: modal.memberId, familyId: modal.familyId, memberName: modal.memberName })}>
                     Back
                   </button>
@@ -4134,11 +4337,23 @@ export default function Dashboard() {
                 <div className="modal-body">
                   {modal.service === 'gmail' ? (
                     <>
+                      {gmailStatus && (
+                        <div
+                          className={`bm-strip-warn ${gmailStatus.state === 'connected' ? 'info' : 'stale'}`}
+                          style={{ marginBottom: 14, flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}
+                        >
+                          <strong>{gmailStatus.label}</strong>
+                          {gmailStatus.detail && <span style={{ lineHeight: 1.5 }}>{gmailStatus.detail}</span>}
+                          {gmailStatus.state === 'connected' && (
+                            <span>OTP emails are read automatically. Paste a new JSON below only to switch OAuth clients.</span>
+                          )}
+                        </div>
+                      )}
                       <div className="form-field">
                         <label>Google OAuth Client JSON</label>
                         <textarea
-                          autoFocus
-                          rows={12}
+                          autoFocus={!gmailStatus?.configured}
+                          rows={gmailStatus?.configured ? 5 : 12}
                           value={serviceConfigValue}
                           onChange={e => setServiceConfigValue(e.target.value)}
                           onKeyDown={e => {
@@ -4257,13 +4472,14 @@ export default function Dashboard() {
                       {busy === 'captcha-clear-anthropic' ? 'Removing...' : 'Clear Key'}
                     </button>
                   )}
-                  {modal.service === 'gmail' && (gmailStatus?.state === 'not_connected' || gmailStatus?.state === 'needs_reauth') && (
+                  {modal.service === 'gmail' && (gmailStatus?.state === 'not_connected' || gmailStatus?.state === 'needs_reauth' || gmailStatus?.state === 'error') && (
                     <button
                       className="btn btn-ghost"
                       onClick={reconnectGmailStatus}
                       disabled={busy === 'gmail-connect'}
+                      title="Opens Google sign-in in your browser. Your current access keeps working until the new sign-in succeeds."
                     >
-                      {busy === 'gmail-connect' ? 'Connecting...' : (gmailStatus?.state === 'needs_reauth' ? 'Reconnect' : 'Sign in')}
+                      {busy === 'gmail-connect' ? 'Waiting for Google sign-in…' : (gmailStatus?.state === 'not_connected' ? 'Sign in' : 'Reconnect')}
                     </button>
                   )}
                   <button
@@ -4354,8 +4570,17 @@ export default function Dashboard() {
             {/* Backup settings modal */}
             {modal.type === 'backup-settings' && (
               <>
-                <div className="modal-head">Backup Settings</div>
+                <div className="modal-head">Backup &amp; Sync</div>
                 <div className="modal-body">
+                  {backupInfo?.state.conflict && (
+                    <div className="bm-strip-warn stale" style={{ marginBottom: 14, gap: 10, alignItems: 'center', justifyContent: 'space-between' }}>
+                      <span>
+                        ⚠ Sync conflict: this PC and {backupInfo.state.conflict.remoteHost || 'another PC'} both
+                        changed data. Nothing syncs until you choose which copy to keep.
+                      </span>
+                      <button className="btn" onClick={() => setModal({ type: 'sync-conflict' })}>Resolve…</button>
+                    </div>
+                  )}
                   <div className="form-field">
                     <label>Backup folder</label>
                     <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -4379,17 +4604,31 @@ export default function Dashboard() {
                         checked={!!backupInfo?.config.enabled}
                         onChange={e => toggleBackupEnabled(e.target.checked)}
                       />
-                      Enable automatic backup (runs every 6 hours after unlock)
+                      Keep this PC in sync — uploads changes about 2 minutes after you make them and
+                      picks up the other PC's changes automatically while the app is open
                     </label>
                   </div>
                   <div className="form-field" style={{ marginTop: 14 }}>
                     <label>Status</label>
-                    <div className="empty-sub">
-                      Last backup: {backupInfo?.state.lastBackupAt
+                    <div className="empty-sub" style={{ lineHeight: 1.7 }}>
+                      This PC: <strong>{backupInfo?.sync?.thisHost || '—'}</strong>
+                      {backupInfo?.sync?.dirty && <> · changes waiting to upload</>}<br />
+                      Last upload: {backupInfo?.state.lastBackupAt
                         ? `${new Date(backupInfo.state.lastBackupAt).toLocaleString()} (${formatAge(backupInfo.state.lastBackupAt)})`
                         : 'never'}<br />
+                      Last download: {backupInfo?.state.lastPullAt
+                        ? `${new Date(backupInfo.state.lastPullAt).toLocaleString()} (${formatAge(backupInfo.state.lastPullAt)})` +
+                          (backupInfo.state.lastPullSourceHost ? ` from ${backupInfo.state.lastPullSourceHost}` : '')
+                        : 'never'}<br />
+                      {backupInfo?.sync?.head && (
+                        <>Newest in folder: {backupInfo.sync.head.sourceHost || 'older app version'}
+                          {backupInfo.sync.head.timestamp ? ` · ${formatAge(backupInfo.sync.head.timestamp)}` : ''}<br /></>
+                      )}
+                      {backupInfo?.state.lastSyncError && (
+                        <span style={{ color: 'var(--warn)' }}>⚠ {backupInfo.state.lastSyncError}<br /></span>
+                      )}
                       {backupInfo?.state.lastBackupError && (
-                        <span style={{ color: 'var(--danger)' }}>Last error: {backupInfo.state.lastBackupError}</span>
+                        <span style={{ color: 'var(--danger)' }}>Last upload error: {backupInfo.state.lastBackupError}</span>
                       )}
                     </div>
                   </div>
@@ -4397,9 +4636,10 @@ export default function Dashboard() {
                     <button
                       className="btn"
                       onClick={runBackupNow}
-                      disabled={busy === 'backup-run' || !backupInfo?.config.folder}
+                      disabled={busy === 'backup-run' || !backupInfo?.config.folder || !!backupInfo?.state.conflict}
+                      title={backupInfo?.state.conflict ? 'Resolve the sync conflict first' : 'Upload this PC\'s changes now (or download newer ones first)'}
                     >
-                      {busy === 'backup-run' ? 'Backing up...' : 'Backup Now'}
+                      {busy === 'backup-run' ? 'Syncing...' : 'Sync now'}
                     </button>
                     <button
                       className="btn btn-ghost"
@@ -4493,6 +4733,7 @@ export default function Dashboard() {
                                 {new Date(snap.timestamp).toLocaleString()}
                               </div>
                               <div className="empty-sub" style={{ fontSize: 11 }}>
+                                {snap.sourceHost ? `from ${snap.sourceHost} · ` : ''}
                                 {snap.documentCount} documents · {formatFileSize(snap.dbBytes)} vault · {formatFileSize(snap.totalBlobBytes)} files
                               </div>
                             </div>
@@ -4520,6 +4761,63 @@ export default function Dashboard() {
                 </div>
               </>
             )}
+
+            {/* Sync conflict — both PCs changed data; the user picks the winner */}
+            {modal.type === 'sync-conflict' && (() => {
+              const conflict = backupInfo?.state.conflict;
+              const other = conflict?.remoteHost || 'your other PC';
+              return (
+                <>
+                  <div className="modal-head">Sync conflict — choose which copy to keep</div>
+                  <div className="modal-body">
+                    {!conflict ? (
+                      <div className="empty">
+                        <div className="empty-title">No conflict</div>
+                        <div className="empty-sub">Both PCs are in sync.</div>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="empty-sub" style={{ marginBottom: 14, lineHeight: 1.6 }}>
+                          {conflict.reason === 'local-unsynced-changes'
+                            ? <>This PC has changes that were never uploaded, and {other} has since saved newer data.</>
+                            : <>{other} saved data without having this PC's latest changes.</>}
+                          {' '}Merging isn't possible, so one copy has to win. Until you choose, this PC
+                          neither uploads nor downloads — nothing is overwritten.
+                        </div>
+                        <div className="portfolio-summary-grid">
+                          <div className="portfolio-summary-card">
+                            <div style={{ fontWeight: 600, marginBottom: 4 }}>This PC · {backupInfo?.sync?.thisHost || '—'}</div>
+                            <div className="empty-sub" style={{ marginBottom: 10 }}>
+                              {backupInfo?.state.lastBackupAt ? `Last uploaded ${formatAge(backupInfo.state.lastBackupAt)}` : 'Never uploaded'}
+                              {conflict.reason === 'local-unsynced-changes' ? ' · has newer local changes' : ''}
+                            </div>
+                            <button className="btn" disabled={busy === 'sync-resolve'} onClick={() => resolveSyncConflict('keep-local')}>
+                              Keep this PC's data
+                            </button>
+                          </div>
+                          <div className="portfolio-summary-card">
+                            <div style={{ fontWeight: 600, marginBottom: 4 }}>{other}</div>
+                            <div className="empty-sub" style={{ marginBottom: 10 }}>
+                              {conflict.remoteTimestamp ? `Saved ${formatAge(conflict.remoteTimestamp)}` : 'Newest backup in the folder'}
+                            </div>
+                            <button className="btn btn-ghost" disabled={busy === 'sync-resolve'} onClick={() => resolveSyncConflict('use-remote')}>
+                              Use {other}'s data
+                            </button>
+                          </div>
+                        </div>
+                        <div className="empty-sub" style={{ marginTop: 12, fontSize: 11 }}>
+                          Not sure? Pick the PC you used most recently for real work (balance refreshes,
+                          new members, IPO bids). The other copy stays in Backup → Restore… history for a while.
+                        </div>
+                      </>
+                    )}
+                  </div>
+                  <div className="modal-foot">
+                    <button className="btn btn-ghost" onClick={() => setModal({ type: 'none' })}>Decide later</button>
+                  </div>
+                </>
+              );
+            })()}
 
             {/* Member detail card (click member name → copyable creds) */}
             {modal.type === 'member-card' && (
@@ -5057,13 +5355,19 @@ function ZerodhaTotpPage() {
 
   async function fetchTotp(brokerAccountId: number) {
     setLoading(true);
-    const res = await window.api.totp.generate(brokerAccountId) as any;
-    setLoading(false);
-    if (res?.ok) {
-      setOtp(res.otp);
-      setSecondsLeft(res.secondsRemaining);
-    } else {
+    try {
+      const res = await window.api.totp.generate(brokerAccountId) as any;
+      if (res?.ok) {
+        setOtp(res.otp);
+        setSecondsLeft(res.secondsRemaining);
+      } else {
+        setOtp(null);
+      }
+    } catch {
+      // e.g. a malformed TOTP secret, or the vault auto-locked
       setOtp(null);
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -5276,20 +5580,29 @@ function RechargeTrackerPage() {
       validity_days: form.validity_days !== '' ? parseInt(form.validity_days, 10) : undefined,
       notes: form.notes || undefined,
     };
-    if (editingId != null) {
-      await window.api.recharge.update({ id: editingId, ...payload });
-    } else {
-      await window.api.recharge.create(payload);
+    try {
+      if (editingId != null) {
+        await window.api.recharge.update({ id: editingId, ...payload });
+      } else {
+        await window.api.recharge.create(payload);
+      }
+      cancelForm();
+      await load();
+    } catch (e: any) {
+      alert(`Could not save: ${e?.message || e}`);
+    } finally {
+      setSaving(false);
     }
-    setSaving(false);
-    cancelForm();
-    await load();
   }
 
   async function deleteEntry(id: number) {
     if (!confirm('Delete this entry?')) return;
-    await window.api.recharge.delete(id);
-    await load();
+    try {
+      await window.api.recharge.delete(id);
+      await load();
+    } catch (e: any) {
+      alert(`Could not delete: ${e?.message || e}`);
+    }
   }
 
   return (

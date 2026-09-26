@@ -3,10 +3,13 @@ import { createRetailBankAdapter } from './genericBank';
 export const bobBankAdapter = createRetailBankAdapter({
   code: 'BOB',
   displayName: 'Bank of Baroda',
-  loginUrl: 'https://www.bobibanking.com/',
+  // bobibanking.com now only shows a "moved to new domain" notice (verified
+  // 2026-09-26); the new site keeps the "Retail Users · LOGIN" entry point.
+  loginUrl: ['https://bobibanking.bankofbaroda.bank.in/', 'https://www.bobibanking.com/'],
   usernameLabel: 'User ID',
   otpMode: 'manual',
   preLoginSelectors: [
+    'a:has-text("Retail Users")',
     'a:has-text("Retail User")',
     'button:has-text("Retail User")',
     'input[value*="Retail" i]',

@@ -1,12 +1,13 @@
 import { Frame, Locator, Page } from 'playwright';
-import { LoginAdapter, LoginCredentials } from './browser';
+import { gotoFirstReachable, LoginAdapter, LoginCredentials } from './browser';
 
 type SearchRoot = Page | Frame;
 
 interface RetailBankConfig {
   code: string;
   displayName: string;
-  loginUrl: string;
+  /** Current address first; older hostnames after it as fallbacks (see gotoFirstReachable). */
+  loginUrl: string | string[];
   usernameLabel?: string;
   otpMode?: 'manual' | 'email';
   preLoginSelectors?: string[];
@@ -367,7 +368,8 @@ export function createRetailBankAdapter(config: RetailBankConfig): LoginAdapter 
     otpMode: config.otpMode ?? 'manual',
 
     async login(page: Page, creds: LoginCredentials, fetchOtp: () => Promise<string>): Promise<void> {
-      await page.goto(config.loginUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      const urls = Array.isArray(config.loginUrl) ? config.loginUrl : [config.loginUrl];
+      await gotoFirstReachable(page, urls, { label: config.displayName });
       await page.waitForTimeout(1_500);
 
       if (config.preLoginSelectors?.length) {

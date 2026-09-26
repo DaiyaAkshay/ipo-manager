@@ -107,14 +107,31 @@ function brokerCode(provider: string | null | undefined): string {
   return 'UNKNOWN';
 }
 
+// Regional rural and co-operative banks often carry a sponsor bank's name or
+// even its IFSC prefix ("Baroda Rajasthan Kshetriya Gramin Bank" uses BARB…),
+// but have their own net banking — the sponsor's adapter would log in wrong.
+const SEPARATE_BANK_HINT = /\b(gramin|kshetriya|rrb|co-?operative|co-?op|sahakari|nagrik|urban co)\b/i;
+
+function containsWord(haystack: string, needle: string): boolean {
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i').test(haystack);
+}
+
 function bankCode(bankName: string | null | undefined, ifsc: string | null | undefined): string {
   const name = (bankName || '').toLowerCase().trim();
+  if (SEPARATE_BANK_HINT.test(name)) return 'UNKNOWN';
+  // Whole-word match: a plain substring test mapped e.g. "Saurashtra …" to AU.
   for (const [needle, code] of Object.entries(BANK_CODE_MAP)) {
-    if (name.includes(needle)) return code;
+    if (containsWord(name, needle)) return code;
   }
 
   const prefix = (ifsc || '').trim().toUpperCase().slice(0, 4);
-  return BANK_CODE_BY_IFSC_PREFIX[prefix] || 'AU';
+  if (BANK_CODE_BY_IFSC_PREFIX[prefix]) return BANK_CODE_BY_IFSC_PREFIX[prefix];
+  // The original sheet listed only AU accounts, often with the bank column
+  // blank — keep AU for rows with no bank details at all. A bank we simply
+  // don't recognise becomes UNKNOWN (login refuses it) instead of being run
+  // through the AU adapter with another bank's credentials.
+  return name || prefix ? 'UNKNOWN' : 'AU';
 }
 
 function readPersonColumn(

@@ -13,9 +13,11 @@ npm install          # also downloads Playwright Chromium (~150 MB)
 npm run dev          # dev mode (hot reload)
 npm run build        # compile to out/
 npm run build:win    # Windows NSIS installer → dist/
+npm test             # vitest (pure modules: backup/syncPolicy, email/otpParse, logging redaction)
+npx tsc --noEmit     # type-check — keep at 0 errors
 ```
 
-There are no test scripts configured.
+Keep sync decisions in `backup/syncPolicy.ts` and OTP parsing in `email/otpParse.ts` pure (no Electron/keytar/native imports) so they stay unit-testable.
 
 ## Architecture
 
@@ -41,7 +43,8 @@ src/renderer/    — React UI, no Node access
 | `automation/registry.ts` | Maps bank/broker codes (`AU`, `YES`, `ZERODHA`, …) to adapters + OTP presets |
 | `automation/auBank.ts` | Only fully implemented adapter; use as template for new ones |
 | `automation/stubs.ts` | All other banks/brokers — just open the login URL, user fills in manually |
-| `email/gmail.ts` | Gmail API OAuth OTP fetcher |
+| `email/gmail.ts` | Gmail API OAuth (loopback + PKCE) OTP fetcher; throws `GmailAuthError` → callers fall back to manual OTP |
+| `backup/engine.ts` | Drive-folder snapshot sync: 30 s loop, dirty-hash + lineage, conflict → user choice (policy in `backup/syncPolicy.ts`) |
 | `importer/excel.ts` | SheetJS importer for `Demat_Sheet.xlsx` |
 
 ### Preload (`src/preload/index.ts`)

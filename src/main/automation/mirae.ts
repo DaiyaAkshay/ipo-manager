@@ -231,7 +231,7 @@ export const miraeAdapter: LoginAdapter = {
     // ── Step 1: Fill Mobile Number ────────────────────────────────────────────
     const mobile = (creds.username || '').replace(/\D/g, '').slice(-10);
     if (mobile.length !== 10) {
-      console.warn(`[mStock] Mobile number "${creds.username}" is not 10 digits — proceeding anyway.`);
+      console.warn(`[mStock] Stored mobile number has ${creds.username.length} characters, not 10 digits — proceeding anyway.`);
     }
 
     try {

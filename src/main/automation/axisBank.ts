@@ -3,7 +3,9 @@ import { createRetailBankAdapter } from './genericBank';
 export const axisBankAdapter = createRetailBankAdapter({
   code: 'AXIS',
   displayName: 'Axis Bank',
-  loginUrl: 'https://omni.axisbank.co.in/axisretailbanking/',
+  // omni.axisbank.co.in stopped resolving (verified 2026-09-26); Axis moved to
+  // the RBI .bank.in domain.
+  loginUrl: ['https://omni.axis.bank.in/axisretailbanking/', 'https://omni.axisbank.co.in/axisretailbanking/'],
   usernameLabel: 'Customer/Login ID',
   otpMode: 'manual',
   usernameSelectors: [

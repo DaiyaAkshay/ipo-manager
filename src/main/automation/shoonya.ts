@@ -409,6 +409,11 @@ export const shoonyaAdapter: LoginAdapter = {
   otpMode: 'manual',
 
   async login(page: Page, creds: LoginCredentials, fetchOtp: () => Promise<string>): Promise<void> {
+    // Sessions launch with viewport:null (a real, screen-sized window), so
+    // page.viewportSize() is null and pointAt() fell back to 1280x800 while the
+    // page actually rendered at the window's size — every click landed on the
+    // wrong spot. Pin the page to the viewport the click ratios were measured on.
+    await page.setViewportSize({ width: 1280, height: 800 }).catch(() => {});
     await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     // The Shoonya Flutter shell paints the login form a little after DOM ready,
     // but a full 12s sleep makes the flow feel sluggish.

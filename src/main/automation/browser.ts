@@ -196,7 +196,7 @@ async function setBrowserDownloadBehavior(page: Page, downloadDir: string): Prom
     const contextAny = page.context() as any;
     const browserContextId = contextAny?._browserContextId;
     if (browserContextId) params.browserContextId = browserContextId;
-    await client.send('Browser.setDownloadBehavior', params);
+    await client.send('Browser.setDownloadBehavior', params as any);
   } catch (error) {
     console.warn('[Browser] Could not override Chromium download behavior:', error);
   }
@@ -289,7 +289,7 @@ function isRevealableDownloadPath(filePath: string): boolean {
 function collectRevealableDownloadFiles(dir: string): string[] {
   if (!existsSync(dir)) return [];
 
-  let entries: ReturnType<typeof readdirSync>;
+  let entries: import('node:fs').Dirent[];
   try {
     entries = readdirSync(dir, { withFileTypes: true });
   } catch {
@@ -510,6 +510,49 @@ export async function closeAllBrowserSessions(): Promise<number> {
   sessionCache.clear();
   await Promise.all(contexts.map(context => context.close().catch(() => {})));
   return contexts.length;
+}
+
+/**
+ * Navigate to the first address that loads. Indian banks moved net banking to
+ * RBI's `.bank.in` domains in 2025–26, and some old hostnames no longer resolve
+ * at all (netbanking.yesbank.in, omni.axisbank.co.in, web.fyers.in, …). Adapters
+ * list the current address first and older ones as fallbacks; only "can't reach
+ * this host" failures fall through to the next address.
+ */
+export async function gotoFirstReachable(
+  page: Page,
+  urls: string[],
+  opts: { timeout?: number; label?: string } = {}
+): Promise<string> {
+  let lastError: unknown = null;
+  for (const url of urls) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: opts.timeout ?? 60_000 });
+      return url;
+    } catch (e: any) {
+      lastError = e;
+      const msg = String(e?.message || e);
+      if (!/ERR_NAME_NOT_RESOLVED|ERR_NAME_RESOLUTION_FAILED|ERR_CONNECTION_(REFUSED|RESET|CLOSED|TIMED_OUT)|ERR_ADDRESS_UNREACHABLE|ERR_CERT_|ERR_SSL_/i.test(msg)) {
+        throw e;
+      }
+      console.warn(`[${opts.label || 'browser'}] ${url} unreachable (${msg.split('\n')[0]}) — trying the next address…`);
+    }
+  }
+  throw lastError ?? new Error('None of the login addresses could be reached.');
+}
+
+/**
+ * True while any bank/broker window launched by the app is still open — the
+ * user may be working in it (e.g. reviewing an AU IPO bid) without touching
+ * the app window, which is all the inactivity timer can see.
+ */
+export function hasOpenBrowserWindows(): boolean {
+  for (const context of sessionCache.values()) {
+    try {
+      if (context.pages().some(page => !page.isClosed())) return true;
+    } catch { /* context already closed */ }
+  }
+  return false;
 }
 
 /**

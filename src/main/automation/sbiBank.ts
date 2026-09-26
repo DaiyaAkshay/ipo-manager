@@ -1,14 +1,18 @@
 /**
  * SBI Internet Banking login adapter.
  *
- * Verified selectors (inspected live via Playwright on retail.sbi.bank.in):
+ * LOGIN URL  : https://retail.sbi.bank.in/retail/login.htm
  *
- *   LOGIN URL  : https://retail.sbi.bank.in/retail/login.htm
- *   Step 1     : click  a.login_button  ("CONTINUE TO LOGIN")
- *   Username   : input#username          (name="userName")
- *   Password   : input#label2            (name="password", type="password")
- *   CAPTCHA    : input#loginCaptchaValue  — user fills manually
- *   Submit     : input#Button2           (type="submit")
+ * Since 2026 that address redirects to the YONO SBI web login
+ * (yonoretail.sbi.bank.in, Angular Material — verified live 2026-09-26):
+ *   Username   : mat-form-field labelled "Username"      (input, maxlength 20)
+ *   Password   : input[type="password"]                   (maxlength 20)
+ *   CAPTCHA    : mat-form-field labelled "Enter Captcha"  (maxlength 5) — user fills
+ *   Submit     : "Login" button — user clicks after typing the CAPTCHA
+ * The mat-input-N ids are generated per load, so fields are found by label.
+ *
+ * The classic OnlineSBI page (a.login_button → input#username / input#label2 /
+ * input#loginCaptchaValue) is still handled in case SBI serves it again.
  *
  * After login SBI shows a separate OTP page (mobile OTP only, no email).
  * The app pops an OTP dialog so the user can type it in from their phone.
@@ -16,10 +20,33 @@
  * otpMode = 'manual' — skips Gmail polling; uses the in-app IPC dialog.
  */
 
-import { Page } from 'playwright';
+import { Locator, Page } from 'playwright';
 import { LoginAdapter, LoginCredentials } from './browser';
 
 const LOGIN_URL = 'https://retail.sbi.bank.in/retail/login.htm';
+
+async function firstVisible(page: Page, selectors: string[], timeoutMs: number): Promise<Locator | null> {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    for (const selector of selectors) {
+      const loc = page.locator(selector).first();
+      if (await loc.isVisible().catch(() => false)) return loc;
+    }
+    await page.waitForTimeout(300);
+  } while (Date.now() < deadline);
+  return null;
+}
+
+const YONO_USERNAME = [
+  'mat-form-field:has(mat-label:has-text("Username")) input',
+  'input[formcontrolname*="user" i]',
+  'input[type="text"][maxlength="20"]',
+];
+const YONO_CAPTCHA = [
+  'mat-form-field:has(mat-label:has-text("Captcha")) input',
+  'input[formcontrolname*="captcha" i]',
+  'input[type="text"][maxlength="5"]',
+];
 
 export const sbiBankAdapter: LoginAdapter = {
   code: 'SBI',
@@ -29,62 +56,79 @@ export const sbiBankAdapter: LoginAdapter = {
   async login(page: Page, creds: LoginCredentials, fetchOtp: () => Promise<string>): Promise<void> {
     // ── Navigate ──────────────────────────────────────────────────────────────
     await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(2500);
 
-    // ── Step 1: Click "CONTINUE TO LOGIN" ────────────────────────────────────
-    try {
-      const continueBtn = page.locator('a.login_button').first();
-      await continueBtn.waitFor({ state: 'visible', timeout: 15_000 });
-      await continueBtn.click();
-      console.log('[SBI] ✓ Clicked "CONTINUE TO LOGIN"');
-    } catch {
-      console.warn('[SBI] Could not find "CONTINUE TO LOGIN" button — the page structure may have changed.');
+    const classic = await page.locator('a.login_button').first().isVisible().catch(() => false);
+    let passwordField: Locator | null = null;
+
+    if (classic) {
+      // ── Classic OnlineSBI page ─────────────────────────────────────────────
+      await page.locator('a.login_button').first().click().catch(() => {});
+      console.log('[SBI] ✓ Clicked "CONTINUE TO LOGIN" (classic page)');
+      const usernameField = await firstVisible(page, ['input#username'], 15_000);
+      if (usernameField) {
+        await usernameField.fill(creds.username);
+        console.log('[SBI] ✓ Username filled');
+      } else {
+        console.warn('[SBI] Could not find username field (input#username).');
+      }
+      passwordField = await firstVisible(page, ['input#label2', 'input[type="password"]'], 10_000);
+    } else {
+      // ── YONO SBI web login ─────────────────────────────────────────────────
+      let usernameField = await firstVisible(page, YONO_USERNAME, 8_000);
+      if (!usernameField) {
+        // Another login method may be pre-selected — switch to Username/Password.
+        await page.locator('button:has-text("Username / Password"), button:has-text("Username/Password")')
+          .first().click({ timeout: 3_000 }).catch(() => {});
+        usernameField = await firstVisible(page, YONO_USERNAME, 12_000);
+      }
+      if (usernameField) {
+        await usernameField.click().catch(() => {});
+        await usernameField.fill(creds.username);
+        console.log('[SBI] ✓ Username filled (YONO)');
+      } else {
+        console.warn('[SBI] Could not find the YONO username field — the page may have changed.');
+      }
+      passwordField = await firstVisible(page, ['input[type="password"]'], 10_000);
     }
 
-    // ── Step 2: Fill username ─────────────────────────────────────────────────
-    try {
-      const usernameField = page.locator('input#username').first();
-      await usernameField.waitFor({ state: 'visible', timeout: 15_000 });
-      await usernameField.fill(creds.username);
-      console.log('[SBI] ✓ Username filled');
-    } catch {
-      console.warn('[SBI] Could not find username field (input#username).');
-    }
-
-    // ── Step 3: Fill password ─────────────────────────────────────────────────
-    try {
-      const passwordField = page.locator('input#label2').first();
-      await passwordField.waitFor({ state: 'visible', timeout: 10_000 });
+    if (passwordField) {
       await passwordField.fill(creds.password);
       console.log('[SBI] ✓ Password filled');
-    } catch {
-      console.warn('[SBI] Could not find password field (input#label2).');
+    } else {
+      console.warn('[SBI] Could not find the password field.');
     }
 
-    // ── Step 4: CAPTCHA — user must fill manually ─────────────────────────────
-    // The CAPTCHA image is at input#loginCaptchaValue.
-    // We leave the browser open; the user types the CAPTCHA and clicks LOGIN.
+    // ── CAPTCHA — user must fill manually ────────────────────────────────────
+    // Put the cursor in the CAPTCHA box so the user can just type and press Login.
+    const captchaField = await firstVisible(page, classic ? ['input#loginCaptchaValue'] : YONO_CAPTCHA, 5_000);
+    await captchaField?.focus().catch(() => {});
     console.log('[SBI] ⏳ Enter the CAPTCHA in the browser and click LOGIN…');
 
-    // ── Step 5: Wait for OTP page ─────────────────────────────────────────────
-    // After a correct login SBI navigates away from login.htm.
-    // We watch for: URL change away from login.htm AND an OTP input appearing.
-    // Known OTP field names used by SBI: txnAuthCode, otp, OTP
+    // ── Wait until the user has submitted the login form ─────────────────────
+    // Classic page: the URL leaves login.htm. YONO: the password field goes away
+    // (OTP / dashboard replaces the login card). Up to 3 min for the CAPTCHA.
     try {
-      // First wait for the page to move past login.htm (up to 2 min for CAPTCHA)
-      await page.waitForFunction(
-        () => !window.location.href.includes('login.htm'),
-        { timeout: 120_000 }
-      );
-      console.log('[SBI] ✓ Navigated past login page, URL:', page.url());
+      if (classic) {
+        await page.waitForFunction(() => !window.location.href.includes('login.htm'), { timeout: 180_000 });
+      } else {
+        await page.waitForFunction(() => {
+          const pw = document.querySelector<HTMLInputElement>('input[type="password"]');
+          const rect = pw?.getBoundingClientRect();
+          return !pw || !rect || rect.width === 0 || rect.height === 0;
+        }, { timeout: 180_000 });
+      }
+      console.log('[SBI] ✓ Login form submitted, URL:', page.url());
     } catch {
-      console.warn('[SBI] Still on login page after 2 min — login may have failed.');
+      console.warn('[SBI] Still on the login page after 3 min — login may have failed.');
       return;
     }
 
-    // After leaving login.htm, wait for an OTP input to appear
+    // After the login form is submitted, wait for an OTP input to appear
     try {
       const otpField = page.locator([
+        'mat-form-field:has(mat-label:has-text("OTP")) input',
+        'input[formcontrolname*="otp" i]',
         'input[name="txnAuthCode"]',
         'input[name="otp"]',
         'input[name="OTP"]',
@@ -94,6 +138,7 @@ export const sbiBankAdapter: LoginAdapter = {
         'input[maxlength="6"][type="text"]',
         'input[maxlength="6"][type="number"]',
         'input[maxlength="6"][type="tel"]',
+        'input[maxlength="6"][type="password"]',
       ].join(', ')).first();
 
       await otpField.waitFor({ state: 'visible', timeout: 30_000 });
@@ -149,12 +194,15 @@ export const sbiBankAdapter: LoginAdapter = {
 
         // SBI account summary page shows "Available Balance" per account.
         // We pick the first (typically savings account) available balance.
+        // Paise optional, but then Indian comma grouping is required, so a
+        // whole-rupee balance ("₹2,00,000") is read while dates/account numbers aren't.
+        const AMT = '(\\d{1,3}(?:,\\d{2,3})+(?:\\.\\d{1,2})?|\\d+\\.\\d{1,2})';
         const patterns: RegExp[] = [
-          /Available\s+Balance[\s\S]{0,40}?₹?\s*([\d,]+\.\d{2})/i,
-          /Avail(?:able)?\.?\s*Bal(?:ance)?\.?[\s\S]{0,40}?₹?\s*([\d,]+\.\d{2})/i,
-          /Clear\s+Balance[\s\S]{0,40}?₹?\s*([\d,]+\.\d{2})/i,
-          /₹\s*([\d,]+\.\d{2})/,          // first ₹ amount with paise
-          /Rs\.?\s*([\d,]+\.\d{2})/i,     // "Rs." prefix variant
+          new RegExp(`Available\\s+Balance[\\s\\S]{0,40}?₹?\\s*${AMT}`, 'i'),
+          new RegExp(`Avail(?:able)?\\.?\\s*Bal(?:ance)?\\.?[\\s\\S]{0,40}?₹?\\s*${AMT}`, 'i'),
+          new RegExp(`Clear\\s+Balance[\\s\\S]{0,40}?₹?\\s*${AMT}`, 'i'),
+          new RegExp(`₹\\s*${AMT}`),          // first ₹ amount
+          new RegExp(`Rs\\.?\\s*${AMT}`, 'i'), // "Rs." prefix variant
         ];
 
         for (const re of patterns) {

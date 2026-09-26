@@ -606,7 +606,7 @@ export const angelAdapter: LoginAdapter = {
     const mpin   = (creds.password || '').replace(/\D/g, '');
 
     if (mobile.length !== 10) {
-      console.warn(`[Angel One] Mobile "${creds.username}" is not 10 digits — proceeding anyway.`);
+      console.warn(`[Angel One] Stored mobile number has ${creds.username.length} characters, not 10 digits — proceeding anyway.`);
     }
 
     // 1) Navigate (or land on cached session)

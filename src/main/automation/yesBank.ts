@@ -1,7 +1,9 @@
 /**
  * YES Bank NetBanking login adapter.
  *
- * Login URL  : https://netbanking.yesbank.in/
+ * Login URL  : https://yesonline.yes.bank.in/  (RBI .bank.in domain). The old
+ *              netbanking.yesbank.in stopped resolving (verified 2026-09-26),
+ *              so every YES login failed at the first navigation.
  * Step 1     : input#txtUserName  (Customer ID / Login ID)
  * Password   : input#txtPassword
  * Submit     : button or input[type="submit"] on the form
@@ -16,9 +18,9 @@
  */
 
 import { Page } from 'playwright';
-import { LoginAdapter, LoginCredentials } from './browser';
+import { gotoFirstReachable, LoginAdapter, LoginCredentials } from './browser';
 
-const LOGIN_URL = 'https://netbanking.yesbank.in/';
+const LOGIN_URLS = ['https://yesonline.yes.bank.in/', 'https://netbanking.yesbank.in/'];
 
 export const yesBankAdapter: LoginAdapter = {
   code: 'YES',
@@ -27,7 +29,7 @@ export const yesBankAdapter: LoginAdapter = {
 
   async login(page: Page, creds: LoginCredentials, fetchOtp: () => Promise<string>): Promise<void> {
     // ── Navigate ─────────────────────────────────────────────────────────────
-    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await gotoFirstReachable(page, LOGIN_URLS, { label: 'YES Bank' });
     await page.waitForTimeout(2000);
 
     // ── Fill Customer ID / Login ID ──────────────────────────────────────────
@@ -38,6 +40,8 @@ export const yesBankAdapter: LoginAdapter = {
         'input[placeholder*="Customer ID" i]',
         'input[placeholder*="Login ID" i]',
         'input[placeholder*="User ID" i]',
+        'input[name*="user" i]:not([type="hidden"])',
+        'input[id*="user" i]:not([type="hidden"])',
         'input[type="text"]',
       ].join(', ')).first();
       await userField.waitFor({ state: 'visible', timeout: 15_000 });
@@ -142,11 +146,14 @@ export const yesBankAdapter: LoginAdapter = {
       await page.waitForTimeout(3000);
       const balance = await page.evaluate((): string | null => {
         const text = (document.body as HTMLElement).innerText || '';
+        // Paise optional, but then Indian comma grouping is required, so a
+        // whole-rupee balance ("₹2,00,000") is read while dates/account numbers aren't.
+        const AMT = '(\\d{1,3}(?:,\\d{2,3})+(?:\\.\\d{1,2})?|\\d+\\.\\d{1,2})';
         const patterns: RegExp[] = [
-          /Available\s+Balance[\s\S]{0,40}?₹?\s*([\d,]+\.\d{2})/i,
-          /Avail(?:able)?\.?\s*Bal(?:ance)?\.?[\s\S]{0,40}?₹?\s*([\d,]+\.\d{2})/i,
-          /₹\s*([\d,]+\.\d{2})/,
-          /Rs\.?\s*([\d,]+\.\d{2})/i,
+          new RegExp(`Available\\s+Balance[\\s\\S]{0,40}?₹?\\s*${AMT}`, 'i'),
+          new RegExp(`Avail(?:able)?\\.?\\s*Bal(?:ance)?\\.?[\\s\\S]{0,40}?₹?\\s*${AMT}`, 'i'),
+          new RegExp(`₹\\s*${AMT}`),
+          new RegExp(`Rs\\.?\\s*${AMT}`, 'i'),
         ];
         for (const re of patterns) {
           const m = text.match(re);

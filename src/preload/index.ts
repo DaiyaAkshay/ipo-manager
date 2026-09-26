@@ -11,10 +11,17 @@ const api = {
       ipcRenderer.invoke('vault:reset', { confirmation, password })
   },
   gmail: {
-    status: () => ipcRenderer.invoke('gmail:status'),
+    /** `force` skips main's 30s status cache (use after a user action). */
+    status: (opts?: { force?: boolean }) => ipcRenderer.invoke('gmail:status', opts),
     connect: () => ipcRenderer.invoke('gmail:connect'),
     setCredentials: (rawJson: string) => ipcRenderer.invoke('gmail:setCredentials', rawJson),
-    clearCredentials: () => ipcRenderer.invoke('gmail:clearCredentials')
+    clearCredentials: () => ipcRenderer.invoke('gmail:clearCredentials'),
+    /** Push event: Gmail access failed mid-login (e.g. token expired). Returns a cleanup function. */
+    onStatusChanged: (cb: () => void): (() => void) => {
+      const handler = () => cb();
+      ipcRenderer.on('gmail:statusChanged', handler);
+      return () => ipcRenderer.off('gmail:statusChanged', handler);
+    },
   },
   captchaAi: {
     status: () => ipcRenderer.invoke('captchaAi:status'),
@@ -34,7 +41,6 @@ const api = {
     members: (familyId: number) => ipcRenderer.invoke('members:byFamily', familyId)
   },
   member: {
-    detail: (memberId: number) => ipcRenderer.invoke('member:detail', memberId),
     fullDetail: (memberId: number) => ipcRenderer.invoke('member:fullDetail', memberId),
     create: (payload: any) => ipcRenderer.invoke('members:create', payload),
     update: (payload: any) => ipcRenderer.invoke('members:update', payload),
@@ -129,14 +135,34 @@ const api = {
     restore: (snapshotId: string, sourceFolder?: string) =>
       ipcRenderer.invoke('backup:restore', { snapshotId, sourceFolder }),
     latestSnapshotId: (sourceFolder?: string) =>
-      ipcRenderer.invoke('backup:latestSnapshotId', sourceFolder)
+      ipcRenderer.invoke('backup:latestSnapshotId', sourceFolder),
+    /** Settle a sync conflict: keep this PC's data, or take the other PC's. */
+    resolveConflict: (choice: 'keep-local' | 'use-remote') =>
+      ipcRenderer.invoke('backup:resolveConflict', choice),
   },
   events: {
-    onLocked: (cb: () => void) => ipcRenderer.on('vault:locked', cb),
-    onAutoSynced: (cb: (data: { snapshotTimestamp: string }) => void) => {
-      const handler = (_: Electron.IpcRendererEvent, data: { snapshotTimestamp: string }) => cb(data);
+    onLocked: (cb: () => void): (() => void) => {
+      const handler = () => cb();
+      ipcRenderer.on('vault:locked', handler);
+      return () => ipcRenderer.off('vault:locked', handler);
+    },
+    /** Push event: the vault was replaced by another PC's newer data — reload everything. */
+    onAutoSynced: (cb: (data: { snapshotTimestamp: string; sourceHost?: string | null }) => void) => {
+      const handler = (_: Electron.IpcRendererEvent, data: { snapshotTimestamp: string; sourceHost?: string | null }) => cb(data);
       ipcRenderer.on('vault:autoSynced', handler);
       return () => ipcRenderer.off('vault:autoSynced', handler);
+    },
+    /** Push event: both PCs changed data; the user must choose which copy to keep. */
+    onSyncConflict: (cb: (conflict: any) => void): (() => void) => {
+      const handler = (_: Electron.IpcRendererEvent, data: any) => cb(data);
+      ipcRenderer.on('backup:syncConflict', handler);
+      return () => ipcRenderer.off('backup:syncConflict', handler);
+    },
+    /** Push event: sync pushed/pulled/failed — refresh the backup pill. */
+    onBackupStatusChanged: (cb: () => void): (() => void) => {
+      const handler = () => cb();
+      ipcRenderer.on('backup:statusChanged', handler);
+      return () => ipcRenderer.off('backup:statusChanged', handler);
     },
     /** Push event: fires when the user re-fetches a balance via the in-browser
      *  "↻ Balance" button. Returns a cleanup function — call it in useEffect. */
@@ -155,12 +181,18 @@ const api = {
     },
   },
   otp: {
-    /** Called by the renderer to register a handler for when main needs an OTP. */
-    onNeeded:  (cb: (data: { label: string }) => void) =>
-      ipcRenderer.on('otp:needed', (_, data) => cb(data)),
-    /** Called by the renderer to dismiss the dialog if main cancelled/timed out. */
-    onDismiss: (cb: () => void) =>
-      ipcRenderer.on('otp:dismiss', () => cb()),
+    /** Register a handler for when main needs an OTP. Returns a cleanup function. */
+    onNeeded: (cb: (data: { label: string }) => void): (() => void) => {
+      const handler = (_: Electron.IpcRendererEvent, data: { label: string }) => cb(data);
+      ipcRenderer.on('otp:needed', handler);
+      return () => ipcRenderer.off('otp:needed', handler);
+    },
+    /** Dismiss the dialog if main cancelled/timed out. Returns a cleanup function. */
+    onDismiss: (cb: () => void): (() => void) => {
+      const handler = () => cb();
+      ipcRenderer.on('otp:dismiss', handler);
+      return () => ipcRenderer.off('otp:dismiss', handler);
+    },
     /** Submit the typed OTP back to the main process. */
     provide: (otp: string) => ipcRenderer.invoke('otp:provide', otp),
     /** Cancel the OTP request. */

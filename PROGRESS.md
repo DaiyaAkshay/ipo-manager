@@ -263,6 +263,43 @@ Findings and fixes:
 
 ---
 
+## Phase 8 — Full audit (v0.3.7, 2026-09-26)
+
+### Cross-PC sync rewritten (fixes "data not syncing across devices")
+
+Root cause: sync only ran once at unlock, only pulled when the snapshot id differed, and pushes happened only on the old 4 h backup timer. Nothing tracked whether local data had changed, and nothing recorded which snapshot a PC started from. One PC could keep pushing over the other's changes, or neither PC would push at all.
+- **Dirty tracking:** the sha256 of the local DB is compared with `lastSyncedDbHash`.
+- **Lineage:** manifests carry `parentSnapshotId`, `ancestors` and `supersedes`. Snapshot ids only increase, even under clock skew. The pure decision logic is in `backup/syncPolicy.ts` (30 unit tests).
+- **Decisions:** fast-forward (pull), push, up-to-date, or **conflict**. A conflict shows a modal that asks the user to keep this PC's data or use the other PC's. Nothing is silently overwritten.
+- **Timing:** a 30 s sync loop runs while unlocked. Local edits push after 90 s of no further changes, and again on lock, quit and Windows logoff.
+- **Safety checks:** STILL_SYNCING checks (size and sha256) stop a PC from restoring a snapshot that Drive has only partly downloaded. Restores swap files atomically and roll back on failure. A password changed on another PC is detected at unlock and adopted.
+- The sidebar pill and backup modal now show sync state, the last pull and its source PC, and the last error.
+
+### Gmail re-authentication
+
+- The status check now calls Gmail with the stored token (cached for 30 s) instead of just checking that a token exists. An expired token shows **Reconnect**, with a note that Google expires tokens after 7 days while the OAuth app is in "Testing" mode.
+- The loopback flow uses PKCE (S256) and a state check, runs on a random port with a 5-minute timeout, and always shuts its server down. The old refresh token is only replaced after a new one arrives.
+- When Gmail auth fails during a login, the app now asks for the OTP manually instead of opening a Google sign-in tab over the bank page. A `gmail:statusChanged` event updates the pill.
+- OTP extraction moved to the pure `email/otpParse.ts`. It prefers the code nearest a keyword, handles `123-456` codes, and ignores PIN codes in addresses. It keeps a list of message ids already used and allows 30 s of clock skew.
+
+### Bank/broker logins (checked live)
+
+- RBI's `.bank.in` migration: HDFC, ICICI, Axis, BoB, YES, Kotak and SBI now try the new host first and fall back to the old one (`gotoFirstReachable`). The old YES and Axis hosts no longer resolve.
+- SBI handles both the classic and the YONO login pages. Fyers was rewritten for `login.fyers.in`. Shoonya gets a fixed viewport so its ratio-based clicks land correctly.
+- AU: fixed username selector, whole-rupee balances, and a crash when `className` is missing. Dhan balances are now sign-aware. Usernames are masked in warnings.
+- One balance regex is shared by all adapters (Indian digit grouping, optional paise).
+
+### Other fixes
+
+- CAPTCHA AI: the retired Claude 3.x models were replaced (Sonnet 5 → Sonnet 4.6 → Haiku 4.5). Requests time out after 20 s, and consent migration no longer re-prompts.
+- Logs: console lines are copied into `automation.log` with redaction (query strings, digit runs, email local parts).
+- Auto-lock is extended to 2 h while an automation browser is open, so an IPO flow isn't cut off halfway.
+- Excel import: unknown banks map to `UNKNOWN` instead of silently becoming AU.
+- Renderer: fixed the "stale" badge caused by reading UTC as local time. Added error handling to import/export/OTP/delete/recharge. Event listeners now unsubscribe. Added the "All Balances (table)" view.
+- Fixed all `tsc --noEmit` errors (the project type-checks cleanly for the first time). The main bundle is back to 537 kB after the google-auth-library import became type-only.
+
+---
+
 ## Status snapshot
 
 | Critical audit item                | Status |

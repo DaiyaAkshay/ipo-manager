@@ -1,7 +1,7 @@
 /**
  * Kotak Mahindra Bank NetBanking login adapter.
  *
- * Login URL  : https://netbanking.kotak.com/knb2/
+ * Login URL  : https://netbanking.kotak.bank.in/knb2/  (was netbanking.kotak.com)
  *
  * CONFIRMED FLOW (from DOM diagnostics):
  *   Step 1 — CRN page:
@@ -23,9 +23,12 @@
  */
 
 import { Page, Locator } from 'playwright';
-import { LoginAdapter, LoginCredentials } from './browser';
+import { gotoFirstReachable, LoginAdapter, LoginCredentials } from './browser';
 
-const LOGIN_URL = 'https://netbanking.kotak.com/knb2/';
+// kotak.com currently redirects to the RBI .bank.in domain (verified
+// 2026-09-26; #credentialInputField unchanged). Go there directly so the
+// login keeps working once the old hostname is retired.
+const LOGIN_URLS = ['https://netbanking.kotak.bank.in/knb2/', 'https://netbanking.kotak.com/knb2/'];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -141,7 +144,7 @@ export const kotakAdapter: LoginAdapter = {
   otpMode: 'email',
 
   async login(page: Page, creds: LoginCredentials, fetchOtp: () => Promise<string>): Promise<void> {
-    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await gotoFirstReachable(page, LOGIN_URLS, { label: 'Kotak' });
     await page.waitForTimeout(2500);
 
     const crn = creds.customerId || creds.username;
@@ -269,11 +272,14 @@ export const kotakAdapter: LoginAdapter = {
       await page.waitForTimeout(3000);
       const balance = await page.evaluate((): string | null => {
         const text = (document.body as HTMLElement).innerText || '';
+        // Paise optional, but then Indian comma grouping is required, so a
+        // whole-rupee balance ("₹2,00,000") is read while dates/account numbers aren't.
+        const AMT = '(\\d{1,3}(?:,\\d{2,3})+(?:\\.\\d{1,2})?|\\d+\\.\\d{1,2})';
         for (const re of [
-          /Available\s+Balance[\s\S]{0,40}?₹?\s*([\d,]+\.\d{2})/i,
-          /Avail(?:able)?\.?\s*Bal(?:ance)?\.?[\s\S]{0,40}?₹?\s*([\d,]+\.\d{2})/i,
-          /₹\s*([\d,]+\.\d{2})/,
-          /Rs\.?\s*([\d,]+\.\d{2})/i,
+          new RegExp(`Available\\s+Balance[\\s\\S]{0,40}?₹?\\s*${AMT}`, 'i'),
+          new RegExp(`Avail(?:able)?\\.?\\s*Bal(?:ance)?\\.?[\\s\\S]{0,40}?₹?\\s*${AMT}`, 'i'),
+          new RegExp(`₹\\s*${AMT}`),
+          new RegExp(`Rs\\.?\\s*${AMT}`, 'i'),
         ]) {
           const m = text.match(re);
           if (m?.[1]) return '₹' + m[1];

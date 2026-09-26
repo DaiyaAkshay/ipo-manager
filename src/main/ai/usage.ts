@@ -26,6 +26,8 @@ export interface CaptchaUsageState {
   cap: number;               // hard daily cap; calls past this are refused
   consented: boolean;        // user has acknowledged that images go to Anthropic
   consentedAt: string | null;
+  /** When the user last chose ON or OFF explicitly (null = never chose). */
+  consentDecidedAt: string | null;
   totalCalls: number;        // lifetime
   totalInputTokens: number;
   totalOutputTokens: number;
@@ -48,6 +50,7 @@ function blankState(): CaptchaUsageState {
     cap: DEFAULT_DAILY_CAP,
     consented: false,
     consentedAt: null,
+    consentDecidedAt: null,
     totalCalls: 0,
     totalInputTokens: 0,
     totalOutputTokens: 0,
@@ -71,6 +74,7 @@ function readRaw(): CaptchaUsageState {
       totalInputTokens: Number(parsed.totalInputTokens) || 0,
       totalOutputTokens: Number(parsed.totalOutputTokens) || 0,
       consented: !!parsed.consented,
+      consentDecidedAt: typeof parsed.consentDecidedAt === 'string' ? parsed.consentDecidedAt : null,
     };
   } catch {
     return blankState();
@@ -116,8 +120,18 @@ export function setCaptchaConsent(consented: boolean): CaptchaUsageState {
   const state = getCaptchaUsage();
   state.consented = !!consented;
   state.consentedAt = consented ? new Date().toISOString() : null;
+  state.consentDecidedAt = new Date().toISOString();
   writeRaw(state);
   return state;
+}
+
+/**
+ * True once the user has chosen ON or OFF. The one-time consent migration for
+ * keys saved before consent gating existed must never override an explicit
+ * OFF — "consented: false" alone can't tell "never asked" from "revoked".
+ */
+export function hasCaptchaConsentDecision(): boolean {
+  return !!getCaptchaUsage().consentDecidedAt;
 }
 
 /**

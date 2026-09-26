@@ -40,6 +40,48 @@ export function appendAutomationLog(scope: string, message: string): void {
   }
 }
 
+/**
+ * Mask things that shouldn't sit in a plaintext log: URL query strings (login
+ * redirects can carry request tokens), long digit runs (mobile / account /
+ * card numbers — last 4 kept) and the local part of email addresses.
+ */
+export function redactLogText(text: string): string {
+  return text
+    .replace(/(https?:\/\/[^\s?#"'<>]+)[?#][^\s"'<>]*/g, '$1?…')
+    .replace(/\b\d{8,}\b/g, digits => `••••${digits.slice(-4)}`)
+    .replace(/\b([A-Za-z0-9])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/g, '$1***@$2');
+}
+
+let consoleMirrorInstalled = false;
+
+/**
+ * Persist main-process diagnostics. Most bank/broker adapters only use
+ * console.*, which is lost in the installed app — so a failed SBI or Zerodha
+ * login left no trace to debug. Mirror tagged console lines ("[Zerodha] …",
+ * "[Sync] …", "[Gmail] …") into automation.log, redacted. Adapters never log
+ * passwords/OTPs (only lengths), and redactLogText masks the rest.
+ */
+export function installConsoleMirror(): void {
+  if (consoleMirrorInstalled) return;
+  consoleMirrorInstalled = true;
+  const TAGGED = /^\[[A-Za-z][\w .&/-]{0,40}\]/;
+  const render = (args: unknown[]) => args.map(a => {
+    if (typeof a === 'string') return a;
+    if (a instanceof Error) return a.message;
+    try { return JSON.stringify(a); } catch { return String(a); }
+  }).join(' ');
+  for (const level of ['log', 'warn', 'error'] as const) {
+    const original = console[level].bind(console);
+    console[level] = (...args: unknown[]) => {
+      original(...args);
+      try {
+        const text = render(args);
+        if (TAGGED.test(text)) appendAutomationLog(level.toUpperCase(), redactLogText(text).slice(0, 2000));
+      } catch { /* logging must never break the caller */ }
+    };
+  }
+}
+
 export function writeAutomationArtifact(fileName: string, bytes: Buffer): string | null {
   try {
     const path = join(ensureLogDir(), fileName);

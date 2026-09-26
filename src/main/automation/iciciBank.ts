@@ -3,10 +3,14 @@ import { createRetailBankAdapter } from './genericBank';
 export const iciciBankAdapter = createRetailBankAdapter({
   code: 'ICICI',
   displayName: 'ICICI Bank',
-  loginUrl: 'https://infinity.icicibank.com/corp/Login.jsp',
+  // Verified 2026-09-26: the old infinity.icicibank.com address redirects to the
+  // new retail login at retailnetbanking.icici.bank.in (#user-id / #password).
+  loginUrl: ['https://retailnetbanking.icici.bank.in/login-page', 'https://infinity.icicibank.com/corp/Login.jsp'],
   usernameLabel: 'User ID',
   otpMode: 'manual',
   usernameSelectors: [
+    'input#user-id',
+    'input[name="username-l"]',
     'input[name*="USER_PRINCIPAL" i]',
     'input[id*="USER_PRINCIPAL" i]',
     'input[name*="DUMMY" i]',
@@ -14,11 +18,14 @@ export const iciciBankAdapter = createRetailBankAdapter({
     'input[placeholder*="User ID" i]',
   ],
   passwordSelectors: [
+    'input#password',
+    'input[name="password-l"]',
     'input[name*="PASSWORD" i]',
     'input[id*="PASSWORD" i]',
     'input[type="password"]',
   ],
   loginSelectors: [
+    'button:has-text("Login")',
     'input[type="image"][alt*="Start" i]',
     'input[type="image"][alt*="Login" i]',
     'input[type="image"][title*="Start" i]',

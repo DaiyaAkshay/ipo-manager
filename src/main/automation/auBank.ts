@@ -654,7 +654,7 @@ async function findAuCaptchaInput(page: Page, username: string, passwordField?: 
     if (marker.includes('enter captcha code')) score += 700;
     if (marker.includes('security')) score += 100;
     if (marker.includes('verification') || marker.includes('verify')) score += 25;
-    if (className.toLowerCase().includes('mat-input')) score += 8;
+    if ((className || '').toLowerCase().includes('mat-input')) score += 8;
     if (type === 'text' || type === 'tel' || type === 'number' || !type) score += 6;
     if (box.width >= 180) score += 8;
     if (box.height >= 18) score += 4;
@@ -1541,7 +1541,7 @@ async function clickAuIssueApply(page: Page, issueName: string): Promise<boolean
       ];
       const isApplyLabel = (text: string) => {
         const t = normalize(text);
-        if (!t) return false;
+        if (!t) return 0;
         for (const lbl of APPLY_LABELS) {
           if (t === lbl) return 1.0;
           if (t.startsWith(lbl + ' ')) return 0.95;
@@ -2585,7 +2585,10 @@ export const auBankAdapter: LoginAdapter = {
 
     try {
       await page.waitForSelector('input[type="text"]', { timeout: 15_000 });
-      await page.fill('input[type="text"]', creds.username);
+      // .first(): page.fill() is strict and throws if a second text input (e.g.
+      // the CAPTCHA box) has rendered too — which left the username blank while
+      // being logged as "field not found". The username is the first one.
+      await page.locator('input[type="text"]').first().fill(creds.username);
       console.log('[AU Bank] Filled username');
     } catch {
       console.error('[AU Bank] Could not find username field.');
@@ -2849,7 +2852,10 @@ export const auBankAdapter: LoginAdapter = {
           })
           .map(n => {
             const raw = (n.innerText || '').replace(/\s+/g, ' ').trim();
-            const amtMatch = raw.match(/([\d,]+\.\d{2})/);
+            // Paise are optional (a tile can show "₹2,00,000"), but then Indian
+            // comma grouping is required so an account number or date on the
+            // tile is never mistaken for the balance.
+            const amtMatch = raw.match(/(\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?|\d+\.\d{1,2})/);
             if (!amtMatch) return { label: '', amount: null, raw };
             const amount = amtMatch[1];
 

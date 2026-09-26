@@ -3,8 +3,13 @@ import { join } from 'node:path';
 import { markActivity, shouldAutolock } from './activity';
 import { closeDb } from './db/connection';
 import { clearVaultSessionSecrets, flushBackupOnExit, registerIpcHandlers } from './ipc';
-import { purgeBrowserProfiles } from './automation/browser';
+import { hasOpenBrowserWindows, purgeBrowserProfiles } from './automation/browser';
 import { initAutoUpdater } from './updater';
+import { installConsoleMirror } from './logging';
+
+// Keep a (redacted) record of adapter / sync / Gmail diagnostics on disk —
+// in the installed app console output goes nowhere.
+installConsoleMirror();
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -48,10 +53,16 @@ function createWindow(): void {
     mainWindow.loadFile(join(__dirname, '../renderer/index.html'));
   }
 
+  // Windows shutdown / restart / sign-out: before-quit is NOT emitted in that
+  // case, so push unsynced changes here (best effort — Windows gives the app a
+  // few seconds). Without this, edits made since the last push stayed on this
+  // PC only and the other PC never saw them.
+  mainWindow.on('session-end', () => { void flushBackupOnExit(); });
+
   // Auto-lock on inactivity
   mainWindow.webContents.on('before-input-event', () => { markActivity(); });
   setInterval(async () => {
-    if (shouldAutolock()) {
+    if (shouldAutolock(Date.now(), hasOpenBrowserWindows())) {
       // Flush any pending changes to the backup folder before locking — so
       // even a short session ending in auto-lock leaves a snapshot for the
       // other PC to pick up.
