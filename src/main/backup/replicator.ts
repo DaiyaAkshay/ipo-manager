@@ -284,9 +284,13 @@ export async function replicate(
       remote.blobs.set(uuid, { key: blobKey(uuid), size, lastModified: nowMs });
       report.uploadedBlobs += 1;
     }
-    const files = new Map<string, StoredObject>();
+    // Resume an interrupted upload: an object already there with the same size
+    // was written by this snapshot (PUTs are all-or-nothing). Skipping it also
+    // matters under a bucket lock, which refuses overwrites.
+    const files = new Map<string, StoredObject>(remote.snapshots.get(snap.id) || []);
     for (const file of snap.files.filter(f => f !== MANIFEST)) {
       const body = readFileSync(join(root, 'snapshots', snap.id, file));
+      if (files.get(file)?.size === body.length) continue;
       await store.put(snapKey(snap.id, file), body);
       files.set(file, { key: snapKey(snap.id, file), size: body.length, lastModified: nowMs });
     }

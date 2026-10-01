@@ -16,6 +16,8 @@ class MemoryStore implements ObjectStore {
   objects = new Map<string, { body: Buffer; lastModified: number }>();
   log: string[] = [];
   refuseDeletes = false;
+  /** Bucket lock: refuse overwrites and deletes. */
+  locked = false;
   now = Date.now();
   async list(prefix: string): Promise<StoredObject[]> {
     return [...this.objects].filter(([k]) => k.startsWith(prefix))
@@ -27,11 +29,12 @@ class MemoryStore implements ObjectStore {
     return Buffer.from(o.body);
   }
   async put(key: string, body: Buffer): Promise<void> {
+    if (this.locked && this.objects.has(key)) throw new Error('403 ObjectLockedByBucketPolicy');
     this.log.push(`put ${key}`);
     this.objects.set(key, { body: Buffer.from(body), lastModified: this.now });
   }
   async delete(key: string): Promise<void> {
-    if (this.refuseDeletes) throw new Error('403 ObjectLocked');
+    if (this.refuseDeletes || this.locked) throw new Error('403 ObjectLocked');
     this.log.push(`delete ${key}`);
     this.objects.delete(key);
   }
@@ -166,6 +169,25 @@ describe('backup/replicator', () => {
     const later = await passA(store.now + 7 * 3_600_000);
     expect(later.deletedRemote).toEqual([S1]);
     expect(stA.tombstones).toEqual({});
+  });
+
+  it('resumes an interrupted upload under a bucket lock without overwriting', async () => {
+    writeSnapshot(pcA, S1, ['doc-1']);
+    store.locked = true;
+    // A crashed earlier pass got vault.db and the blob up, but not the rest.
+    await store.put(`${P}/blobs/doc-1.enc`, Buffer.from('blob-doc-1'));
+    await store.put(`${P}/snapshots/${S1}/vault.db`, Buffer.from(`db-${S1}`));
+    const r = await passA();
+    expect(r.uploadedSnapshots).toEqual([S1]);
+    expect(store.objects.has(`${P}/snapshots/${S1}/manifest.json`)).toBe(true);
+    expect(stA.synced).toEqual([S1]);
+  });
+
+  it('connection test passes repeatedly under a bucket lock', async () => {
+    store.locked = true;
+    expect((await testObjectStore(store, P)).ok).toBe(true);
+    await new Promise(res => setTimeout(res, 2));
+    expect((await testObjectStore(store, P)).ok).toBe(true);
   });
 
   it('does not delete local snapshots when the bucket looks empty', async () => {

@@ -166,7 +166,8 @@ export class R2Store implements ObjectStore {
  * (recommended — it stops anyone wiping recent backups) refuses deletes.
  */
 export async function testObjectStore(store: ObjectStore, prefix: string): Promise<{ ok: true; note?: string } | { ok: false; error: string }> {
-  const key = `${prefix}/.connection-test`;
+  // A fresh key each time: a bucket lock also refuses overwrites.
+  const key = `${prefix}/.connection-test-${Date.now()}`;
   const body = Buffer.from(`ipo-manager connection test ${new Date().toISOString()}`);
   try {
     await store.list(`${prefix}/`);
