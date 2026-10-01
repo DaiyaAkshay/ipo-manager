@@ -53,6 +53,8 @@ import {
   decideSync, isDirty, monotonicSnapshotTime, nextAncestors, pickHead, selectSnapshotsToKeep,
   MAX_LINEAGE, type ConflictReason, type Head, type HeadCandidate, type SyncDecision,
 } from './syncPolicy';
+import { copyBackupTree, emptyReplicationState, replicate, type ReplicationState } from './replicator';
+import { R2Store, normalizePrefix, testObjectStore } from './objectStore';
 import keytar from 'keytar';
 
 const FIELD_KEYTAR_SERVICE = 'ipo-manager';
@@ -62,9 +64,25 @@ const BACKUP_STATE_FILENAME = 'backup.state.json';
 const META_FILENAME = 'meta.json';
 const FORMAT_VERSION = 1;
 
+export type BackupTarget = 'folder' | 'r2';
+
+/** Non-secret R2 settings. The secret access key lives in the OS keychain. */
+export interface R2Config {
+  accountId: string;
+  bucket: string;
+  accessKeyId: string;
+  /** Folder inside the bucket, e.g. "ipo-manager". */
+  prefix: string;
+}
+
 export interface BackupConfig {
   enabled: boolean;
-  folder: string | null;          // user-chosen backup root
+  /** Where snapshots go: a synced folder (Google Drive etc.) or Cloudflare R2. */
+  target: BackupTarget;
+  folder: string | null;          // user-chosen backup root (target 'folder')
+  r2: R2Config | null;            // target 'r2'
+  /** Optional extra copy (USB disk, NAS, cloud folder), refreshed after each upload. */
+  mirrorFolder: string | null;
   vaultId: string;                // random id, lets restore validate it's the right vault
 }
 
@@ -92,6 +110,8 @@ export interface BackupState {
   lastSyncError: string | null;
   /** Set when both sides changed; nothing is pushed or pulled until the user chooses. */
   conflict: SyncConflict | null;
+  /** Last problem refreshing the extra-copy folder (null when fine or not set). */
+  lastMirrorError: string | null;
 }
 
 export interface SnapshotInfo {
@@ -138,9 +158,17 @@ export function getBackupConfig(): BackupConfig {
   try {
     if (existsSync(getConfigPath())) {
       const parsed = JSON.parse(readFileSync(getConfigPath(), 'utf8'));
+      const r2 = parsed.r2 && typeof parsed.r2 === 'object'
+        && typeof parsed.r2.accountId === 'string' && typeof parsed.r2.bucket === 'string'
+        && typeof parsed.r2.accessKeyId === 'string'
+        ? { accountId: parsed.r2.accountId, bucket: parsed.r2.bucket, accessKeyId: parsed.r2.accessKeyId, prefix: safePrefix(parsed.r2.prefix) }
+        : null;
       return {
         enabled: !!parsed.enabled,
+        target: parsed.target === 'r2' && r2 ? 'r2' : 'folder',
         folder: typeof parsed.folder === 'string' ? parsed.folder : null,
+        r2,
+        mirrorFolder: typeof parsed.mirrorFolder === 'string' && parsed.mirrorFolder ? parsed.mirrorFolder : null,
         vaultId: typeof parsed.vaultId === 'string' && parsed.vaultId.length > 0
           ? parsed.vaultId
           : randomUUID(),
@@ -149,7 +177,7 @@ export function getBackupConfig(): BackupConfig {
   } catch {
     // fallthrough — write a fresh config
   }
-  const fresh: BackupConfig = { enabled: false, folder: null, vaultId: randomUUID() };
+  const fresh: BackupConfig = { enabled: false, target: 'folder', folder: null, r2: null, mirrorFolder: null, vaultId: randomUUID() };
   writeFileSync(getConfigPath(), JSON.stringify(fresh, null, 2), 'utf8');
   return fresh;
 }
@@ -161,15 +189,168 @@ export function setBackupConfig(patch: Partial<BackupConfig>): BackupConfig {
     ...patch,
     vaultId: current.vaultId, // never change vault id once minted
   };
+  if (next.target === 'r2' && !next.r2) next.target = 'folder';
   writeFileSync(getConfigPath(), JSON.stringify(next, null, 2), 'utf8');
   return next;
+}
+
+function safePrefix(prefix: unknown): string {
+  try { return normalizePrefix(typeof prefix === 'string' ? prefix : null); } catch { return 'ipo-manager'; }
+}
+
+/** Has the user chosen where backups go? */
+export function isBackupConfigured(config: BackupConfig = getBackupConfig()): boolean {
+  return config.target === 'r2' ? !!config.r2 : !!config.folder;
+}
+
+/**
+ * The folder the engine reads and writes snapshots in. For R2 that is a local
+ * cache the replicator keeps in step with the bucket — which also leaves a
+ * full local backup history on this PC.
+ */
+export function getActiveRoot(config: BackupConfig = getBackupConfig()): string | null {
+  if (config.target === 'r2') return config.r2 ? join(getDataDir(), R2_CACHE_DIRNAME) : null;
+  return config.folder;
+}
+
+// ── Cloudflare R2 ───────────────────────────────────────────────────────────
+
+const R2_SECRET_KEYTAR_ACCOUNT = 'r2-secret-access-key-v1';
+const R2_CACHE_DIRNAME = 'r2-cache';
+const R2_STATE_FILENAME = 'r2.state.json';
+/** The extra copy goes in its own subfolder so it can never mix with a folder another PC syncs from. */
+export const MIRROR_SUBFOLDER = 'IPO Manager backup copy';
+
+export async function setR2Secret(secret: string): Promise<void> {
+  await keytar.setPassword(FIELD_KEYTAR_SERVICE, R2_SECRET_KEYTAR_ACCOUNT, secret.trim());
+}
+
+export async function hasR2Secret(): Promise<boolean> {
+  return !!(await keytar.getPassword(FIELD_KEYTAR_SERVICE, R2_SECRET_KEYTAR_ACCOUNT).catch(() => null));
+}
+
+async function openR2Store(r2: R2Config, secretOverride?: string): Promise<R2Store> {
+  const secretAccessKey = secretOverride || await keytar.getPassword(FIELD_KEYTAR_SERVICE, R2_SECRET_KEYTAR_ACCOUNT);
+  if (!secretAccessKey) throw new Error('The R2 secret key is missing from this PC\'s keychain — enter it again in Backup & Sync.');
+  return new R2Store({ ...r2, secretAccessKey });
+}
+
+/** Check credentials before saving them (list, write, read back, delete). */
+export async function testR2(r2: R2Config, secret: string | undefined) {
+  try {
+    return await testObjectStore(await openR2Store(r2, secret), r2.prefix);
+  } catch (e: any) {
+    return { ok: false as const, error: e?.message || String(e) };
+  }
+}
+
+interface R2Status extends ReplicationState {
+  lastOkAt: string | null;
+  lastError: string | null;
+  lastWarning: string | null;
+  /** Bucket + prefix the state belongs to — a different bucket starts fresh. */
+  target: string | null;
+}
+
+function r2TargetId(r2: R2Config): string {
+  return `${r2.accountId}/${r2.bucket}/${r2.prefix}`;
+}
+
+function getR2Status(): R2Status {
+  const blank: R2Status = { ...emptyReplicationState(), lastOkAt: null, lastError: null, lastWarning: null, target: null };
+  try {
+    const p = join(getDataDir(), R2_STATE_FILENAME);
+    if (!existsSync(p)) return blank;
+    const s = JSON.parse(readFileSync(p, 'utf8'));
+    return {
+      synced: Array.isArray(s.synced) ? s.synced.filter((x: unknown) => typeof x === 'string') : [],
+      tombstones: s.tombstones && typeof s.tombstones === 'object' ? s.tombstones : {},
+      orphanBlobsSince: s.orphanBlobsSince && typeof s.orphanBlobsSince === 'object' ? s.orphanBlobsSince : {},
+      lastOkAt: s.lastOkAt ?? null,
+      lastError: s.lastError ?? null,
+      lastWarning: s.lastWarning ?? null,
+      target: s.target ?? null,
+    };
+  } catch {
+    return blank;
+  }
+}
+
+function saveR2Status(next: R2Status): void {
+  writeFileSync(join(getDataDir(), R2_STATE_FILENAME), JSON.stringify(next, null, 2), 'utf8');
+}
+
+/**
+ * Bring the R2 cache and the bucket in step. Callers hold _inProgress (or
+ * are about to check it), so this never runs alongside a snapshot or restore.
+ */
+async function replicateR2(config: BackupConfig): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!config.r2) return { ok: false, error: 'Cloudflare R2 is not configured.' };
+  const root = getActiveRoot(config)!;
+  const prev = getR2Status();
+  const target = r2TargetId(config.r2);
+  const base: ReplicationState = prev.target === target ? prev : emptyReplicationState();
+  try {
+    const store = await openR2Store(config.r2);
+    const report = await replicate(root, store, config.r2.prefix, base);
+    saveR2Status({
+      ...report.state,
+      lastOkAt: new Date().toISOString(),
+      lastError: null,
+      lastWarning: report.warnings[0] ?? null,
+      target,
+    });
+    if (report.uploadedSnapshots.length || report.downloadedSnapshots.length) {
+      console.log(`[Sync] R2: uploaded ${report.uploadedSnapshots.length}, downloaded ${report.downloadedSnapshots.length} snapshot(s)`);
+    }
+    return { ok: true };
+  } catch (e: any) {
+    const error = e?.name === 'TimeoutError' ? 'the connection timed out' : (e?.message || String(e));
+    saveR2Status({ ...prev, lastError: error });
+    return { ok: false, error };
+  }
+}
+
+/** Refresh the optional extra-copy folder. Never fails the backup. */
+function refreshMirror(config: BackupConfig): void {
+  const root = getActiveRoot(config);
+  if (!config.mirrorFolder || !root) return;
+  const state = getBackupState();
+  try {
+    if (!existsSync(config.mirrorFolder)) throw new Error(`folder not found: ${config.mirrorFolder} (drive unplugged?)`);
+    copyBackupTree(root, join(config.mirrorFolder, MIRROR_SUBFOLDER), { prune: true });
+    if (state.lastMirrorError) updateState({ lastMirrorError: null });
+  } catch (e: any) {
+    updateState({ lastMirrorError: `Extra copy not updated: ${e?.message || e}` });
+  }
+}
+
+/**
+ * Switch this PC to R2. With `seedFrom`, copy an existing backup folder's
+ * history (e.g. the Google Drive folder) into the R2 cache first, so the
+ * bucket starts with it and the sync lineage carries on unbroken.
+ */
+export async function enableR2(r2: R2Config, opts: { seedFrom?: string | null }): Promise<{ ok: true; seeded: number } | { ok: false; error: string }> {
+  if (_inProgress) return { ok: false, error: 'A backup is running — try again in a moment.' };
+  _inProgress = true;
+  try {
+    const config = setBackupConfig({ target: 'r2', r2, enabled: true });
+    let seeded = 0;
+    if (opts.seedFrom && existsSync(join(opts.seedFrom, 'snapshots'))) {
+      seeded = copyBackupTree(opts.seedFrom, getActiveRoot(config)!, { prune: false }).copiedSnapshots;
+    }
+    const rep = await replicateR2(config);
+    return rep.ok ? { ok: true, seeded } : { ok: false, error: `Saved, but the first upload failed: ${rep.error}` };
+  } finally {
+    _inProgress = false;
+  }
 }
 
 function emptyState(): BackupState {
   return {
     lastBackupAt: null, lastBackupError: null, lastSnapshotId: null, inProgress: false,
     lastSyncedDbHash: null, lineage: [], lastPullAt: null, lastPullSourceHost: null,
-    lastSyncError: null, conflict: null,
+    lastSyncError: null, conflict: null, lastMirrorError: null,
   };
 }
 
@@ -189,6 +370,7 @@ export function getBackupState(): BackupState {
         lastPullSourceHost: parsed.lastPullSourceHost ?? null,
         lastSyncError: parsed.lastSyncError ?? null,
         conflict: parsed.conflict && typeof parsed.conflict.remoteSnapshotId === 'string' ? parsed.conflict : null,
+        lastMirrorError: parsed.lastMirrorError ?? null,
       };
     }
   } catch { /* */ }
@@ -350,7 +532,8 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
   }
 
   const config = getBackupConfig();
-  if (!config.enabled || !config.folder) {
+  const root = getActiveRoot(config);
+  if (!config.enabled || !root) {
     return { ok: false, error: 'Backup is not configured (folder not chosen).' };
   }
 
@@ -361,13 +544,13 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
   let snapshotDir = '';
 
   try {
-    ensureBackupRoot(config.folder, config.vaultId);
+    ensureBackupRoot(root, config.vaultId);
     // Never sort before the head we're building on, even if this PC's clock
     // runs behind the PC that wrote it.
-    const headId = latestSnapshotId(config.folder);
+    const headId = latestSnapshotId(root);
     const headTime = headId ? (parseSnapshotIdTimestamp(headId)?.getTime() ?? null) : null;
     snapshotId = newSnapshotId(monotonicSnapshotTime(startTs, headTime));
-    snapshotDir = join(getSnapshotsDir(config.folder), snapshotId);
+    snapshotDir = join(getSnapshotsDir(root), snapshotId);
     ensureDir(snapshotDir);
 
     // 1) DB snapshot via VACUUM INTO — consistent without closing.
@@ -401,7 +584,7 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
     const docs = db.prepare(`
       SELECT file_uuid, original_name, sha256, file_size FROM documents
     `).all() as Array<{ file_uuid: string; original_name: string; sha256: string; file_size: number }>;
-    const blobsDir = getBlobsDir(config.folder);
+    const blobsDir = getBlobsDir(root);
     let copied = 0;
     let reused = 0;
     for (const doc of docs) {
@@ -424,7 +607,7 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
     //    this to tell "built on my data" (safe to take) from "diverged" (ask).
     const supersedes = (opts.supersedes || []).filter(Boolean);
     const supersededLineage: string[] = [];
-    for (const id of supersedes) supersededLineage.push(id, ...readManifestAncestors(config.folder, id));
+    for (const id of supersedes) supersededLineage.push(id, ...readManifestAncestors(root, id));
     const baseLineage = state.lineage.length
       ? state.lineage
       : (state.lastSnapshotId ? [state.lastSnapshotId] : []);
@@ -453,8 +636,17 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
     writeFileSync(join(snapshotDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
 
     // 6) Retention sweep.
-    try { pruneOldSnapshots(config.folder); } catch (e) { /* non-fatal */ }
-    try { garbageCollectBlobs(config.folder); } catch (e) { /* non-fatal */ }
+    try { pruneOldSnapshots(root); } catch (e) { /* non-fatal */ }
+    try { garbageCollectBlobs(root); } catch (e) { /* non-fatal */ }
+
+    // 7) Off-PC copies. The snapshot is already safe in the local root; if
+    //    the upload fails it is retried on the next sync pass.
+    let uploadError: string | null = null;
+    if (config.target === 'r2') {
+      const rep = await replicateR2(config);
+      if (!rep.ok) uploadError = `Saved on this PC; upload to Cloudflare R2 will retry (${rep.error}).`;
+    }
+    refreshMirror(config);
 
     const durationMs = Date.now() - startTs;
     updateState({
@@ -463,7 +655,7 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
       lastSnapshotId: snapshotId,
       lastSyncedDbHash: getLocalDbHash(),
       lineage: [snapshotId, ...ancestors].slice(0, MAX_LINEAGE),
-      lastSyncError: null,
+      lastSyncError: uploadError,
       conflict: null,
     });
     return { ok: true, snapshotId, durationMs, documentsCopied: copied, documentsReused: reused, dbBytes };
@@ -485,7 +677,7 @@ export function listSnapshots(sourceFolder?: string): SnapshotInfo[] {
   // backup before adopting it), else the configured local folder. Taking the
   // folder as an argument avoids mutating the persistent backup config just to
   // peek at a foreign folder — a swap that could race with an auto-backup.
-  const folder = sourceFolder || getBackupConfig().folder;
+  const folder = sourceFolder || getActiveRoot();
   if (!folder || !existsSync(getSnapshotsDir(folder))) return [];
 
   const dirs = readdirSync(getSnapshotsDir(folder), { withFileTypes: true })
@@ -708,7 +900,7 @@ async function restoreSnapshotInner(
   options: RestoreOptions
 ): Promise<RestoreResult> {
   const config = getBackupConfig();
-  const root = options.sourceFolder || config.folder;
+  const root = options.sourceFolder || getActiveRoot(config);
   if (!root) return { ok: false, error: 'No backup folder configured.' };
   if (!masterPassword) return { ok: false, error: 'Master password is required to restore.' };
 
@@ -887,7 +1079,7 @@ async function restoreSnapshotInner(
 
 /** Convenience: pick the latest snapshot id from a folder (own folder by default). */
 export function latestSnapshotId(sourceFolder?: string): string | null {
-  const root = sourceFolder || getBackupConfig().folder;
+  const root = sourceFolder || getActiveRoot();
   if (!root) return null;
   const snapsDir = getSnapshotsDir(root);
   if (!existsSync(snapsDir)) return null;
@@ -985,17 +1177,48 @@ const PASSWORD_CHANGED_MESSAGE =
   'The master password was changed on another PC, so its newer backup can\'t be opened with this ' +
   'session\'s password. Lock (Ctrl+L) and unlock with the NEW password to continue syncing.';
 
-/** The configured backup root if sync can run now, else why not. */
-function syncRoot(): { root: string } | { skip: 'disabled' } | { skip: 'missing'; message: string } {
+type RootCheck = { root: string } | { skip: 'disabled' } | { skip: 'missing'; message: string };
+
+const r2UnreachableMessage = (error: string) =>
+  `Cloudflare R2 could not be reached (${error}). Your data is safe on this PC; sync resumes automatically.`;
+
+/** Root check without network access (for status display). */
+function localSyncRoot(): RootCheck {
   const config = getBackupConfig();
-  if (!config.enabled || !config.folder) return { skip: 'disabled' };
-  if (!existsSync(config.folder)) {
+  const root = getActiveRoot(config);
+  if (!config.enabled || !root) return { skip: 'disabled' };
+  if (config.target === 'r2') {
+    const err = getR2Status().lastError;
+    return err ? { skip: 'missing', message: r2UnreachableMessage(err) } : { root };
+  }
+  if (!existsSync(root)) {
     return {
       skip: 'missing',
-      message: `Backup folder not found: ${config.folder}. Is Google Drive (or your cloud drive) running and signed in?`,
+      message: `Backup folder not found: ${root}. Is Google Drive (or your cloud drive) running and signed in?`,
     };
   }
-  return { root: config.folder };
+  return { root };
+}
+
+/**
+ * The configured backup root if sync can run now, else why not. For R2 this
+ * first brings the local cache up to date with the bucket — unless a
+ * snapshot/restore is running, in which case the caller backs off anyway.
+ */
+async function syncRoot(): Promise<RootCheck> {
+  const config = getBackupConfig();
+  const root = getActiveRoot(config);
+  if (!config.enabled || !root) return { skip: 'disabled' };
+  if (config.target !== 'r2') return localSyncRoot();
+  if (_inProgress) return { root };
+  _inProgress = true;
+  try {
+    const rep = await replicateR2(config);
+    if (!rep.ok) return { skip: 'missing', message: r2UnreachableMessage(rep.error) };
+  } finally {
+    _inProgress = false;
+  }
+  return { root };
 }
 
 export interface SyncOutcome {
@@ -1073,7 +1296,7 @@ export async function syncOnUnlock(opts: {
   liveKey: Buffer;
   preOpenLocalHash: string | null;
 }): Promise<SyncOutcome> {
-  const ready = syncRoot();
+  const ready = await syncRoot();
   if ('skip' in ready) {
     if (ready.skip === 'missing') updateState({ lastSyncError: ready.message });
     return { action: ready.skip === 'missing' ? 'error' : 'disabled', error: 'message' in ready ? ready.message : undefined };
@@ -1112,7 +1335,7 @@ export async function syncOnUnlock(opts: {
  * field key before touching anything, so a mistyped password changes nothing.
  */
 export async function tryUnlockFromNewerBackup(masterPassword: string): Promise<SyncOutcome | null> {
-  const ready = syncRoot();
+  const ready = await syncRoot();
   if ('skip' in ready) return null;
   const state = getBackupState();
   const head = findHead(ready.root);
@@ -1148,7 +1371,7 @@ export async function syncTick(opts: {
   canPull: boolean;
   canPush: boolean;
 }): Promise<SyncOutcome> {
-  const ready = syncRoot();
+  const ready = await syncRoot();
   if ('skip' in ready) {
     if (ready.skip === 'missing' && getBackupState().lastSyncError !== ready.message) {
       updateState({ lastSyncError: ready.message });
@@ -1196,7 +1419,7 @@ export async function syncTick(opts: {
  * and record a conflict for the user to resolve at the next unlock.
  */
 export async function pushBeforeClose(masterKey: Buffer): Promise<SyncOutcome> {
-  const ready = syncRoot();
+  const ready = await syncRoot();
   if ('skip' in ready) return { action: ready.skip === 'missing' ? 'error' : 'disabled' };
   if (_inProgress) return { action: 'none' };
 
@@ -1232,7 +1455,7 @@ export async function resolveSyncConflict(
   choice: 'keep-local' | 'use-remote',
   opts: { masterPassword: string; liveKey: Buffer }
 ): Promise<SyncOutcome> {
-  const ready = syncRoot();
+  const ready = await syncRoot();
   if ('skip' in ready) {
     return { action: 'error', error: 'message' in ready ? ready.message : 'Backup is not configured.' };
   }
@@ -1257,7 +1480,7 @@ export async function resolveSyncConflict(
 export async function backupNow(opts: { masterPassword: string; liveKey: Buffer }): Promise<
   CreateSnapshotResult & { pulledFrom?: string | null; newMasterKey?: Buffer }
 > {
-  const ready = syncRoot();
+  const ready = await syncRoot();
   if ('skip' in ready) {
     return { ok: false, error: 'message' in ready ? ready.message : 'Backup is not configured (folder not chosen).' };
   }
@@ -1287,7 +1510,7 @@ export async function backupNow(opts: { masterPassword: string; liveKey: Buffer 
  * back to the folder's newest snapshot and silently undo the restore.
  */
 export async function publishRestoredVault(masterKey: Buffer, restoredSnapshotId: string, ancestors: string[]): Promise<CreateSnapshotResult> {
-  const ready = syncRoot();
+  const ready = await syncRoot();
   if ('skip' in ready) return { ok: false, error: 'Backup is not configured.' };
   const head = findHead(ready.root);
   updateState({
@@ -1307,14 +1530,30 @@ export interface SyncStatus {
   head: { id: string; sourceHost: string | null; timestamp: string | null } | null;
   /** Newest remote snapshot that is still arriving through the cloud client. */
   pendingRemoteId: string | null;
+  target: BackupTarget;
+  /** R2 only: last failed bucket round-trip, and the last good one. */
+  remoteError: string | null;
+  remoteOkAt: string | null;
+  /** R2 only: non-fatal note, e.g. a delete refused by a bucket lock. */
+  remoteWarning: string | null;
 }
 
 export function getSyncStatus(): SyncStatus {
   const state = getBackupState();
-  const status: SyncStatus = { thisHost: hostname(), dirty: false, folderMissing: false, head: null, pendingRemoteId: null };
-  const ready = syncRoot();
-  if ('skip' in ready) return { ...status, folderMissing: ready.skip === 'missing' };
-  const head = findHead(ready.root);
+  const config = getBackupConfig();
+  const r2 = config.target === 'r2' ? getR2Status() : null;
+  const status: SyncStatus = {
+    thisHost: hostname(), dirty: false, folderMissing: false, head: null, pendingRemoteId: null,
+    target: config.target,
+    remoteError: r2?.lastError ?? null,
+    remoteOkAt: r2?.lastOkAt ?? null,
+    remoteWarning: r2?.lastWarning ?? null,
+  };
+  const ready = localSyncRoot();
+  if ('skip' in ready && config.target !== 'r2') return { ...status, folderMissing: ready.skip === 'missing' };
+  const root = 'root' in ready ? ready.root : getActiveRoot(config);
+  if (!root) return status;
+  const head = findHead(root);
   return {
     ...status,
     dirty: !!state.lastSyncedDbHash && isDirty(getLocalDbHash(), state.lastSyncedDbHash, false),

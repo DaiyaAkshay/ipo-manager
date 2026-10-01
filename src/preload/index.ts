@@ -125,8 +125,14 @@ const api = {
   backup: {
     status: () => ipcRenderer.invoke('backup:status'),
     getConfig: () => ipcRenderer.invoke('backup:getConfig'),
-    setConfig: (patch: { enabled?: boolean; folder?: string | null }) =>
+    setConfig: (patch: { enabled?: boolean; folder?: string | null; mirrorFolder?: string | null; target?: 'folder' }) =>
       ipcRenderer.invoke('backup:setConfig', patch),
+    /** Check Cloudflare R2 credentials (list, write, read back, delete). Omit `secret` to use the saved one. */
+    testR2: (r2: { accountId: string; bucket: string; accessKeyId: string; secret?: string; prefix?: string }) =>
+      ipcRenderer.invoke('backup:testR2', r2),
+    /** Switch backups to Cloudflare R2; `seedFromFolder` uploads the current folder's history first. */
+    enableR2: (r2: { accountId: string; bucket: string; accessKeyId: string; secret?: string; prefix?: string; seedFromFolder?: boolean }) =>
+      ipcRenderer.invoke('backup:enableR2', r2),
     pickFolder: () => ipcRenderer.invoke('backup:pickFolder'),
     runNow: () => ipcRenderer.invoke('backup:runNow'),
     listSnapshots: () => ipcRenderer.invoke('backup:listSnapshots'),
