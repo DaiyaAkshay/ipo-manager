@@ -13,7 +13,7 @@ npm install          # also downloads Playwright Chromium (~150 MB)
 npm run dev          # dev mode (hot reload)
 npm run build        # compile to out/
 npm run build:win    # Windows NSIS installer → dist/
-npm test             # vitest (pure modules: backup/syncPolicy, email/otpParse, logging redaction)
+npm test             # vitest (pure modules: backup/syncPolicy, backup/replicator, email/otpParse, logging redaction)
 npx tsc --noEmit     # type-check — keep at 0 errors
 ```
 
@@ -45,6 +45,7 @@ src/renderer/    — React UI, no Node access
 | `automation/stubs.ts` | All other banks/brokers — just open the login URL, user fills in manually |
 | `email/gmail.ts` | Gmail API OAuth (loopback + PKCE) OTP fetcher; throws `GmailAuthError` → callers fall back to manual OTP |
 | `backup/engine.ts` | Drive-folder snapshot sync: 30 s loop, dirty-hash + lineage, conflict → user choice (policy in `backup/syncPolicy.ts`) |
+| `backup/replicator.ts` + `objectStore.ts` | Cloudflare R2 target: keeps `data/r2-cache` (the engine's root in R2 mode) in step with the bucket; optional extra-copy folder. See `docs/R2_BACKUP.md` |
 | `importer/excel.ts` | SheetJS importer for `Demat_Sheet.xlsx` |
 
 ### Preload (`src/preload/index.ts`)

@@ -49,6 +49,12 @@ import {
   restoreSnapshot as backupRestoreSnapshot,
   latestSnapshotId as backupLatestSnapshotId,
   backupNow,
+  enableR2,
+  getActiveRoot as backupActiveRoot,
+  hasR2Secret,
+  setR2Secret,
+  testR2,
+  type R2Config,
   getLocalDbHash,
   getSyncStatus,
   publishRestoredVault,
@@ -59,6 +65,7 @@ import {
   tryUnlockFromNewerBackup,
   type SyncOutcome,
 } from './backup/engine';
+import { normalizePrefix, validateR2Settings } from './backup/objectStore';
 
 // Store the master password as a Buffer so we can zero the bytes on lock,
 // preventing the string from lingering in V8's heap (JS strings are immutable
@@ -1053,9 +1060,18 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   // ── Backup IPC ──────────────────────────────────────────────────────────────
   ipc.handle('backup:getConfig', async () => backupGetConfig());
 
-  ipc.handle('backup:setConfig', async (_, patch: { enabled?: boolean; folder?: string | null }) => {
+  ipc.handle('backup:setConfig', async (_, patch: {
+    enabled?: boolean; folder?: string | null; mirrorFolder?: string | null; target?: 'folder';
+  }) => {
     try {
-      const next = backupSetConfig(patch);
+      // Only whitelisted fields; switching TO R2 goes through backup:enableR2,
+      // which tests the credentials first.
+      const clean: Parameters<typeof backupSetConfig>[0] = {};
+      if (typeof patch?.enabled === 'boolean') clean.enabled = patch.enabled;
+      if (patch?.folder === null || typeof patch?.folder === 'string') clean.folder = patch.folder;
+      if (patch?.mirrorFolder === null || typeof patch?.mirrorFolder === 'string') clean.mirrorFolder = patch.mirrorFolder || null;
+      if (patch?.target === 'folder') clean.target = 'folder';
+      const next = backupSetConfig(clean);
       return { ok: true, config: next };
     } catch (e: any) {
       return { ok: false, error: e?.message || String(e) };
@@ -1071,9 +1087,52 @@ export function registerIpcHandlers(ipc: IpcMain): void {
     return { ok: true, folder: result.filePaths[0] };
   });
 
+  // R2 settings arrive from the renderer; the secret is only ever written to
+  // the OS keychain, and only after a successful round-trip to the bucket.
+  type R2Payload = { accountId?: string; bucket?: string; accessKeyId?: string; secret?: string; prefix?: string };
+  const readR2Payload = async (p: R2Payload): Promise<{ r2: R2Config; secret?: string } | { error: string }> => {
+    try {
+      const r2: R2Config = {
+        accountId: String(p?.accountId || '').trim().toLowerCase(),
+        bucket: String(p?.bucket || '').trim(),
+        accessKeyId: String(p?.accessKeyId || '').trim(),
+        prefix: normalizePrefix(p?.prefix),
+      };
+      const secret = typeof p?.secret === 'string' && p.secret.trim() ? p.secret.trim() : undefined;
+      if (!secret && !(await hasR2Secret())) return { error: 'Enter the Secret Access Key.' };
+      const problem = validateR2Settings({ ...r2, secretAccessKey: secret || 'x'.repeat(32) });
+      return problem ? { error: problem } : { r2, secret };
+    } catch (e: any) {
+      return { error: e?.message || String(e) };
+    }
+  };
+
+  ipc.handle('backup:testR2', async (_, payload: R2Payload) => {
+    const parsed = await readR2Payload(payload);
+    if ('error' in parsed) return { ok: false, error: parsed.error };
+    return testR2(parsed.r2, parsed.secret);
+  });
+
+  ipc.handle('backup:enableR2', async (_, payload: R2Payload & { seedFromFolder?: boolean }) => {
+    const parsed = await readR2Payload(payload);
+    if ('error' in parsed) return { ok: false, error: parsed.error };
+    if (activeAutomations() > 0) {
+      return { ok: false, error: 'Wait for the running bank/broker login to finish, then try again.' };
+    }
+    const test = await testR2(parsed.r2, parsed.secret);
+    if (!test.ok) return test;
+    if (parsed.secret) await setR2Secret(parsed.secret);
+    const current = backupGetConfig();
+    const seedFrom = payload?.seedFromFolder && current.target === 'folder' ? current.folder : null;
+    const result = await enableR2(parsed.r2, { seedFrom });
+    broadcast('backup:statusChanged', {});
+    return result.ok ? { ...result, note: test.note } : result;
+  });
+
   ipc.handle('backup:status', async () => {
     const state = backupGetState();
     return {
+      hasR2Secret: await hasR2Secret(),
       config: backupGetConfig(),
       state: { ...state, inProgress: backupInProgress() },
       sync: getSyncStatus(),
@@ -1138,7 +1197,7 @@ export function registerIpcHandlers(ipc: IpcMain): void {
     // Make the restored data the new head for every synced PC; otherwise the
     // next sync pass would fast-forward straight back and undo the restore.
     let published = true;
-    if (!payload.sourceFolder || payload.sourceFolder === backupGetConfig().folder) {
+    if (!payload.sourceFolder || payload.sourceFolder === backupActiveRoot()) {
       const pub = await publishRestoredVault(currentMasterKey, payload.snapshotId, result.ancestors);
       published = pub.ok;
       if (!pub.ok) console.warn('[Sync] restored vault not published:', pub.error);

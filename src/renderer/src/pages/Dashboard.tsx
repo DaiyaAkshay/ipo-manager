@@ -601,8 +601,17 @@ interface SyncConflictInfo {
 }
 
 interface BackupInfo {
-  config: { enabled: boolean; folder: string | null; vaultId: string };
+  hasR2Secret?: boolean;
+  config: {
+    enabled: boolean;
+    target?: 'folder' | 'r2';
+    folder: string | null;
+    r2?: { accountId: string; bucket: string; accessKeyId: string; prefix: string } | null;
+    mirrorFolder?: string | null;
+    vaultId: string;
+  };
   state: {
+    lastMirrorError?: string | null;
     lastBackupAt: string | null;
     lastBackupError: string | null;
     lastSnapshotId: string | null;
@@ -618,8 +627,30 @@ interface BackupInfo {
     folderMissing: boolean;
     head: { id: string; sourceHost: string | null; timestamp: string | null } | null;
     pendingRemoteId: string | null;
+    target?: 'folder' | 'r2';
+    remoteError?: string | null;
+    remoteOkAt?: string | null;
+    remoteWarning?: string | null;
   };
 }
+
+/** Where backups go, for display — null when not set up yet. */
+function backupDestination(info: BackupInfo | null): string | null {
+  if (!info) return null;
+  if (info.config.target === 'r2') return info.config.r2 ? `Cloudflare R2 · ${info.config.r2.bucket}/${info.config.r2.prefix}` : null;
+  return info.config.folder;
+}
+
+interface R2Form {
+  accountId: string;
+  bucket: string;
+  accessKeyId: string;
+  secret: string;
+  prefix: string;
+  seed: boolean;
+}
+
+const EMPTY_R2_FORM: R2Form = { accountId: '', bucket: '', accessKeyId: '', secret: '', prefix: 'ipo-manager', seed: true };
 
 // 'all' = View All, 'spreadsheet' = every member's balances in one table,
 // 'recharge' = SIM recharge tracker, 'totp' = Zerodha TOTP, number = specific family id
@@ -682,6 +713,8 @@ export default function Dashboard() {
     sourceHost?: string | null; appVersion?: string | null;
   }>>([]);
   const [restoreSourceFolder, setRestoreSourceFolder] = useState<string | null>(null);
+  const [backupDestTab, setBackupDestTab] = useState<'r2' | 'folder'>('r2');
+  const [r2Form, setR2Form] = useState<R2Form>(EMPTY_R2_FORM);
   const [serviceConfigValue, setServiceConfigValue] = useState('');
   const [passwordChangeForm, setPasswordChangeForm] = useState({ current: '', next: '', confirm: '' });
   const [portfolioReport, setPortfolioReport] = useState<BrokerPortfolioReport | null>(null);
@@ -2434,17 +2467,18 @@ export default function Dashboard() {
   }
 
   function backupTone(): 'good' | 'warn' | 'bad' | 'muted' {
-    if (!backupInfo?.config.enabled || !backupInfo.config.folder) return 'muted';
-    if (backupInfo.state.conflict || backupInfo.sync?.folderMissing || backupInfo.state.lastBackupError) return 'bad';
+    if (!backupInfo?.config.enabled || !backupDestination(backupInfo)) return 'muted';
+    if (backupInfo.state.conflict || backupInfo.sync?.folderMissing || backupInfo.sync?.remoteError || backupInfo.state.lastBackupError) return 'bad';
     if (backupInfo.state.inProgress) return 'good';
-    if (backupInfo.state.lastSyncError || backupInfo.sync?.pendingRemoteId || !lastSyncAt()) return 'warn';
+    if (backupInfo.state.lastSyncError || backupInfo.state.lastMirrorError || backupInfo.sync?.pendingRemoteId || !lastSyncAt()) return 'warn';
     return 'good';
   }
 
   function backupLabel(): string {
     if (!backupInfo) return 'Sync: checking...';
-    if (!backupInfo.config.enabled || !backupInfo.config.folder) return 'Backup: off';
+    if (!backupInfo.config.enabled || !backupDestination(backupInfo)) return 'Backup: off';
     if (backupInfo.state.conflict) return '⚠ Sync conflict — resolve';
+    if (backupInfo.sync?.remoteError) return 'Sync: R2 offline — retrying';
     if (backupInfo.sync?.folderMissing) return 'Sync: backup folder missing';
     if (backupInfo.state.inProgress) return 'Sync: syncing...';
     if (backupInfo.sync?.pendingRemoteId) return 'Sync: other PC uploading…';
@@ -2455,14 +2489,16 @@ export default function Dashboard() {
   }
 
   function backupTooltip(): string {
-    if (!backupInfo?.config.folder) return 'Click to set up backup & sync';
+    if (!backupInfo || !backupDestination(backupInfo)) return 'Click to set up backup & sync';
     const s = backupInfo.state;
     const lines = [
       `This PC: ${backupInfo.sync?.thisHost || 'unknown'}`,
       s.lastBackupAt ? `Last upload: ${formatAge(s.lastBackupAt)}` : 'Last upload: never',
       s.lastPullAt ? `Last download: ${formatAge(s.lastPullAt)}${s.lastPullSourceHost ? ` from ${s.lastPullSourceHost}` : ''}` : null,
-      `Folder: ${backupInfo.config.folder}`,
+      `Backups go to: ${backupDestination(backupInfo)}`,
+      backupInfo.config.mirrorFolder ? `Extra copy: ${backupInfo.config.mirrorFolder}` : null,
       s.lastSyncError ? `⚠ ${s.lastSyncError}` : null,
+      s.lastMirrorError ? `⚠ ${s.lastMirrorError}` : null,
       s.lastBackupError ? `⚠ Last upload failed: ${s.lastBackupError}` : null,
     ];
     return lines.filter(Boolean).join('\n');
@@ -2470,6 +2506,9 @@ export default function Dashboard() {
 
   function openBackupSettings() {
     void loadBackupStatus();
+    const r2 = backupInfo?.config.r2;
+    setBackupDestTab(backupInfo?.config.target !== 'r2' && backupInfo?.config.folder ? 'folder' : 'r2');
+    setR2Form(r2 ? { ...EMPTY_R2_FORM, ...r2, secret: '', seed: false } : { ...EMPTY_R2_FORM, seed: !!backupInfo?.config.folder });
     setModal(backupInfo?.state.conflict ? { type: 'sync-conflict' } : { type: 'backup-settings' });
   }
 
@@ -2508,6 +2547,74 @@ export default function Dashboard() {
     } catch (e: any) {
       showToast('error', e?.message || String(e));
     }
+  }
+
+  function r2Payload() {
+    return {
+      accountId: r2Form.accountId, bucket: r2Form.bucket, accessKeyId: r2Form.accessKeyId,
+      secret: r2Form.secret || undefined, prefix: r2Form.prefix,
+    };
+  }
+
+  async function testR2Connection() {
+    setBusy('r2-test');
+    try {
+      const result: any = await window.api.backup.testR2(r2Payload());
+      if (result?.ok) showToast('success', result.note ? `Connected · ${result.note}` : 'Connected to Cloudflare R2');
+      else showToast('error', result?.error || 'Could not connect');
+    } catch (e: any) {
+      showToast('error', e?.message || String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveR2Settings() {
+    if (backupInfo?.config.target !== 'r2' && !confirm(
+      'Switch backups to Cloudflare R2?\n\n' +
+      'Switch EVERY PC that shares this vault — a PC still on the Google Drive folder will not see ' +
+      'changes made on an R2 PC, and vice versa.'
+    )) return;
+    setBusy('r2-save');
+    try {
+      const result: any = await window.api.backup.enableR2({ ...r2Payload(), seedFromFolder: r2Form.seed });
+      if (result?.ok) {
+        showToast('success',
+          `Backups now go to Cloudflare R2${result.seeded ? ` · ${result.seeded} existing snapshot(s) uploaded` : ''}` +
+          (result.note ? ` · ${result.note}` : ''));
+        setR2Form(f => ({ ...f, secret: '', seed: false }));
+      } else {
+        showToast('error', result?.error || 'Could not switch to R2');
+      }
+    } catch (e: any) {
+      showToast('error', e?.message || String(e));
+    } finally {
+      setBusy(null);
+      await loadBackupStatus();
+    }
+  }
+
+  async function useFolderTarget() {
+    if (!confirm('Stop using Cloudflare R2 and go back to the backup folder on every sync? Switch the other PCs too.')) return;
+    await window.api.backup.setConfig({ target: 'folder' });
+    await loadBackupStatus();
+  }
+
+  async function chooseMirrorFolder() {
+    try {
+      const result: any = await window.api.backup.pickFolder();
+      if (!result?.ok) return;
+      await window.api.backup.setConfig({ mirrorFolder: result.folder });
+      await loadBackupStatus();
+      showToast('success', 'Extra copy folder set — it is refreshed after every upload');
+    } catch (e: any) {
+      showToast('error', e?.message || String(e));
+    }
+  }
+
+  async function clearMirrorFolder() {
+    await window.api.backup.setConfig({ mirrorFolder: null });
+    await loadBackupStatus();
   }
 
   async function toggleBackupEnabled(enabled: boolean) {
@@ -2629,7 +2736,8 @@ export default function Dashboard() {
   }
 
   async function restoreSelectedSnapshot(snapshotId: string) {
-    const syncedFolder = !restoreSourceFolder || restoreSourceFolder === backupInfo?.config.folder;
+    const syncedFolder = !restoreSourceFolder
+      || (backupInfo?.config.target !== 'r2' && restoreSourceFolder === backupInfo?.config.folder);
     if (!confirm(
       `Restore from snapshot ${snapshotId}?\n\n` +
       'This will REPLACE your current vault' +
@@ -4582,20 +4690,112 @@ export default function Dashboard() {
                     </div>
                   )}
                   <div className="form-field">
-                    <label>Backup folder</label>
+                    <label>Where backups go</label>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button className={backupDestTab === 'r2' ? 'btn' : 'btn btn-ghost'} onClick={() => setBackupDestTab('r2')}>
+                        Cloudflare R2{backupInfo?.config.target === 'r2' ? ' ✓' : ''}
+                      </button>
+                      <button className={backupDestTab === 'folder' ? 'btn' : 'btn btn-ghost'} onClick={() => setBackupDestTab('folder')}>
+                        Folder (Google Drive / OneDrive){backupInfo?.config.target !== 'r2' && backupInfo?.config.folder ? ' ✓' : ''}
+                      </button>
+                    </div>
+                  </div>
+
+                  {backupDestTab === 'r2' && (
+                    <div className="form-field" style={{ marginTop: 10 }}>
+                      <div className="empty-sub" style={{ marginBottom: 8 }}>
+                        Uploads straight to your own Cloudflare R2 bucket — no Drive app to be signed out of.
+                        Everything is encrypted on this PC before upload; Cloudflare only stores scrambled files.
+                        Use an R2 API token with <strong>Object Read &amp; Write</strong> on this one bucket only.
+                      </div>
+                      <div className="form-grid">
+                        <div className="form-field">
+                          <label>Account ID</label>
+                          <input value={r2Form.accountId} placeholder="32-character id from the R2 dashboard"
+                            onChange={e => setR2Form(f => ({ ...f, accountId: e.target.value }))} style={{ fontFamily: 'var(--mono)' }} />
+                        </div>
+                        <div className="form-field">
+                          <label>Bucket</label>
+                          <input value={r2Form.bucket} placeholder="ipo-manager-backup"
+                            onChange={e => setR2Form(f => ({ ...f, bucket: e.target.value }))} style={{ fontFamily: 'var(--mono)' }} />
+                        </div>
+                        <div className="form-field">
+                          <label>Access Key ID</label>
+                          <input value={r2Form.accessKeyId} autoComplete="off"
+                            onChange={e => setR2Form(f => ({ ...f, accessKeyId: e.target.value }))} style={{ fontFamily: 'var(--mono)' }} />
+                        </div>
+                        <div className="form-field">
+                          <label>Secret Access Key</label>
+                          <input type="password" value={r2Form.secret} autoComplete="new-password"
+                            placeholder={backupInfo?.hasR2Secret ? 'Saved in Windows Credential Manager — leave blank to keep' : ''}
+                            onChange={e => setR2Form(f => ({ ...f, secret: e.target.value }))} />
+                        </div>
+                        <div className="form-field">
+                          <label>Folder inside the bucket</label>
+                          <input value={r2Form.prefix}
+                            onChange={e => setR2Form(f => ({ ...f, prefix: e.target.value }))} style={{ fontFamily: 'var(--mono)' }} />
+                        </div>
+                      </div>
+                      {backupInfo?.config.target !== 'r2' && backupInfo?.config.folder && (
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
+                          <input type="checkbox" checked={r2Form.seed} onChange={e => setR2Form(f => ({ ...f, seed: e.target.checked }))} />
+                          Upload the existing backup history from {backupInfo.config.folder}
+                        </label>
+                      )}
+                      <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                        <button className="btn btn-ghost" onClick={testR2Connection} disabled={busy === 'r2-test' || busy === 'r2-save'}>
+                          {busy === 'r2-test' ? 'Testing...' : 'Test connection'}
+                        </button>
+                        <button className="btn" onClick={saveR2Settings} disabled={busy === 'r2-test' || busy === 'r2-save'}>
+                          {busy === 'r2-save' ? 'Saving & uploading...' : backupInfo?.config.target === 'r2' ? 'Save R2 settings' : 'Use Cloudflare R2'}
+                        </button>
+                      </div>
+                      {backupInfo?.sync?.remoteWarning && (
+                        <div className="empty-sub" style={{ marginTop: 6 }}>Note: {backupInfo.sync.remoteWarning}</div>
+                      )}
+                    </div>
+                  )}
+
+                  {backupDestTab === 'folder' && (
+                    <div className="form-field" style={{ marginTop: 10 }}>
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <input
+                          readOnly
+                          value={backupInfo?.config.folder || ''}
+                          placeholder="Not set — click Choose folder"
+                          style={{ fontFamily: 'var(--mono)', flex: 1 }}
+                        />
+                        <button className="btn btn-ghost" onClick={chooseBackupFolder}>Choose folder...</button>
+                        {backupInfo?.config.target === 'r2' && backupInfo?.config.folder && (
+                          <button className="btn btn-ghost" onClick={useFolderTarget}>Use this folder instead of R2</button>
+                        )}
+                      </div>
+                      <div className="empty-sub" style={{ marginTop: 6 }}>
+                        A folder inside OneDrive / Google Drive / Dropbox syncs backups across PCs — but only while
+                        that app is running and signed in. Documents are stored once and reused across snapshots.
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="form-field" style={{ marginTop: 14 }}>
+                    <label>Extra copy (optional)</label>
                     <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                       <input
                         readOnly
-                        value={backupInfo?.config.folder || ''}
-                        placeholder="Not set — click Choose folder"
+                        value={backupInfo?.config.mirrorFolder || ''}
+                        placeholder="None — e.g. a USB disk or NAS folder"
                         style={{ fontFamily: 'var(--mono)', flex: 1 }}
                       />
-                      <button className="btn btn-ghost" onClick={chooseBackupFolder}>Choose folder...</button>
+                      <button className="btn btn-ghost" onClick={chooseMirrorFolder}>Choose...</button>
+                      {backupInfo?.config.mirrorFolder && <button className="btn btn-ghost" onClick={clearMirrorFolder}>Remove</button>}
                     </div>
                     <div className="empty-sub" style={{ marginTop: 6 }}>
-                      Tip: pick a folder inside OneDrive / Google Drive / Dropbox to sync backups across machines.
-                      Documents are stored once and reused across snapshots (incremental).
+                      After every upload the full encrypted history is also copied to "IPO Manager backup copy" inside this folder.
+                      To restore from it, use Restore → choose that subfolder.
                     </div>
+                    {backupInfo?.state.lastMirrorError && (
+                      <div className="empty-sub" style={{ marginTop: 4, color: 'var(--warn)' }}>⚠ {backupInfo.state.lastMirrorError}</div>
+                    )}
                   </div>
                   <div className="form-field" style={{ marginTop: 14 }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -4620,8 +4820,13 @@ export default function Dashboard() {
                         ? `${new Date(backupInfo.state.lastPullAt).toLocaleString()} (${formatAge(backupInfo.state.lastPullAt)})` +
                           (backupInfo.state.lastPullSourceHost ? ` from ${backupInfo.state.lastPullSourceHost}` : '')
                         : 'never'}<br />
+                      {backupInfo?.sync?.target === 'r2' && (
+                        <>Cloudflare R2: {backupInfo.sync.remoteError
+                          ? <span style={{ color: 'var(--danger)' }}>not reachable — {backupInfo.sync.remoteError}</span>
+                          : backupInfo.sync.remoteOkAt ? `connected · last checked ${formatAge(backupInfo.sync.remoteOkAt)}` : 'not checked yet'}<br /></>
+                      )}
                       {backupInfo?.sync?.head && (
-                        <>Newest in folder: {backupInfo.sync.head.sourceHost || 'older app version'}
+                        <>Newest backup: {backupInfo.sync.head.sourceHost || 'older app version'}
                           {backupInfo.sync.head.timestamp ? ` · ${formatAge(backupInfo.sync.head.timestamp)}` : ''}<br /></>
                       )}
                       {backupInfo?.state.lastSyncError && (
@@ -4636,7 +4841,7 @@ export default function Dashboard() {
                     <button
                       className="btn"
                       onClick={runBackupNow}
-                      disabled={busy === 'backup-run' || !backupInfo?.config.folder || !!backupInfo?.state.conflict}
+                      disabled={busy === 'backup-run' || !backupDestination(backupInfo) || !!backupInfo?.state.conflict}
                       title={backupInfo?.state.conflict ? 'Resolve the sync conflict first' : 'Upload this PC\'s changes now (or download newer ones first)'}
                     >
                       {busy === 'backup-run' ? 'Syncing...' : 'Sync now'}

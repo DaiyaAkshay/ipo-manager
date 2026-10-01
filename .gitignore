@@ -24,6 +24,8 @@ data/
 *.db-shm
 *.enc
 documents/
+# ...but the documents module is source code, not client documents
+!src/main/documents/
 backups/
 gmail-token.json
 gmail-credentials.json
