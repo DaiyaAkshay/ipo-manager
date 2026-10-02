@@ -1,9 +1,16 @@
 /**
- * Database connection using SQLCipher.
+ * Database connection using SQLite3MultipleCiphers (better-sqlite3-multiple-ciphers).
  *
- * SQLCipher encrypts the entire .db file at rest with AES-256-CBC + HMAC-SHA512.
- * The encryption key is derived from the user's master password via Argon2id
- * (in master.ts) and never persisted to disk.
+ * The whole .db file is encrypted at rest with SQLite3MultipleCiphers' ChaCha20-Poly1305
+ * cipher (cipher='chacha20', non-legacy). This is NOT SQLCipher: a vault will
+ * not open with cipher='sqlcipher'. The cipher is pinned explicitly in openDb()
+ * so a change in the library default can't silently switch formats. The
+ * Android viewer (ipo-manager-android, docs/DECISIONS.md) depends on this format.
+ *
+ * Key: the 32-byte Argon2id hash of the master password (master.ts), never
+ * persisted to disk. It is passed as the text `x'<hex>'`, but on this path
+ * SQLite3MC does NOT use it as a raw key: it runs PBKDF2-HMAC-SHA256 (64007
+ * iterations, salt = first 16 bytes of the file) over that literal string.
  *
  * Sensitive fields (passwords, account numbers, PAN, Aadhaar) are ALSO
  * encrypted at the field level using a separate key stored in the OS keychain
@@ -57,13 +64,16 @@ export function openDb(rawKey: Buffer): Database.Database {
   const newDb = !existsSync(dbPath);
   db = new Database(dbPath);
 
-  // SQLCipher key as raw hex bytes.
-  // Format: x'<hex>' tells SQLCipher to use the bytes directly (no KDF inside SQLCipher).
-  // Our KDF (Argon2id) is stronger than SQLCipher's default PBKDF2, so we
-  // pre-derive the key and pass it raw.
+  // Pin the cipher BEFORE keying. chacha20 is the library default and the
+  // format every existing vault uses; pinning it means a future default change
+  // can't silently create or expect a different format.
+  db.pragma("cipher='chacha20'");
+  // The x'<hex>' string goes through SQLite3MC's PBKDF2-HMAC-SHA256 (64007
+  // iterations, per-file salt) on top of our Argon2id; it is not a raw key.
+  // (We used to also set `cipher_compatibility = 4`. SQLite3MC doesn't
+  // recognise that pragma, so it did nothing; removed.)
   const keyHex = rawKey.toString('hex');
   db.pragma(`key = "x'${keyHex}'"`);
-  db.pragma('cipher_compatibility = 4');
   db.pragma('foreign_keys = ON');
 
   // Verify the key works by running a trivial query.

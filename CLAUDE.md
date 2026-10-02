@@ -35,9 +35,9 @@ src/renderer/    — React UI, no Node access
 |--------|------|
 | `index.ts` | App entry, window creation, 5-min auto-lock timer |
 | `ipc.ts` | All IPC handlers — the single integration point between renderer and main |
-| `crypto/master.ts` | Argon2id KDF → 32-byte SQLCipher key (256 MB memory, 4 iters) |
+| `crypto/master.ts` | Argon2id KDF → 32-byte vault key (256 MB memory, 4 iters) |
 | `crypto/field.ts` | AES-256-GCM field encryption; key lives in Windows Credential Manager via `keytar` |
-| `db/connection.ts` | Opens SQLCipher DB; passes raw Argon2 key via `x'hex'` pragma |
+| `db/connection.ts` | Opens SQLite3MC ChaCha20 DB; pins `cipher='chacha20'`, keys with `x'hex'` text (PBKDF2'd by SQLite3MC) |
 | `db/schema.sql` | Source of truth for all tables |
 | `automation/browser.ts` | Playwright headed Chromium, per-member-per-bank persistent profile |
 | `automation/registry.ts` | Maps bank/broker codes (`AU`, `YES`, `ZERODHA`, …) to adapters + OTP presets |
@@ -58,7 +58,7 @@ Plain React 18, no state library. `App.tsx` is a three-state machine: `loading �
 
 ## Security model — dual encryption layer
 
-1. **SQLCipher** (DB file, AES-256-CBC + HMAC): key = Argon2id hash of master password, never stored anywhere. Wrong password → `INVALID_MASTER_PASSWORD` thrown in `openDb()`.
+1. **SQLite3MultipleCiphers ChaCha20-Poly1305** (DB file, `cipher='chacha20'`, non-legacy — NOT SQLCipher; the Android viewer depends on this format): key = Argon2id hash of master password, never stored anywhere. It is passed as the string `x'<hex>'`, which SQLite3MC runs through PBKDF2-HMAC-SHA256 (64007 iterations, salt = first 16 bytes of the file) — it is not used as a raw key. Wrong password → `INVALID_MASTER_PASSWORD` thrown in `openDb()`.
 2. **Field-level AES-256-GCM** (`crypto/field.ts`): wraps PAN, Aadhaar, account numbers, passwords. Key is a random 32-byte value stored in Windows Credential Manager. An attacker needs both the DB file, the master password **and** OS-level access to read credentials.
 
 `pan_last4` / `aadhaar_last4` / `account_last4` columns store plaintext tails only, for fast list rendering without decryption.
@@ -67,7 +67,7 @@ Plain React 18, no state library. `App.tsx` is a three-state machine: `loading �
 
 | Path | Contents |
 |------|----------|
-| `data/vault.db` | SQLCipher encrypted database |
+| `data/vault.db` | SQLite3MC ChaCha20-Poly1305 encrypted database |
 | `data/vault.meta.json` | Argon2id salt (not secret) |
 | `data/gmail-credentials.json` | OAuth client secret (user-provided, not in repo) |
 | `browser-profiles/<profileKey>/` | Persistent Chromium sessions per member×bank |

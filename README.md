@@ -10,7 +10,7 @@ Encrypted local vault and login automation for managing family IPO applications.
 
 ## What it does
 
-- Stores family member profiles, bank accounts, and broker accounts in a **locally encrypted SQLite vault** (SQLCipher + AES-256-GCM field-level encryption + OS keychain).
+- Stores family member profiles, bank accounts, and broker accounts in a **locally encrypted SQLite vault** (SQLite3MultipleCiphers ChaCha20-Poly1305 + AES-256-GCM field-level encryption + OS keychain).
 - Imports your existing `Demat_Sheet.xlsx` (the layout where each sheet is a family and each column is a person).
 - Shows families as a **collapsible tree**. Each family member has two buttons: 🏦 **Bank** and 📈 **Broker**, which launch a real Chrome window pre-logged-in.
 - Auto-fills usernames + passwords and waits for the OTP from your Gmail (via Gmail API with read-only OAuth scope).
@@ -23,7 +23,7 @@ Encrypted local vault and login automation for managing family IPO applications.
 |---|---|
 | Shell | Electron 32 + Vite |
 | UI | React 18 + TypeScript |
-| Database | SQLite via `better-sqlite3-multiple-ciphers` (SQLCipher) |
+| Database | SQLite via `better-sqlite3-multiple-ciphers` (ChaCha20-Poly1305 cipher, not SQLCipher) |
 | Master KDF | Argon2id (256 MB / 4 iters) |
 | Field crypto | AES-256-GCM, key in Windows Credential Manager via `keytar` |
 | Browser automation | Playwright (headed Chromium) |
@@ -141,7 +141,7 @@ Output goes to `dist/`. The installer is a standard NSIS `.exe`. **Do not distri
 │      ↓ Argon2id (256MB, 4 iters)                        │
 │  256-bit raw key                                        │
 │      ↓                                                  │
-│  SQLCipher decrypts entire .db file (AES-256-CBC+HMAC)  │
+│  SQLite3MC decrypts entire .db file (ChaCha20-Poly1305) │
 │      ↓                                                  │
 │  Field-level AES-256-GCM blobs in DB rows               │
 │      ↑ key from Windows Credential Manager              │
@@ -184,7 +184,7 @@ ipo-manager/
 │   │   ├── index.ts                # App lifecycle, window mgmt, auto-lock
 │   │   ├── ipc.ts                  # IPC handlers
 │   │   ├── db/
-│   │   │   ├── connection.ts       # SQLCipher init
+│   │   │   ├── connection.ts       # SQLite3MC (chacha20) init
 │   │   │   └── schema.sql          # Tables
 │   │   ├── crypto/
 │   │   │   ├── master.ts           # Argon2id
