@@ -10,7 +10,7 @@ Exactly what went into the Drive folder, and it is all encrypted on the PC befor
 
 | Object | Protected by |
 |--------|--------------|
-| `snapshots/<id>/vault.db` | SQLCipher, key = Argon2id(master password) |
+| `snapshots/<id>/vault.db` | SQLite3MC ChaCha20-Poly1305, key = Argon2id(master password) |
 | `snapshots/<id>/field-key.bin` | AES-256-GCM with the master key |
 | `blobs/<uuid>.enc` | AES-256-GCM with the field key |
 | `snapshots/<id>/vault.meta.json` | not secret (Argon2 salt + parameters) |

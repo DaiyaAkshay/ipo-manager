@@ -11,8 +11,8 @@
  *   │                                       once, referenced by many snapshots)
  *   └── snapshots/
  *       └── 2026-05-19T02-30-00.000Z/
- *           ├── vault.db                   (SQLCipher snapshot — encrypted
- *           │                               with the master-derived key)
+ *           ├── vault.db                   (SQLite3MC ChaCha20-Poly1305 snapshot
+ *           │                               — encrypted with the master-derived key)
  *           ├── field-key.bin              (field key, AES-256-GCM-encrypted
  *           │                               with the master key — lets you
  *           │                               restore on another machine)
@@ -422,7 +422,7 @@ function sha256File(path: string): string | null {
 }
 
 /**
- * sha256 of the live vault.db file. SQLCipher writes committed changes straight
+ * sha256 of the live vault.db file. SQLite3MC writes committed changes straight
  * into the file (no WAL), so this changes exactly when data changes — the
  * basis for "does this PC have edits the other PC hasn't seen?".
  */
@@ -581,8 +581,8 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
     ensureDir(snapshotDir);
 
     // 1) DB snapshot via VACUUM INTO — consistent without closing.
-    //    SQLCipher carries the encryption key into the output file, so the
-    //    backup file is openable with the same master password.
+    //    SQLite3MC carries the cipher (chacha20) and key into the output file,
+    //    so the backup file is openable with the same master password.
     const db = getDb();
     db.pragma('wal_checkpoint(TRUNCATE)');
     const snapshotDbPath = join(snapshotDir, 'vault.db');
@@ -837,8 +837,9 @@ function validateSnapshotDb(dbPath: string, rawKey: Buffer): { ok: true } | { ok
   let probe: Database.Database | null = null;
   try {
     probe = new Database(dbPath, { readonly: true });
+    // Same pragmas as openDb(): pin chacha20 before keying (see db/connection.ts).
+    probe.pragma("cipher='chacha20'");
     probe.pragma(`key = "x'${rawKey.toString('hex')}'"`);
-    probe.pragma('cipher_compatibility = 4');
     // Wrong key throws here; a truncated/corrupt file fails quick_check.
     const result = probe.pragma('quick_check', { simple: true }) as string;
     if (result !== 'ok') {
