@@ -30,6 +30,10 @@ does **not** publish — it only produces the `.exe` in `dist/`.
 
 ## Publishing a new version
 
+Before building, run `npm test`, `npm run test:native`, and `npx tsc --noEmit`.
+The native test runner uses Electron and must pass the backup/restore and cipher
+tests that plain Node skips. Use synthetic vaults only for release checks.
+
 From the project folder (`H:\ipo-manager_1\ipo-manager`):
 
 1. **Bump the version.** Edit `"version"` in `package.json` (e.g. `0.3.5` →
