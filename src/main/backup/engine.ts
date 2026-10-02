@@ -11,8 +11,8 @@
  *   │                                       once, referenced by many snapshots)
  *   └── snapshots/
  *       └── 2026-05-19T02-30-00.000Z/
- *           ├── vault.db                   (SQLCipher snapshot — encrypted
- *           │                               with the master-derived key)
+ *           ├── vault.db                   (SQLite3MC ChaCha20-Poly1305 snapshot
+ *           │                               — encrypted with the master-derived key)
  *           ├── field-key.bin              (field key, AES-256-GCM-encrypted
  *           │                               with the master key — lets you
  *           │                               restore on another machine)
@@ -48,12 +48,17 @@ import Database from 'better-sqlite3-multiple-ciphers';
 import { getDataDir, getDbPath, getDb, closeDb, openDb } from '../db/connection';
 import { getEncryptedDocumentPath } from '../documents/storage';
 import { deriveMasterKeyFromMeta, getVaultMeta, type VaultMeta } from '../crypto/master';
-import { clearKeyCache as clearFieldKeyCache } from '../crypto/field';
+import { clearKeyCache as clearFieldKeyCache, getOrCreateFieldKey } from '../crypto/field';
 import {
   decideSync, isDirty, monotonicSnapshotTime, nextAncestors, pickHead, selectSnapshotsToKeep,
   MAX_LINEAGE, type ConflictReason, type Head, type HeadCandidate, type SyncDecision,
 } from './syncPolicy';
-import { copyBackupTree, emptyReplicationState, replicate, type ReplicationState } from './replicator';
+import {
+  copyBackupTree, emptyReplicationState, fetchRemoteSnapshot, remoteManifestDir, replicate,
+  type ReplicateOptions, type ReplicationState,
+} from './replicator';
+import { syncGmailSettings } from './appSettings';
+import { applyGmailSyncPayload, getGmailSyncPayload } from '../email/gmail';
 import { R2Store, normalizePrefix, testObjectStore } from './objectStore';
 import keytar from 'keytar';
 
@@ -61,6 +66,7 @@ const FIELD_KEYTAR_SERVICE = 'ipo-manager';
 const FIELD_KEYTAR_ACCOUNT = 'field-encryption-key-v1';
 const BACKUP_CONFIG_FILENAME = 'backup.config.json';
 const BACKUP_STATE_FILENAME = 'backup.state.json';
+const SETTINGS_STATE_FILENAME = 'settings.state.json';
 const META_FILENAME = 'meta.json';
 const FORMAT_VERSION = 1;
 
@@ -112,6 +118,8 @@ export interface BackupState {
   conflict: SyncConflict | null;
   /** Last problem refreshing the extra-copy folder (null when fine or not set). */
   lastMirrorError: string | null;
+  /** A manual restore that still has to be published to the other PCs (retried by the sync loop). */
+  pendingRestorePublish: { snapshotId: string; ancestors: string[] } | null;
 }
 
 export interface SnapshotInfo {
@@ -123,6 +131,10 @@ export interface SnapshotInfo {
   band: 'last-24h' | 'last-7d' | 'last-30d' | 'last-6mo' | 'older';
   sourceHost: string | null;       // PC that wrote it (null for snapshots from older builds)
   appVersion: string | null;
+  /** 'cloud' = in the R2 bucket only; restoring downloads it first. */
+  location: 'local' | 'cloud';
+  /** The newest snapshot — what every PC syncs to. */
+  isHead: boolean;
 }
 
 interface SnapshotManifest {
@@ -145,6 +157,13 @@ interface SnapshotManifest {
 }
 
 // ── Config / state ──────────────────────────────────────────────────────────
+
+/** Write JSON via temp file + rename: a crash mid-write never leaves a torn state file. */
+function writeJsonAtomic(path: string, value: unknown): void {
+  const tmp = `${path}.part`;
+  writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8');
+  renameSync(tmp, path);
+}
 
 function getConfigPath(): string {
   return join(getDataDir(), BACKUP_CONFIG_FILENAME);
@@ -178,7 +197,7 @@ export function getBackupConfig(): BackupConfig {
     // fallthrough — write a fresh config
   }
   const fresh: BackupConfig = { enabled: false, target: 'folder', folder: null, r2: null, mirrorFolder: null, vaultId: randomUUID() };
-  writeFileSync(getConfigPath(), JSON.stringify(fresh, null, 2), 'utf8');
+  writeJsonAtomic(getConfigPath(), fresh);
   return fresh;
 }
 
@@ -190,7 +209,7 @@ export function setBackupConfig(patch: Partial<BackupConfig>): BackupConfig {
     vaultId: current.vaultId, // never change vault id once minted
   };
   if (next.target === 'r2' && !next.r2) next.target = 'folder';
-  writeFileSync(getConfigPath(), JSON.stringify(next, null, 2), 'utf8');
+  writeJsonAtomic(getConfigPath(), next);
   return next;
 }
 
@@ -229,10 +248,10 @@ export async function hasR2Secret(): Promise<boolean> {
   return !!(await keytar.getPassword(FIELD_KEYTAR_SERVICE, R2_SECRET_KEYTAR_ACCOUNT).catch(() => null));
 }
 
-async function openR2Store(r2: R2Config, secretOverride?: string): Promise<R2Store> {
+async function openR2Store(r2: R2Config, secretOverride?: string, opts?: { fast?: boolean }): Promise<R2Store> {
   const secretAccessKey = secretOverride || await keytar.getPassword(FIELD_KEYTAR_SERVICE, R2_SECRET_KEYTAR_ACCOUNT);
   if (!secretAccessKey) throw new Error('The R2 secret key is missing from this PC\'s keychain — enter it again in Backup & Sync.');
-  return new R2Store({ ...r2, secretAccessKey });
+  return new R2Store({ ...r2, secretAccessKey }, opts?.fast ? { smallTimeoutMs: 8_000, transferTimeoutMs: 60_000, retries: 1 } : undefined);
 }
 
 /** Check credentials before saving them (list, write, read back, delete). */
@@ -266,6 +285,7 @@ function getR2Status(): R2Status {
       synced: Array.isArray(s.synced) ? s.synced.filter((x: unknown) => typeof x === 'string') : [],
       tombstones: s.tombstones && typeof s.tombstones === 'object' ? s.tombstones : {},
       orphanBlobsSince: s.orphanBlobsSince && typeof s.orphanBlobsSince === 'object' ? s.orphanBlobsSince : {},
+      deleteAttempts: s.deleteAttempts && typeof s.deleteAttempts === 'object' ? s.deleteAttempts : {},
       lastOkAt: s.lastOkAt ?? null,
       lastError: s.lastError ?? null,
       lastWarning: s.lastWarning ?? null,
@@ -277,22 +297,24 @@ function getR2Status(): R2Status {
 }
 
 function saveR2Status(next: R2Status): void {
-  writeFileSync(join(getDataDir(), R2_STATE_FILENAME), JSON.stringify(next, null, 2), 'utf8');
+  writeJsonAtomic(join(getDataDir(), R2_STATE_FILENAME), next);
 }
 
 /**
  * Bring the R2 cache and the bucket in step. Callers hold _inProgress (or
  * are about to check it), so this never runs alongside a snapshot or restore.
  */
-async function replicateR2(config: BackupConfig): Promise<{ ok: true } | { ok: false; error: string }> {
+async function replicateR2(
+  config: BackupConfig, opts: ReplicateOptions = {},
+): Promise<{ ok: true; moreToDownload: boolean } | { ok: false; error: string }> {
   if (!config.r2) return { ok: false, error: 'Cloudflare R2 is not configured.' };
   const root = getActiveRoot(config)!;
   const prev = getR2Status();
   const target = r2TargetId(config.r2);
   const base: ReplicationState = prev.target === target ? prev : emptyReplicationState();
   try {
-    const store = await openR2Store(config.r2);
-    const report = await replicate(root, store, config.r2.prefix, base);
+    const store = await openR2Store(config.r2, undefined, { fast: !!opts.light });
+    const report = await replicate(root, store, config.r2.prefix, base, Date.now(), opts);
     saveR2Status({
       ...report.state,
       lastOkAt: new Date().toISOString(),
@@ -301,9 +323,10 @@ async function replicateR2(config: BackupConfig): Promise<{ ok: true } | { ok: f
       target,
     });
     if (report.uploadedSnapshots.length || report.downloadedSnapshots.length) {
-      console.log(`[Sync] R2: uploaded ${report.uploadedSnapshots.length}, downloaded ${report.downloadedSnapshots.length} snapshot(s)`);
+      console.log(`[Sync] R2: uploaded ${report.uploadedSnapshots.length}, downloaded ${report.downloadedSnapshots.length} snapshot(s)` +
+        (report.moreToDownload ? ' (older history still downloading)' : ''));
     }
-    return { ok: true };
+    return { ok: true, moreToDownload: report.moreToDownload };
   } catch (e: any) {
     const error = e?.name === 'TimeoutError' ? 'the connection timed out' : (e?.message || String(e));
     saveR2Status({ ...prev, lastError: error });
@@ -340,7 +363,7 @@ export async function enableR2(r2: R2Config, opts: { seedFrom?: string | null })
       seeded = copyBackupTree(opts.seedFrom, getActiveRoot(config)!, { prune: false }).copiedSnapshots;
     }
     const rep = await replicateR2(config);
-    return rep.ok ? { ok: true, seeded } : { ok: false, error: `Saved, but the first upload failed: ${rep.error}` };
+    return rep.ok ? { ok: true, seeded } : { ok: false, error: `Saved, but the first sync with the bucket failed: ${rep.error}` };
   } finally {
     _inProgress = false;
   }
@@ -350,7 +373,7 @@ function emptyState(): BackupState {
   return {
     lastBackupAt: null, lastBackupError: null, lastSnapshotId: null, inProgress: false,
     lastSyncedDbHash: null, lineage: [], lastPullAt: null, lastPullSourceHost: null,
-    lastSyncError: null, conflict: null, lastMirrorError: null,
+    lastSyncError: null, conflict: null, lastMirrorError: null, pendingRestorePublish: null,
   };
 }
 
@@ -371,6 +394,8 @@ export function getBackupState(): BackupState {
         lastSyncError: parsed.lastSyncError ?? null,
         conflict: parsed.conflict && typeof parsed.conflict.remoteSnapshotId === 'string' ? parsed.conflict : null,
         lastMirrorError: parsed.lastMirrorError ?? null,
+        pendingRestorePublish: parsed.pendingRestorePublish && typeof parsed.pendingRestorePublish.snapshotId === 'string'
+          ? parsed.pendingRestorePublish : null,
       };
     }
   } catch { /* */ }
@@ -382,7 +407,7 @@ let _inProgress = false;
 /** Merge a patch into the persisted state (never clobbers fields it doesn't name). */
 function updateState(patch: Partial<BackupState>): BackupState {
   const next: BackupState = { ...getBackupState(), ...patch, inProgress: false };
-  writeFileSync(getStatePath(), JSON.stringify(next, null, 2), 'utf8');
+  writeJsonAtomic(getStatePath(), next);
   return next;
 }
 
@@ -397,7 +422,7 @@ function sha256File(path: string): string | null {
 }
 
 /**
- * sha256 of the live vault.db file. SQLCipher writes committed changes straight
+ * sha256 of the live vault.db file. SQLite3MC writes committed changes straight
  * into the file (no WAL), so this changes exactly when data changes — the
  * basis for "does this PC have edits the other PC hasn't seen?".
  */
@@ -506,6 +531,8 @@ export interface CreateSnapshotResult {
   ok: boolean;
   snapshotId?: string;
   error?: string;
+  /** Saved on this PC, but the upload to Cloudflare R2 failed (it is retried by the sync loop). */
+  uploadError?: string;
   durationMs?: number;
   documentsCopied?: number;
   documentsReused?: number;
@@ -554,8 +581,8 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
     ensureDir(snapshotDir);
 
     // 1) DB snapshot via VACUUM INTO — consistent without closing.
-    //    SQLCipher carries the encryption key into the output file, so the
-    //    backup file is openable with the same master password.
+    //    SQLite3MC carries the cipher (chacha20) and key into the output file,
+    //    so the backup file is openable with the same master password.
     const db = getDb();
     db.pragma('wal_checkpoint(TRUNCATE)');
     const snapshotDbPath = join(snapshotDir, 'vault.db');
@@ -591,8 +618,8 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
       const src = getEncryptedDocumentPath(doc.file_uuid);
       const dst = join(blobsDir, `${doc.file_uuid}.enc`);
       if (!existsSync(src)) {
-        // Document file is missing on disk — skip, don't fail the whole backup.
-        continue;
+        if (existsSync(dst)) { reused += 1; continue; }
+        throw new Error(`Document ${doc.file_uuid} is missing. Backup aborted; existing backups are unchanged.`);
       }
       if (existsSync(dst)) {
         reused += 1;
@@ -644,13 +671,14 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
     let uploadError: string | null = null;
     if (config.target === 'r2') {
       const rep = await replicateR2(config);
-      if (!rep.ok) uploadError = `Saved on this PC; upload to Cloudflare R2 will retry (${rep.error}).`;
+      if (!rep.ok) uploadError = `Saved on this PC; the upload to Cloudflare R2 will retry (${rep.error}).`;
     }
     refreshMirror(config);
 
     const durationMs = Date.now() - startTs;
     updateState({
-      lastBackupAt: new Date().toISOString(),
+      // "Last upload" means it actually left this PC.
+      ...(uploadError ? {} : { lastBackupAt: new Date().toISOString() }),
       lastBackupError: null,
       lastSnapshotId: snapshotId,
       lastSyncedDbHash: getLocalDbHash(),
@@ -658,7 +686,10 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
       lastSyncError: uploadError,
       conflict: null,
     });
-    return { ok: true, snapshotId, durationMs, documentsCopied: copied, documentsReused: reused, dbBytes };
+    return {
+      ok: true, snapshotId, durationMs, documentsCopied: copied, documentsReused: reused, dbBytes,
+      ...(uploadError ? { uploadError } : {}),
+    };
   } catch (e: any) {
     const message = e?.message || String(e);
     // Best-effort cleanup of half-written snapshot dir
@@ -680,16 +711,24 @@ export function listSnapshots(sourceFolder?: string): SnapshotInfo[] {
   const folder = sourceFolder || getActiveRoot();
   if (!folder || !existsSync(getSnapshotsDir(folder))) return [];
 
-  const dirs = readdirSync(getSnapshotsDir(folder), { withFileTypes: true })
+  const entries: Array<{ id: string; manifestPath: string; location: 'local' | 'cloud' }> = readdirSync(getSnapshotsDir(folder), { withFileTypes: true })
     .filter(e => e.isDirectory())
-    .map(e => e.name);
+    .map(e => ({ id: e.name, manifestPath: join(getSnapshotsDir(folder), e.name, 'manifest.json'), location: 'local' as const }));
+  // R2 cache: also list snapshots that are in the bucket but not downloaded yet.
+  const cloudDir = remoteManifestDir(folder);
+  if (!sourceFolder && existsSync(cloudDir)) {
+    const known = new Set(entries.filter(e => existsSync(e.manifestPath)).map(e => e.id));
+    for (const f of readdirSync(cloudDir)) {
+      const id = f.replace(/\.json$/, '');
+      if (!known.has(id)) entries.push({ id, manifestPath: join(cloudDir, f), location: 'cloud' });
+    }
+  }
 
   const now = Date.now();
   const out: SnapshotInfo[] = [];
-  for (const id of dirs) {
+  for (const { id, manifestPath, location } of entries) {
     const ts = parseSnapshotIdTimestamp(id);
     if (!ts) continue;
-    const manifestPath = join(getSnapshotsDir(folder), id, 'manifest.json');
     if (!existsSync(manifestPath)) continue;
     let manifest: SnapshotManifest;
     try {
@@ -706,11 +745,15 @@ export function listSnapshots(sourceFolder?: string): SnapshotInfo[] {
       band: bandForAge(now - ts.getTime()),
       sourceHost: typeof manifest.sourceHost === 'string' ? manifest.sourceHost : null,
       appVersion: typeof manifest.appVersion === 'string' ? manifest.appVersion : null,
+      location,
+      isHead: false,
     });
   }
 
-  // Newest first
-  return out.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  // Newest first (by id — the id order is what sync uses to pick the head).
+  out.sort((a, b) => b.id.localeCompare(a.id));
+  if (out[0]) out[0].isHead = true;
+  return out;
 }
 
 // ── Retention ───────────────────────────────────────────────────────────────
@@ -794,8 +837,9 @@ function validateSnapshotDb(dbPath: string, rawKey: Buffer): { ok: true } | { ok
   let probe: Database.Database | null = null;
   try {
     probe = new Database(dbPath, { readonly: true });
+    // Same pragmas as openDb(): pin chacha20 before keying (see db/connection.ts).
+    probe.pragma("cipher='chacha20'");
     probe.pragma(`key = "x'${rawKey.toString('hex')}'"`);
-    probe.pragma('cipher_compatibility = 4');
     // Wrong key throws here; a truncated/corrupt file fails quick_check.
     const result = probe.pragma('quick_check', { simple: true }) as string;
     if (result !== 'ok') {
@@ -818,15 +862,15 @@ function validateSnapshotDb(dbPath: string, rawKey: Buffer): { ok: true } | { ok
  * cloud-sync setup. We keep the latest KEEP so a recent restore is still
  * recoverable, and delete the rest.
  */
-function pruneOldPreRestoreSidecars(dataDir: string, keep = 3): void {
+function pruneOldPreRestoreSidecars(dataDir: string, keep = 3, marker = '.pre-restore-'): void {
   try {
     const entries = readdirSync(dataDir, { withFileTypes: true })
-      .filter(e => e.isFile() && e.name.includes('.pre-restore-'))
+      .filter(e => e.isFile() && e.name.includes(marker))
       .map(e => e.name);
     // Group by the base file (e.g. "vault.db", "vault.meta.json").
     const groups = new Map<string, string[]>();
     for (const name of entries) {
-      const base = name.slice(0, name.indexOf('.pre-restore-'));
+      const base = name.slice(0, name.indexOf(marker));
       const list = groups.get(base) || [];
       list.push(name);
       groups.set(base, list);
@@ -844,6 +888,12 @@ function pruneOldPreRestoreSidecars(dataDir: string, keep = 3): void {
 export interface RestoreOptions {
   /** Restore from a different backup root (e.g. another machine's folder). */
   sourceFolder?: string;
+  /**
+   * Keep the replaced vault as a long-lived safety copy (conflict resolved as
+   * "use the other PC's data", or a password changed elsewhere). These are not
+   * rotated away by later automatic pulls.
+   */
+  safetyCopy?: boolean;
   /**
    * Key of the CURRENTLY open live vault. Lets us (a) skip the expensive
    * Argon2 derivation when the snapshot uses the same salt as the live vault —
@@ -875,8 +925,8 @@ function sameKdf(a: VaultMeta, b: VaultMeta): boolean {
 }
 
 const STILL_SYNCING_ERROR =
-  'This backup is still being copied by your cloud drive (the file is incomplete). ' +
-  'It will be picked up automatically once it has fully arrived.';
+  'This backup has not fully arrived yet (the file is incomplete). ' +
+  'It will be picked up automatically once it has.';
 
 export async function restoreSnapshot(
   snapshotId: string,
@@ -903,6 +953,16 @@ async function restoreSnapshotInner(
   const root = options.sourceFolder || getActiveRoot(config);
   if (!root) return { ok: false, error: 'No backup folder configured.' };
   if (!masterPassword) return { ok: false, error: 'Master password is required to restore.' };
+
+  // R2: an older snapshot this PC never downloaded — fetch it first.
+  if (!options.sourceFolder && config.target === 'r2' && config.r2
+    && !existsSync(join(getSnapshotsDir(root), snapshotId, 'manifest.json'))) {
+    try {
+      await fetchRemoteSnapshot(root, await openR2Store(config.r2), config.r2.prefix, snapshotId);
+    } catch (e: any) {
+      return { ok: false, error: `Could not download that backup from Cloudflare R2: ${e?.message || e}` };
+    }
+  }
 
   const snapshotDir = join(getSnapshotsDir(root), snapshotId);
   if (!existsSync(snapshotDir)) return { ok: false, error: 'Snapshot not found.' };
@@ -994,7 +1054,7 @@ async function restoreSnapshotInner(
     const blobsDir = getBlobsDir(root);
     for (const doc of manifest.documents) {
       const src = join(blobsDir, `${doc.file_uuid}.enc`);
-      if (!existsSync(src)) continue;
+      if (!existsSync(src)) throw new Error(`Document ${doc.file_uuid} is missing. Restore aborted; your existing vault is unchanged.`);
       const dst = join(dataDocsDir, `${doc.file_uuid}.enc`);
       if (!existsSync(dst) || statSync(dst).size !== statSync(src).size) {
         ensureDir(dirname(dst));
@@ -1014,8 +1074,9 @@ async function restoreSnapshotInner(
   const targetDbPath = getDbPath();
   const liveMetaPath = join(getDataDir(), 'vault.meta.json');
   const stamp = new Date().toISOString().replace(/:/g, '-');
-  const dbSidecar = `${targetDbPath}.pre-restore-${stamp}`;
-  const metaSidecar = `${liveMetaPath}.pre-restore-${stamp}`;
+  const tag = options.safetyCopy ? 'pre-conflict' : 'pre-restore';
+  const dbSidecar = `${targetDbPath}.${tag}-${stamp}`;
+  const metaSidecar = `${liveMetaPath}.${tag}-${stamp}`;
   const reopenLive = () => {
     if (options.liveKey) { try { openDb(options.liveKey); } catch { /* */ } }
   };
@@ -1041,6 +1102,15 @@ async function restoreSnapshotInner(
     if (hadLiveMeta) renameSync(liveMetaPath, metaSidecar);
     copyFileSync(snapshotMetaPath, liveMetaPath);
     openDb(snapshotMasterKey);
+    // Keychain persistence is part of recovery: if it fails, keep the old
+    // database rather than installing a vault whose fields cannot be opened.
+    if (fieldKey) {
+      const current = await readFieldKey();
+      if (!current || !current.equals(fieldKey)) {
+        await writeFieldKey(fieldKey);
+        clearFieldKeyCache();
+      }
+    }
   } catch (e: any) {
     // Roll back to exactly what we had.
     try { closeDb(); } catch { /* */ }
@@ -1054,17 +1124,7 @@ async function restoreSnapshotInner(
   }
   const dbBytes = statSync(targetDbPath).size;
   pruneOldPreRestoreSidecars(getDataDir());
-
-  // 5) Field key → OS keychain, only if it actually differs (first restore onto
-  //    a new PC). Drop the in-memory copy in field.ts too, or encrypted fields
-  //    in the restored vault would be decrypted with the old key.
-  if (fieldKey) {
-    const current = await readFieldKey().catch(() => null);
-    if (!current || !current.equals(fieldKey)) {
-      await writeFieldKey(fieldKey);
-      clearFieldKeyCache();
-    }
-  }
+  pruneOldPreRestoreSidecars(getDataDir(), 10, '.pre-conflict-');
 
   return {
     ok: true,
@@ -1170,8 +1230,8 @@ function pushDirty(state: BackupState, localHash: string | null): boolean {
 }
 
 const PENDING_MESSAGE =
-  'A newer backup from another PC is still arriving through your cloud drive. ' +
-  'It will be applied automatically once it has fully synced.';
+  'Another PC is uploading a newer backup right now. ' +
+  'It will be applied automatically once the upload finishes.';
 
 const PASSWORD_CHANGED_MESSAGE =
   'The master password was changed on another PC, so its newer backup can\'t be opened with this ' +
@@ -1179,8 +1239,9 @@ const PASSWORD_CHANGED_MESSAGE =
 
 type RootCheck = { root: string } | { skip: 'disabled' } | { skip: 'missing'; message: string };
 
-const r2UnreachableMessage = (error: string) =>
-  `Cloudflare R2 could not be reached (${error}). Your data is safe on this PC; sync resumes automatically.`;
+const r2UnreachableMessage = (error: string) => /HTTP \d{3}/.test(error)
+  ? `Cloudflare R2 refused the request (${error}). Check the R2 settings in Backup & Sync. Your data is safe on this PC.`
+  : `Cloudflare R2 could not be reached (${error}). Your data is safe on this PC; sync resumes automatically.`;
 
 /** Root check without network access (for status display). */
 function localSyncRoot(): RootCheck {
@@ -1205,7 +1266,7 @@ function localSyncRoot(): RootCheck {
  * first brings the local cache up to date with the bucket — unless a
  * snapshot/restore is running, in which case the caller backs off anyway.
  */
-async function syncRoot(): Promise<RootCheck> {
+async function syncRoot(opts: ReplicateOptions = {}): Promise<RootCheck> {
   const config = getBackupConfig();
   const root = getActiveRoot(config);
   if (!config.enabled || !root) return { skip: 'disabled' };
@@ -1213,12 +1274,42 @@ async function syncRoot(): Promise<RootCheck> {
   if (_inProgress) return { root };
   _inProgress = true;
   try {
-    const rep = await replicateR2(config);
+    const rep = await replicateR2(config, opts);
     if (!rep.ok) return { skip: 'missing', message: r2UnreachableMessage(rep.error) };
   } finally {
     _inProgress = false;
   }
   return { root };
+}
+
+// Set while the vault is locking / the app quitting: a sync pass that is still
+// running must not pull (swap the DB) or adopt keys after that point.
+let suspended = false;
+export function setSyncSuspended(value: boolean): void {
+  suspended = value;
+}
+
+/**
+ * Carry Gmail setup between PCs (see appSettings.ts). Needs the field key,
+ * which every PC of this vault has after its first restore. Never throws.
+ */
+async function syncSettings(root: string): Promise<void> {
+  try {
+    // Only once this PC shares the vault's history: a brand-new PC must take the
+    // vault (and its field key) from the backup before it can read or write these.
+    if (!getBackupState().lastSnapshotId) return;
+    // A vault with no encrypted fields yet has no field key — mint it now; the
+    // next snapshot carries it to the other PCs as field-key.bin.
+    const fieldKey = (await readFieldKey()) ?? await getOrCreateFieldKey();
+    const r = await syncGmailSettings(root, join(getDataDir(), SETTINGS_STATE_FILENAME), fieldKey, {
+      read: getGmailSyncPayload,
+      apply: applyGmailSyncPayload,
+    });
+    if (r === 'applied') console.log('[Sync] Gmail setup adopted from another PC');
+    else if (r === 'published') console.log('[Sync] Gmail setup saved to the backup for other PCs');
+  } catch (e: any) {
+    console.warn('[Sync] settings sync failed:', e?.message || e);
+  }
 }
 
 export interface SyncOutcome {
@@ -1254,9 +1345,11 @@ function recordConflict(decision: Extract<SyncDecision, { kind: 'conflict' }>, h
 async function applyFastForward(
   remoteSnapshotId: string,
   masterPassword: string,
-  liveKey: Buffer
+  liveKey: Buffer,
+  opts: { safetyCopy?: boolean } = {},
 ): Promise<SyncOutcome> {
-  const r = await restoreSnapshot(remoteSnapshotId, masterPassword, { liveKey });
+  if (suspended) return { action: 'none' };
+  const r = await restoreSnapshot(remoteSnapshotId, masterPassword, { liveKey, safetyCopy: opts.safetyCopy });
   if (!r.ok) {
     const stillSyncing = r.error === STILL_SYNCING_ERROR;
     const passwordChanged = r.error.startsWith('Master password does not match');
@@ -1278,6 +1371,9 @@ async function applyFastForward(
     lastSyncError: null,
     conflict: null,
   });
+  // A PC that only ever pulls would otherwise keep every snapshot it downloads.
+  const root = getActiveRoot();
+  if (root) { try { pruneOldSnapshots(root); garbageCollectBlobs(root); } catch { /* non-fatal */ } }
   return {
     action: 'pulled',
     newMasterKey: r.masterKey,
@@ -1296,7 +1392,10 @@ export async function syncOnUnlock(opts: {
   liveKey: Buffer;
   preOpenLocalHash: string | null;
 }): Promise<SyncOutcome> {
-  const ready = await syncRoot();
+  suspended = false;
+  // Unlock only needs the newest snapshot: one list + at most one download,
+  // short timeouts. Uploads, clean-up and history follow in the sync loop.
+  const ready = await syncRoot({ light: true, maxDownloads: 1 });
   if ('skip' in ready) {
     if (ready.skip === 'missing') updateState({ lastSyncError: ready.message });
     return { action: ready.skip === 'missing' ? 'error' : 'disabled', error: 'message' in ready ? ready.message : undefined };
@@ -1313,18 +1412,24 @@ export async function syncOnUnlock(opts: {
     updateState({ lastSyncedDbHash: opts.preOpenLocalHash });
   }
 
+  let outcome: SyncOutcome;
   switch (decision.kind) {
     case 'fast-forward':
-      return applyFastForward(decision.remoteSnapshotId, opts.masterPassword, opts.liveKey);
+      outcome = await applyFastForward(decision.remoteSnapshotId, opts.masterPassword, opts.liveKey);
+      break;
     case 'conflict':
-      return recordConflict(decision, head);
+      outcome = recordConflict(decision, head);
+      break;
     case 'pending':
       updateState({ lastSyncError: PENDING_MESSAGE });
-      return { action: 'pending' };
+      outcome = { action: 'pending' };
+      break;
     default:
       updateState({ lastSyncError: null, conflict: null });
-      return { action: 'none' };
+      outcome = { action: 'none' };
   }
+  await syncSettings(ready.root);
+  return outcome;
 }
 
 /**
@@ -1335,12 +1440,19 @@ export async function syncOnUnlock(opts: {
  * field key before touching anything, so a mistyped password changes nothing.
  */
 export async function tryUnlockFromNewerBackup(masterPassword: string): Promise<SyncOutcome | null> {
-  const ready = await syncRoot();
+  const ready = await syncRoot({ light: true, maxDownloads: 1 });
   if ('skip' in ready) return null;
   const state = getBackupState();
   const head = findHead(ready.root);
   if (head.kind !== 'ready' || head.id === state.lastSnapshotId) return null;
-  const r = await restoreSnapshot(head.id, masterPassword, {});
+  // Same salt + Argon2 params as this PC's vault → same key, so a password
+  // that failed here fails there too. Skip the 256 MB Argon2 run.
+  const live = getVaultMeta();
+  try {
+    const headMeta = JSON.parse(readFileSync(join(getSnapshotsDir(ready.root), head.id, 'vault.meta.json'), 'utf8')) as VaultMeta;
+    if (live && sameKdf(live, headMeta)) return null;
+  } catch { /* unreadable meta — let restoreSnapshot decide */ }
+  const r = await restoreSnapshot(head.id, masterPassword, { safetyCopy: true });
   if (!r.ok) return null;
   updateState({
     lastSnapshotId: head.id,
@@ -1371,6 +1483,7 @@ export async function syncTick(opts: {
   canPull: boolean;
   canPush: boolean;
 }): Promise<SyncOutcome> {
+  if (suspended) return { action: 'none' };
   const ready = await syncRoot();
   if ('skip' in ready) {
     if (ready.skip === 'missing' && getBackupState().lastSyncError !== ready.message) {
@@ -1378,7 +1491,16 @@ export async function syncTick(opts: {
     }
     return { action: ready.skip === 'missing' ? 'error' : 'disabled' };
   }
-  if (_inProgress) return { action: 'none' };
+  if (_inProgress || suspended) return { action: 'none' };
+  await syncSettings(ready.root);
+
+  // A manual restore whose publish failed earlier: finish it before anything
+  // else, or the next decision would see the restored data as a conflict.
+  const pending = getBackupState().pendingRestorePublish;
+  if (pending && opts.canPush) {
+    const pub = await publishRestoredVault(opts.liveKey, pending.snapshotId, pending.ancestors);
+    return pub.ok ? { action: 'pushed' } : { action: 'error', error: pub.error };
+  }
 
   const state = getBackupState();
   const localHash = getLocalDbHash();
@@ -1419,12 +1541,28 @@ export async function syncTick(opts: {
  * and record a conflict for the user to resolve at the next unlock.
  */
 export async function pushBeforeClose(masterKey: Buffer): Promise<SyncOutcome> {
+  const config = getBackupConfig();
+  if (!config.enabled || !getActiveRoot(config)) return { action: 'disabled' };
+  const before = getBackupState();
+  if (before.conflict) return { action: 'conflict', conflict: before.conflict };
+  // Nothing changed → nothing to do. No network on lock/quit in the common case.
+  if (!pushDirty(before, getLocalDbHash()) && !before.pendingRestorePublish) return { action: 'none' };
+
+  // Let a sync pass that is still running finish rather than skipping the push.
+  const deadline = Date.now() + 20_000;
+  while (_inProgress && Date.now() < deadline) await new Promise(r => setTimeout(r, 200));
+  if (_inProgress) return { action: 'error', error: 'A sync pass was still running; local changes will upload at the next unlock.' };
+
   const ready = await syncRoot();
   if ('skip' in ready) return { action: ready.skip === 'missing' ? 'error' : 'disabled' };
   if (_inProgress) return { action: 'none' };
 
   const state = getBackupState();
   if (state.conflict) return { action: 'conflict', conflict: state.conflict };
+  if (state.pendingRestorePublish) {
+    const pub = await publishRestoredVault(masterKey, state.pendingRestorePublish.snapshotId, state.pendingRestorePublish.ancestors);
+    return pub.ok ? { action: 'pushed' } : { action: 'error', error: pub.error };
+  }
   const head = findHead(ready.root);
   const dirty = pushDirty(state, getLocalDbHash());
   const decision = decideSync(state, head, dirty);
@@ -1469,7 +1607,7 @@ export async function resolveSyncConflict(
     return res.ok ? { action: 'pushed' } : { action: 'error', error: res.error };
   }
   if (head.kind === 'pending') return { action: 'pending', error: STILL_SYNCING_ERROR };
-  return applyFastForward(remoteId, opts.masterPassword, opts.liveKey);
+  return applyFastForward(remoteId, opts.masterPassword, opts.liveKey, { safetyCopy: true });
 }
 
 /**
@@ -1517,9 +1655,13 @@ export async function publishRestoredVault(masterKey: Buffer, restoredSnapshotId
     lastSnapshotId: restoredSnapshotId,
     lineage: [restoredSnapshotId, ...ancestors].slice(0, MAX_LINEAGE),
     conflict: null,
+    // Until this lands, the sync loop retries it instead of seeing a conflict.
+    pendingRestorePublish: { snapshotId: restoredSnapshotId, ancestors },
   });
   const supersedes = head.kind === 'ready' && head.id !== restoredSnapshotId ? [head.id] : [];
-  return createSnapshot(masterKey, { supersedes });
+  const res = await createSnapshot(masterKey, { supersedes });
+  if (res.ok) updateState({ pendingRestorePublish: null });
+  return res;
 }
 
 export interface SyncStatus {

@@ -61,20 +61,39 @@ function createWindow(): void {
 
   // Auto-lock on inactivity
   mainWindow.webContents.on('before-input-event', () => { markActivity(); });
+  let autoLocking = false;
   setInterval(async () => {
+    // A slow final upload must not let the next 30 s tick start a second lock.
+    if (autoLocking) return;
     if (shouldAutolock(Date.now(), hasOpenBrowserWindows())) {
-      // Flush any pending changes to the backup folder before locking — so
-      // even a short session ending in auto-lock leaves a snapshot for the
-      // other PC to pick up.
-      await flushBackupOnExit();
-      closeDb();
-      clearVaultSessionSecrets();
-      // Wipe Playwright profiles (session cookies for banks/brokers) so an
-      // attacker with disk access can't replay the auto-locked user's logins.
-      void purgeBrowserProfiles().catch(() => {});
-      mainWindow?.webContents.send('vault:locked');
+      autoLocking = true;
+      try {
+        // Flush any pending changes to the backup folder before locking — so
+        // even a short session ending in auto-lock leaves a snapshot for the
+        // other PC to pick up.
+        await flushBackupOnExit();
+        closeDb();
+        clearVaultSessionSecrets();
+        // Wipe Playwright profiles (session cookies for banks/brokers) so an
+        // attacker with disk access can't replay the auto-locked user's logins.
+        void purgeBrowserProfiles().catch(() => {});
+        mainWindow?.webContents.send('vault:locked');
+      } finally {
+        autoLocking = false;
+      }
     }
   }, 30_000);
+}
+
+// One instance only: a second copy would share vault.db and the backup cache
+// with a first one that may still be finishing its final upload.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    const win = BrowserWindow.getAllWindows()[0];
+    if (win) { if (win.isMinimized()) win.restore(); win.focus(); }
+  });
 }
 
 app.whenReady().then(() => {
@@ -101,7 +120,10 @@ let didFlushOnExit = false;
 app.on('before-quit', async (event) => {
   if (!didFlushOnExit) {
     event.preventDefault();
-    try { await flushBackupOnExit(); } catch { /* never block exit */ }
+    // Bounded: a stalled network must never keep an invisible process alive.
+    try {
+      await Promise.race([flushBackupOnExit(), new Promise(resolve => setTimeout(resolve, 45_000))]);
+    } catch { /* never block exit */ }
     didFlushOnExit = true;
     app.quit();
     return;

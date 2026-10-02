@@ -8,8 +8,11 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  replicate, copyBackupTree, emptyReplicationState, ORPHAN_BLOB_GRACE_MS, type ReplicationState,
+  replicate, copyBackupTree, emptyReplicationState, fetchRemoteSnapshot, latestSettingsFile, writeSettingsFile,
+  ORPHAN_BLOB_GRACE_MS, type ReplicationState,
 } from '../../src/main/backup/replicator';
+import { decideSettingsSync, syncGmailSettings } from '../../src/main/backup/appSettings';
+import { randomBytes } from 'node:crypto';
 import { normalizePrefix, parseListObjectsV2, testObjectStore, validateR2Settings, type ObjectStore, type StoredObject } from '../../src/main/backup/objectStore';
 
 class MemoryStore implements ObjectStore {
@@ -18,6 +21,8 @@ class MemoryStore implements ObjectStore {
   refuseDeletes = false;
   /** Bucket lock: refuse overwrites and deletes. */
   locked = false;
+  /** Refuse deletes only for keys containing this (e.g. a lock still holding snapshots). */
+  refuseDeletesMatching: string | null = null;
   now = Date.now();
   async list(prefix: string): Promise<StoredObject[]> {
     return [...this.objects].filter(([k]) => k.startsWith(prefix))
@@ -34,7 +39,9 @@ class MemoryStore implements ObjectStore {
     this.objects.set(key, { body: Buffer.from(body), lastModified: this.now });
   }
   async delete(key: string): Promise<void> {
-    if (this.refuseDeletes || this.locked) throw new Error('403 ObjectLocked');
+    if (this.refuseDeletes || this.locked || (this.refuseDeletesMatching && key.includes(this.refuseDeletesMatching))) {
+      throw new Error('403 ObjectLocked');
+    }
     this.log.push(`delete ${key}`);
     this.objects.delete(key);
   }
@@ -94,6 +101,21 @@ afterEach(() => {
 });
 
 describe('backup/replicator', () => {
+  it('does not publish a snapshot whose document is missing locally and remotely', async () => {
+    writeSnapshot(pcA, S1, ['doc-1']);
+    rmSync(join(pcA, 'blobs', 'doc-1.enc'));
+    await expect(passA()).rejects.toThrow(/document.*missing/i);
+    expect(store.objects.has(`${P}/snapshots/${S1}/manifest.json`)).toBe(false);
+  });
+
+  it('does not mark a downloaded snapshot complete when a remote document is missing', async () => {
+    writeSnapshot(pcA, S1, ['doc-1']);
+    await passA();
+    store.objects.delete(`${P}/blobs/doc-1.enc`);
+    await expect(passB()).rejects.toThrow(/document.*missing/i);
+    expect(existsSync(join(pcB, 'snapshots', S1, 'manifest.json'))).toBe(false);
+  });
+
   it('uploads blobs first and the manifest last', async () => {
     writeSnapshot(pcA, S1, ['doc-1']);
     const r = await passA();
@@ -221,6 +243,138 @@ describe('backup/replicator', () => {
     await passA(store.now + ORPHAN_BLOB_GRACE_MS + 1000);
     expect(store.objects.has(`${P}/blobs/doc.enc`)).toBe(true);
     expect(stA.orphanBlobsSince).toEqual({});
+  });
+});
+
+describe('backup/replicator — audit fixes', () => {
+  const ids = ['2026-09-01T01-00-00.000Z', '2026-09-01T02-00-00.000Z', '2026-09-01T03-00-00.000Z',
+    '2026-09-01T04-00-00.000Z', '2026-09-01T05-00-00.000Z'];
+
+  it('downloads newest first, a few per pass, so the first pass is quick', async () => {
+    for (const id of ids) writeSnapshot(pcA, id);
+    await passA();
+    const r = await replicate(pcB, store, P, stB, store.now, { maxDownloads: 2 });
+    stB = r.state;
+    expect(r.downloadedSnapshots).toEqual([ids[4], ids[3]]);
+    expect(r.moreToDownload).toBe(true);
+    const r2 = await passB();
+    expect(r2.downloadedSnapshots).toEqual([ids[2], ids[1], ids[0]]);
+    expect(r2.moreToDownload).toBe(false);
+  });
+
+  it('light (unlock) mode fetches only the newest and never uploads or deletes', async () => {
+    for (const id of ids) writeSnapshot(pcA, id);
+    await passA();
+    writeSnapshot(pcB, '2026-08-01T00-00-00.000Z'); // local-only, would normally upload
+    store.log = [];
+    const r = await replicate(pcB, store, P, stB, store.now, { light: true, maxDownloads: 1 });
+    expect(r.downloadedSnapshots).toEqual([ids[4]]);
+    expect(r.uploadedSnapshots).toEqual([]);
+    expect(store.log.filter(l => l.startsWith('put') || l.startsWith('delete'))).toEqual([]);
+  });
+
+  it('keeps documents still referenced by snapshots this PC never downloaded', async () => {
+    // PC A has an old snapshot with a document; PC B only ever fetched the newest one.
+    writeSnapshot(pcA, ids[0], ['old-doc']);
+    writeSnapshot(pcA, ids[1], []);
+    await passA();
+    await replicate(pcB, store, P, stB, store.now, { maxDownloads: 1 }).then(r => { stB = r.state; });
+    expect(existsSync(join(pcB, 'snapshots', ids[0]))).toBe(false);
+    // Long after the grace period, B's clean-up must still see the remote reference.
+    await passB(store.now + ORPHAN_BLOB_GRACE_MS * 3);
+    expect(store.objects.has(`${P}/blobs/old-doc.enc`)).toBe(true);
+  });
+
+  it('keeps documents of pruned snapshots that a bucket lock still holds', async () => {
+    writeSnapshot(pcA, ids[0], ['locked-doc']);
+    writeSnapshot(pcA, ids[1], []);
+    await passA();
+    store.refuseDeletesMatching = '/snapshots/'; // the lock still holds the snapshot, not the older blob
+    rmSync(join(pcA, 'snapshots', ids[0]), { recursive: true });
+    for (let i = 0; i <= 4; i++) await passA(store.now + i * ORPHAN_BLOB_GRACE_MS);
+    expect(store.objects.has(`${P}/snapshots/${ids[0]}/vault.db`)).toBe(true);
+    expect(store.objects.has(`${P}/blobs/locked-doc.enc`)).toBe(true);
+  });
+
+  it('retries a refused delete at most every few hours (no retry storm)', async () => {
+    writeSnapshot(pcA, ids[0], ['gone']);
+    writeSnapshot(pcA, ids[1], []);
+    await passA();
+    rmSync(join(pcA, 'snapshots', ids[0]), { recursive: true });
+    await passA();                            // snapshot delete goes through
+    store.refuseDeletes = true;
+    const t = store.now + ORPHAN_BLOB_GRACE_MS * 2;
+    await passA(t);                           // first orphan check
+    await passA(t + ORPHAN_BLOB_GRACE_MS + 1); // first delete attempt (refused)
+    const refused = store.log.length;
+    for (let i = 1; i <= 5; i++) await passA(t + ORPHAN_BLOB_GRACE_MS + 1 + i * 30_000);
+    expect(store.log.length).toBe(refused); // no further attempts within the back-off
+  });
+
+  it('fetches an older snapshot on demand (restore from R2)', async () => {
+    for (const id of ids) writeSnapshot(pcA, id, [`doc-${id.slice(11, 13)}`]);
+    await passA();
+    await fetchRemoteSnapshot(pcB, store, P, ids[0]);
+    expect(readFileSync(join(pcB, 'snapshots', ids[0], 'vault.db'), 'utf8')).toBe(`db-${ids[0]}`);
+    expect(existsSync(join(pcB, 'blobs', 'doc-01.enc'))).toBe(true);
+  });
+
+  it('syncs settings files: newest wins, never overwritten, a few versions kept', async () => {
+    writeSettingsFile(pcA, 'gmail', Buffer.from('v1'), 1_000_000_000_000);
+    await passA();
+    await passB();
+    expect(readFileSync(latestSettingsFile(pcB, 'gmail')!.path, 'utf8')).toBe('v1');
+    store.locked = true; // bucket lock: new versions are new keys, so this still works
+    for (let i = 2; i <= 5; i++) { writeSettingsFile(pcB, 'gmail', Buffer.from(`v${i}`), 1_000_000_000_000 + i); await passB(); }
+    await passA();
+    expect(readFileSync(latestSettingsFile(pcA, 'gmail')!.path, 'utf8')).toBe('v5');
+    expect(readdirSync(join(pcB, 'settings')).length).toBeLessThanOrEqual(3);
+  });
+});
+
+describe('backup/appSettings — Gmail setup between PCs', () => {
+  const fieldKey = randomBytes(32);
+  type G = { credentialsJson: string; refreshToken: string | null; connectedAt: string | null };
+  function fakeGmail(initial: G | null) {
+    let cur = initial;
+    return { get: () => cur, access: { read: async () => cur, apply: async (p: G | null) => { cur = p; } } };
+  }
+
+  it('decision rules', () => {
+    expect(decideSettingsSync(undefined, null, { atMs: 5, fp: 'r' }, 10).kind).toBe('apply');     // new PC adopts
+    expect(decideSettingsSync(undefined, 'l', null, 10).kind).toBe('publish');                   // first PC shares
+    expect(decideSettingsSync(undefined, 'l', { atMs: 5, fp: 'r' }, 10).kind).toBe('none');      // keeps its own
+    expect(decideSettingsSync({ fp: 'a', atMs: 5 }, 'b', { atMs: 5, fp: 'a' }, 10).kind).toBe('publish'); // changed here
+    expect(decideSettingsSync({ fp: 'a', atMs: 5 }, 'a', { atMs: 9, fp: 'c' }, 10).kind).toBe('apply');   // newer there
+    expect(decideSettingsSync({ fp: 'a', atMs: 9 }, 'a', { atMs: 9, fp: 'a' }, 10).kind).toBe('none');
+  });
+
+  it('a new PC gets the Gmail setup; a re-sign-in on it flows back', async () => {
+    const stateA = join(tmp('sa'), 's.json');
+    const stateB = join(tmp('sb'), 's.json');
+    const gA = fakeGmail({ credentialsJson: '{"installed":{}}', refreshToken: 'tok-1', connectedAt: '2026-10-01' });
+    const gB = fakeGmail(null);
+    expect(await syncGmailSettings(pcA, stateA, fieldKey, gA.access, 1_000)).toBe('published');
+    await passA(); await passB();
+    expect(await syncGmailSettings(pcB, stateB, fieldKey, gB.access, 2_000)).toBe('applied');
+    expect(gB.get()?.refreshToken).toBe('tok-1');
+    // Nothing changed → nothing happens on either side.
+    expect(await syncGmailSettings(pcB, stateB, fieldKey, gB.access, 3_000)).toBe('none');
+    expect(await syncGmailSettings(pcA, stateA, fieldKey, gA.access, 3_000)).toBe('none');
+    // Signing in again on B (e.g. after Google expired the token) reaches A.
+    await gB.access.apply({ credentialsJson: '{"installed":{}}', refreshToken: 'tok-2', connectedAt: '2026-10-08' });
+    expect(await syncGmailSettings(pcB, stateB, fieldKey, gB.access, 4_000)).toBe('published');
+    await passB(); await passA();
+    expect(await syncGmailSettings(pcA, stateA, fieldKey, gA.access, 5_000)).toBe('applied');
+    expect(gA.get()?.refreshToken).toBe('tok-2');
+  });
+
+  it('ignores settings encrypted for a different vault', async () => {
+    const gA = fakeGmail({ credentialsJson: '{}', refreshToken: 'x', connectedAt: null });
+    await syncGmailSettings(pcA, join(tmp('s1'), 's.json'), fieldKey, gA.access, 1_000);
+    const gOther = fakeGmail(null);
+    expect(await syncGmailSettings(pcA, join(tmp('s2'), 's.json'), randomBytes(32), gOther.access, 2_000)).toBe('none');
+    expect(gOther.get()).toBeNull();
   });
 });
 

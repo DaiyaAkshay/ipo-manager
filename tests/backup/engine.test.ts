@@ -11,8 +11,10 @@
  * that regression.
  */
 
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { describe, expect, it, beforeAll, beforeEach, afterEach, vi } from 'vitest';
+import { randomBytes } from 'node:crypto';
+import keytar from 'keytar';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -41,14 +43,24 @@ let dataDirA: string;
 let dataDirB: string;
 let backupDir: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   dataDirA = mkdtempSync(join(tmpdir(), 'ipo-backup-A-'));
   dataDirB = mkdtempSync(join(tmpdir(), 'ipo-backup-B-'));
   backupDir = mkdtempSync(join(tmpdir(), 'ipo-backup-shared-'));
   process.env.IPO_DATA_DIR = dataDirA;
+  if (canLoadSqlite) {
+    const { clearKeyCache, getOrCreateFieldKey } = await import('../../src/main/crypto/field');
+    clearKeyCache();
+    await getOrCreateFieldKey();
+  }
 });
 
-afterEach(() => {
+afterEach(async () => {
+  vi.restoreAllMocks();
+  if (canLoadSqlite) {
+    const { closeDb } = await import('../../src/main/db/connection');
+    closeDb();
+  }
   for (const d of [dataDirA, dataDirB, backupDir]) {
     if (d && existsSync(d)) rmSync(d, { recursive: true, force: true });
   }
@@ -56,6 +68,9 @@ afterEach(() => {
 });
 
 describeIfDb('backup/engine', () => {
+  // Load the Gmail/Google dependency graph outside timed recovery operations.
+  // A cold Windows import can take longer than an actual backup or restore.
+  beforeAll(async () => { await import('../../src/main/backup/engine'); }, 60_000);
   it('creates a snapshot with vault.db + vault.meta.json + manifest', async () => {
     // ── Machine A: set up vault ──────────────────────────────────────────
     const { deriveMasterKey } = await import('../../src/main/crypto/master');
@@ -174,5 +189,56 @@ describeIfDb('backup/engine', () => {
     const r = await createSnapshot(k);
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/not configured/i);
+  });
+
+  it('refuses a restore with a missing document before changing the live vault', async () => {
+    const { deriveMasterKey } = await import('../../src/main/crypto/master');
+    const { openDb, getDb, getDbPath } = await import('../../src/main/db/connection');
+    const { setBackupConfig, createSnapshot, restoreSnapshot } = await import('../../src/main/backup/engine');
+    const password = 'Tr0pic@l-Mango-Whirl-Strong';
+    const key = await deriveMasterKey(password);
+    openDb(key);
+    getDb().prepare('INSERT INTO families (family_name) VALUES (?)').run('Keep this family');
+    setBackupConfig({ enabled: true, folder: backupDir });
+    const snapshot = await createSnapshot(key);
+    expect(snapshot.ok).toBe(true);
+    const manifestPath = join(backupDir, 'snapshots', snapshot.snapshotId!, 'manifest.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    manifest.documents.push({ file_uuid: 'missing-doc', original_name: 'synthetic.pdf', sha256: '', file_size: 1 });
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    const before = readFileSync(getDbPath());
+    const result = await restoreSnapshot(snapshot.snapshotId!, password, { liveKey: key });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/document.*missing/i);
+    expect(readFileSync(getDbPath()).equals(before)).toBe(true);
+    expect(getDb().prepare('SELECT family_name FROM families').all()).toEqual([{ family_name: 'Keep this family' }]);
+  });
+
+  it('rolls back the live vault when the restored field key cannot be saved', async () => {
+    const { deriveMasterKey } = await import('../../src/main/crypto/master');
+    const { openDb, closeDb, getDb } = await import('../../src/main/db/connection');
+    const { setBackupConfig, createSnapshot, restoreSnapshot } = await import('../../src/main/backup/engine');
+    const password = 'Tr0pic@l-Mango-Whirl-Strong';
+    const keyA = await deriveMasterKey(password);
+    openDb(keyA);
+    setBackupConfig({ enabled: true, folder: backupDir });
+    const snapshot = await createSnapshot(keyA);
+    expect(snapshot.ok).toBe(true);
+    closeDb();
+
+    process.env.IPO_DATA_DIR = dataDirB;
+    const keyB = await deriveMasterKey(password);
+    openDb(keyB);
+    getDb().prepare('INSERT INTO families (family_name) VALUES (?)').run('Keep PC B');
+    setBackupConfig({ enabled: true, folder: backupDir });
+    const fieldKeyB = randomBytes(32).toString('hex');
+    await keytar.setPassword('ipo-manager', 'field-encryption-key-v1', fieldKeyB);
+    vi.spyOn(keytar, 'setPassword').mockRejectedValueOnce(new Error('Credential Manager unavailable'));
+
+    const result = await restoreSnapshot(snapshot.snapshotId!, password, { liveKey: keyB });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/rolled back.*Credential Manager unavailable/i);
+    expect(getDb().prepare('SELECT family_name FROM families').all()).toEqual([{ family_name: 'Keep PC B' }]);
+    expect(await keytar.getPassword('ipo-manager', 'field-encryption-key-v1')).toBe(fieldKeyB);
   });
 });

@@ -47,6 +47,12 @@ const PARTIAL_CLEANUP_MS = 24 * 3_600_000;
 export const ORPHAN_BLOB_GRACE_MS = 24 * 3_600_000;
 /** How often to retry a delete the bucket refused (e.g. bucket lock). */
 const TOMBSTONE_RETRY_MS = 6 * 3_600_000;
+/** Snapshot downloads per pass, newest first — keeps each pass short so user actions never wait long. */
+export const DEFAULT_MAX_DOWNLOADS = 3;
+/** Encrypted settings bundles (e.g. Gmail): settings/<name>-<13-digit ms>.enc, never overwritten. */
+export const SETTINGS_RE = /^([a-z0-9-]+)-(\d{13})\.enc$/;
+/** Settings versions kept per name. */
+const SETTINGS_KEEP = 3;
 
 export interface ReplicationState {
   /** Snapshot ids both sides had, as of the last pass. */
@@ -55,10 +61,22 @@ export interface ReplicationState {
   tombstones: Record<string, number>;
   /** Remote blob → when it was first seen unreferenced. */
   orphanBlobsSince: Record<string, number>;
+  /** Object key → last delete attempt, so a bucket lock never causes a retry storm. */
+  deleteAttempts: Record<string, number>;
 }
 
 export function emptyReplicationState(): ReplicationState {
-  return { synced: [], tombstones: {}, orphanBlobsSince: {} };
+  return { synced: [], tombstones: {}, orphanBlobsSince: {}, deleteAttempts: {} };
+}
+
+export interface ReplicateOptions {
+  /** Max snapshots to download this pass (newest first). Default DEFAULT_MAX_DOWNLOADS. */
+  maxDownloads?: number;
+  /**
+   * Unlock mode: only fetch what's needed to see the newest snapshot — no
+   * uploads, no deletes, no clean-up. The next normal pass does the rest.
+   */
+  light?: boolean;
 }
 
 export interface ReplicationReport {
@@ -71,6 +89,8 @@ export interface ReplicationReport {
   downloadedBlobs: number;
   /** Non-fatal problems (e.g. a delete refused by a bucket lock). */
   warnings: string[];
+  /** Older remote snapshots still to fetch (they come in later passes). */
+  moreToDownload: boolean;
 }
 
 // ── Local helpers ───────────────────────────────────────────────────────────
@@ -115,23 +135,35 @@ function localManifestPath(root: string, id: string): string {
   return join(root, 'snapshots', id, MANIFEST);
 }
 
+/** Manifests of remote snapshots not (yet) downloaded — for blob GC and the restore list. */
+export function remoteManifestDir(root: string): string {
+  return join(root, 'remote-manifests');
+}
+
+function settingsDir(root: string): string {
+  return join(root, 'settings');
+}
+
 // ── Remote listing ──────────────────────────────────────────────────────────
 
 interface RemoteView {
   snapshots: Map<string, Map<string, StoredObject>>;
   blobs: Map<string, StoredObject>;
   meta: StoredObject | null;
+  settings: Map<string, StoredObject>;
 }
 
 function groupRemote(objects: StoredObject[], prefix: string): RemoteView {
-  const view: RemoteView = { snapshots: new Map(), blobs: new Map(), meta: null };
+  const view: RemoteView = { snapshots: new Map(), blobs: new Map(), meta: null, settings: new Map() };
   const base = `${prefix}/`;
   for (const o of objects) {
     if (!o.key.startsWith(base)) continue;
     const rel = o.key.slice(base.length);
     if (rel === META) { view.meta = o; continue; }
     const parts = rel.split('/');
-    if (parts.length === 2 && parts[0] === 'blobs' && BLOB_RE.test(parts[1])) {
+    if (parts.length === 2 && parts[0] === 'settings' && SETTINGS_RE.test(parts[1])) {
+      view.settings.set(parts[1], o);
+    } else if (parts.length === 2 && parts[0] === 'blobs' && BLOB_RE.test(parts[1])) {
       view.blobs.set(parts[1].replace(/\.enc$/, ''), o);
     } else if (parts.length === 3 && parts[0] === 'snapshots' && SNAPSHOT_ID_RE.test(parts[1]) && SNAPSHOT_FILE_RE.test(parts[2])) {
       const files = view.snapshots.get(parts[1]) || new Map<string, StoredObject>();
@@ -155,15 +187,35 @@ export async function replicate(
   prefix: string,
   prev: ReplicationState,
   nowMs: number = Date.now(),
+  opts: ReplicateOptions = {},
 ): Promise<ReplicationReport> {
   ensureDir(join(root, 'snapshots'));
   ensureDir(join(root, 'blobs'));
+  const light = !!opts.light;
+  const maxDownloads = Math.max(1, opts.maxDownloads ?? DEFAULT_MAX_DOWNLOADS);
   const report: ReplicationReport = {
-    state: { synced: [], tombstones: { ...prev.tombstones }, orphanBlobsSince: { ...prev.orphanBlobsSince } },
+    state: {
+      synced: [], tombstones: { ...prev.tombstones }, orphanBlobsSince: { ...prev.orphanBlobsSince },
+      deleteAttempts: { ...(prev.deleteAttempts || {}) },
+    },
     uploadedSnapshots: [], downloadedSnapshots: [], deletedRemote: [], deletedLocal: [],
-    uploadedBlobs: 0, downloadedBlobs: 0, warnings: [],
+    uploadedBlobs: 0, downloadedBlobs: 0, warnings: [], moreToDownload: false,
   };
   const tombstones = report.state.tombstones;
+  const attempts = report.state.deleteAttempts;
+  /** Throttled delete: at most one attempt per key per TOMBSTONE_RETRY_MS. */
+  const tryDelete = async (key: string, what: string): Promise<boolean> => {
+    if (nowMs - (attempts[key] ?? 0) < TOMBSTONE_RETRY_MS) return false;
+    attempts[key] = nowMs;
+    try {
+      await store.delete(key);
+      delete attempts[key];
+      return true;
+    } catch (e: any) {
+      report.warnings.push(`Could not delete ${what} from the bucket (a bucket lock keeps it until it expires): ${e?.message || e}`);
+      return false;
+    }
+  };
   const synced = new Set(prev.synced);
 
   const remote = groupRemote(await store.list(`${prefix}/`), prefix);
@@ -194,11 +246,12 @@ export async function replicate(
 
   // 1) Snapshots this PC pruned (known on both sides, now gone locally), plus
   //    earlier prunes whose delete the bucket refused.
-  for (const id of synced) {
+  if (!light) for (const id of synced) {
     if (!local.has(id) && remote.snapshots.has(id)) tombstones[id] = 0;
   }
   for (const [id, lastTry] of Object.entries(tombstones)) {
     if (!remote.snapshots.has(id)) { delete tombstones[id]; continue; }
+    if (light) continue;
     if (nowMs - lastTry < TOMBSTONE_RETRY_MS) continue;
     tombstones[id] = nowMs;
     if (await deleteRemoteSnapshot(id)) {
@@ -211,7 +264,7 @@ export async function replicate(
   //    Never act on an empty-looking bucket — that's a wrong prefix or a
   //    wiped bucket, not a prune (retention always keeps the newest).
   const remoteNow = remoteComplete();
-  if (remoteNow.size > 0) {
+  if (remoteNow.size > 0 && !light) {
     for (const id of synced) {
       if (remote.snapshots.has(id) || !local.get(id)?.complete) continue;
       try { rmSync(join(root, 'snapshots', id), { recursive: true, force: true }); report.deletedLocal.push(id); } catch { /* */ }
@@ -219,32 +272,16 @@ export async function replicate(
     local = localSnapshots(root);
   }
 
-  // 3) Download complete remote snapshots this PC doesn't have: blobs, then
-  //    the snapshot files, then the manifest.
-  for (const id of [...remoteComplete()].sort()) {
-    if (local.get(id)?.complete || id in tombstones) continue;
-    const files = remote.snapshots.get(id)!;
-    const dir = join(root, 'snapshots', id);
-    ensureDir(dir);
-    const manifestBody = await store.get(snapKey(id, MANIFEST));
-    const tmpManifest = join(dir, `${MANIFEST}.part`);
-    writeFileSync(tmpManifest, manifestBody);
-    for (const uuid of readManifestDocs(tmpManifest)) {
-      const dst = localBlob(uuid);
-      const obj = remote.blobs.get(uuid);
-      if (!obj || (existsSync(dst) && statSync(dst).size === obj.size)) continue;
-      writeAtomic(dst, await store.get(blobKey(uuid)));
-      report.downloadedBlobs += 1;
-    }
-    for (const [file, obj] of files) {
-      if (file === MANIFEST) continue;
-      const body = await store.get(snapKey(id, file));
-      if (body.length !== obj.size) throw new Error(`Download of ${id}/${file} was incomplete.`);
-      writeAtomic(join(dir, file), body);
-    }
-    renameSync(tmpManifest, join(dir, MANIFEST));
+  // 3) Download complete remote snapshots this PC doesn't have, NEWEST first
+  //    and a few per pass (the newest is what sync needs; history follows):
+  //    blobs, then the snapshot files, then the manifest.
+  const wanted = [...remoteComplete()].sort().reverse()
+    .filter(id => !local.get(id)?.complete && !(id in tombstones));
+  for (const id of wanted.slice(0, maxDownloads)) {
+    report.downloadedBlobs += await downloadSnapshot(root, store, prefix, id, remote.snapshots.get(id)!, remote.blobs);
     report.downloadedSnapshots.push(id);
   }
+  report.moreToDownload = wanted.length > maxDownloads;
 
   // 4) Another PC's upload in progress: mirror it as an empty folder so the
   //    engine reports "pending" instead of building on an older snapshot.
@@ -257,8 +294,11 @@ export async function replicate(
     if (age < ABANDONED_UPLOAD_MS) {
       uploading.add(id);
       ensureDir(join(root, 'snapshots', id));
-    } else if (age > PARTIAL_CLEANUP_MS && !local.get(id)?.complete) {
-      await deleteRemoteSnapshot(id);
+    } else if (age > PARTIAL_CLEANUP_MS && !local.get(id)?.complete && !light) {
+      for (const f of [...files.keys()]) {
+        if (await tryDelete(snapKey(id, f), `an abandoned upload (${id})`)) files.delete(f);
+      }
+      if (files.size === 0) remote.snapshots.delete(id);
     }
   }
   local = localSnapshots(root);
@@ -274,10 +314,13 @@ export async function replicate(
   local = localSnapshots(root);
   const remoteDone = remoteComplete();
   for (const snap of [...local.values()].sort((a, b) => a.id.localeCompare(b.id))) {
-    if (!snap.complete || remoteDone.has(snap.id)) continue;
+    if (light || !snap.complete || remoteDone.has(snap.id)) continue;
     for (const uuid of readManifestDocs(localManifestPath(root, snap.id))) {
       const src = localBlob(uuid);
-      if (!existsSync(src)) continue;
+      if (!existsSync(src)) {
+        if (remote.blobs.has(uuid)) continue;
+        throw new Error(`Backup document ${uuid} is missing; the snapshot was not published.`);
+      }
       const size = statSync(src).size;
       if (remote.blobs.get(uuid)?.size === size) continue;
       await store.put(blobKey(uuid), readFileSync(src));
@@ -303,28 +346,47 @@ export async function replicate(
 
   // 6) Root meta.json, either direction.
   const localMeta = join(root, META);
-  if (!remote.meta && existsSync(localMeta)) await store.put(`${prefix}/${META}`, readFileSync(localMeta));
+  if (!remote.meta && existsSync(localMeta) && !light) await store.put(`${prefix}/${META}`, readFileSync(localMeta));
   else if (remote.meta && !existsSync(localMeta)) writeAtomic(localMeta, await store.get(`${prefix}/${META}`));
 
-  // 7) Remote blobs no complete snapshot references — deleted after a grace
-  //    period, so a blob another PC is about to reference again survives.
-  local = localSnapshots(root);
-  const completeLocal = [...local.values()].filter(s => s.complete);
-  if (completeLocal.length > 0) {
+  // 7) Settings bundles (encrypted elsewhere; opaque here). Each version is a
+  //    new key, so a bucket lock never refuses them: fetch what's missing,
+  //    upload ours, keep the newest few of each name.
+  await syncSettings(root, store, prefix, remote.settings, light, tryDelete);
+
+  // 8) Remote blobs that NO remote snapshot references — including snapshots
+  //    this PC never downloaded, or pruned while a bucket lock still keeps
+  //    them — are deleted after a grace period.
+  if (!light) {
+    local = localSnapshots(root);
+    const completeLocal = [...local.values()].filter(s => s.complete);
+    const remoteIds = remoteComplete();
+    const manDir = remoteManifestDir(root);
+    ensureDir(manDir);
     const referenced = new Set<string>();
+    let allKnown = completeLocal.length > 0;
     for (const s of completeLocal) for (const u of readManifestDocs(localManifestPath(root, s.id))) referenced.add(u);
+    for (const id of remoteIds) {
+      if (local.get(id)?.complete) continue;
+      const cached = join(manDir, `${id}.json`);
+      if (!existsSync(cached)) {
+        try { writeAtomic(cached, await store.get(snapKey(id, MANIFEST))); } catch { allKnown = false; continue; }
+      }
+      for (const u of readManifestDocs(cached)) referenced.add(u);
+    }
+    for (const f of readdirSync(manDir)) {
+      const id = f.replace(/\.json$/, '');
+      if (!remoteIds.has(id) || local.get(id)?.complete) { try { unlinkSync(join(manDir, f)); } catch { /* */ } }
+    }
     const orphans = report.state.orphanBlobsSince;
     for (const uuid of Object.keys(orphans)) if (referenced.has(uuid) || !remote.blobs.has(uuid)) delete orphans[uuid];
-    for (const uuid of remote.blobs.keys()) {
-      if (referenced.has(uuid)) continue;
-      orphans[uuid] ??= nowMs;
-      if (nowMs - orphans[uuid] < ORPHAN_BLOB_GRACE_MS) continue;
-      try {
-        await store.delete(blobKey(uuid));
-        delete orphans[uuid];
-      } catch (e: any) {
-        report.warnings.push(`Could not delete an unused document from the bucket: ${e?.message || e}`);
-        break;
+    // Only when every remote manifest could be read — otherwise we can't know what's unreferenced.
+    if (allKnown) {
+      for (const uuid of remote.blobs.keys()) {
+        if (referenced.has(uuid)) continue;
+        orphans[uuid] ??= nowMs;
+        if (nowMs - orphans[uuid] < ORPHAN_BLOB_GRACE_MS) continue;
+        if (await tryDelete(blobKey(uuid), 'an unused document')) delete orphans[uuid];
       }
     }
   }
@@ -336,6 +398,114 @@ export async function replicate(
     .map(s => s.id)
     .sort();
   return report;
+}
+
+/** Fetch one complete remote snapshot into `root` (blobs, files, manifest last). Returns blobs downloaded. */
+async function downloadSnapshot(
+  root: string, store: ObjectStore, prefix: string, id: string,
+  files: Map<string, StoredObject>, blobs: Map<string, StoredObject>,
+): Promise<number> {
+  const dir = join(root, 'snapshots', id);
+  ensureDir(dir);
+  const tmpManifest = join(dir, `${MANIFEST}.part`);
+  writeFileSync(tmpManifest, await store.get(`${prefix}/snapshots/${id}/${MANIFEST}`));
+  let n = 0;
+  for (const uuid of readManifestDocs(tmpManifest)) {
+    const dst = join(root, 'blobs', `${uuid}.enc`);
+    const obj = blobs.get(uuid);
+    if (!obj) throw new Error(`Backup document ${uuid} is missing from the bucket.`);
+    if (existsSync(dst) && statSync(dst).size === obj.size) continue;
+    const body = await store.get(`${prefix}/blobs/${uuid}.enc`);
+    if (body.length !== obj.size) throw new Error(`Download of document ${uuid} was incomplete.`);
+    writeAtomic(dst, body);
+    n += 1;
+  }
+  for (const [file, obj] of files) {
+    if (file === MANIFEST) continue;
+    const body = await store.get(`${prefix}/snapshots/${id}/${file}`);
+    if (body.length !== obj.size) throw new Error(`Download of ${id}/${file} was incomplete.`);
+    writeAtomic(join(dir, file), body);
+  }
+  renameSync(tmpManifest, join(dir, MANIFEST));
+  return n;
+}
+
+/**
+ * Download one specific remote snapshot (e.g. an older one picked in the
+ * Restore dialog that this PC never fetched). No-op if it's already local.
+ */
+export async function fetchRemoteSnapshot(root: string, store: ObjectStore, prefix: string, id: string): Promise<void> {
+  if (!SNAPSHOT_ID_RE.test(id)) throw new Error('Bad snapshot id.');
+  if (existsSync(localManifestPath(root, id))) return;
+  const remote = groupRemote(await store.list(`${prefix}/`), prefix);
+  const files = remote.snapshots.get(id);
+  if (!files?.has(MANIFEST)) throw new Error('That backup is no longer in the bucket.');
+  ensureDir(join(root, 'blobs'));
+  await downloadSnapshot(root, store, prefix, id, files, remote.blobs);
+}
+
+/** Newest local settings file for `name` (e.g. "gmail"), or null. */
+export function latestSettingsFile(root: string, name: string): { path: string; atMs: number } | null {
+  const dir = settingsDir(root);
+  if (!existsSync(dir)) return null;
+  let best: { path: string; atMs: number } | null = null;
+  for (const f of readdirSync(dir)) {
+    const m = f.match(SETTINGS_RE);
+    if (!m || m[1] !== name) continue;
+    const atMs = Number(m[2]);
+    if (!best || atMs > best.atMs) best = { path: join(dir, f), atMs };
+  }
+  return best;
+}
+
+/** Write a new settings version (never overwrites; a newer timestamp always wins). */
+export function writeSettingsFile(root: string, name: string, body: Buffer, atMs: number = Date.now()): { path: string; atMs: number } {
+  if (!/^[a-z0-9-]+$/.test(name)) throw new Error('Bad settings name.');
+  const dir = settingsDir(root);
+  ensureDir(dir);
+  const latest = latestSettingsFile(root, name);
+  const stamp = Math.max(atMs, (latest?.atMs ?? 0) + 1);
+  const path = join(dir, `${name}-${String(stamp).padStart(13, '0')}.enc`);
+  writeAtomic(path, body);
+  return { path, atMs: stamp };
+}
+
+async function syncSettings(
+  root: string, store: ObjectStore, prefix: string, remote: Map<string, StoredObject>, light: boolean,
+  tryDelete: (key: string, what: string) => Promise<boolean>,
+): Promise<void> {
+  const dir = settingsDir(root);
+  ensureDir(dir);
+  const localFiles = new Set(readdirSync(dir).filter(f => SETTINGS_RE.test(f)));
+  const newestPerName = (files: Iterable<string>) => {
+    const m = new Map<string, string>();
+    for (const f of files) { const n = f.match(SETTINGS_RE)![1]; if (!m.has(n) || f > m.get(n)!) m.set(n, f); }
+    return m;
+  };
+  // Only the newest remote version of each name matters; older ones are history.
+  const localNewest = newestPerName(localFiles);
+  for (const [name, f] of newestPerName(remote.keys())) {
+    if (!localFiles.has(f) && (!localNewest.has(name) || f > localNewest.get(name)!)) {
+      writeAtomic(join(dir, f), await store.get(`${prefix}/settings/${f}`));
+      localFiles.add(f);
+    }
+  }
+  if (light) return;
+  for (const f of localFiles) {
+    if (!remote.has(f)) await store.put(`${prefix}/settings/${f}`, readFileSync(join(dir, f)));
+  }
+  // Keep the newest SETTINGS_KEEP versions of each name, locally and (throttled) remotely.
+  const byName = new Map<string, string[]>();
+  for (const f of new Set([...localFiles, ...remote.keys()])) {
+    const name = f.match(SETTINGS_RE)![1];
+    byName.set(name, [...(byName.get(name) || []), f]);
+  }
+  for (const list of byName.values()) {
+    for (const f of list.sort().reverse().slice(SETTINGS_KEEP)) {
+      try { if (existsSync(join(dir, f))) unlinkSync(join(dir, f)); } catch { /* */ }
+      if (remote.has(f)) await tryDelete(`${prefix}/settings/${f}`, 'an old settings version');
+    }
+  }
 }
 
 // ── Mirror folder ───────────────────────────────────────────────────────────
