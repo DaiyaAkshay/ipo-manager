@@ -15,14 +15,7 @@ import {
   saveGmailCredentialsJson,
   clearGmailCredentialsConfig,
 } from './email/gmail';
-import {
-  clearCaptchaApiKey,
-  getCaptchaAiStatus,
-  setCaptchaAiProvider,
-  saveCaptchaApiKey,
-  type CaptchaApiKeyProvider,
-  type CaptchaAiProvider,
-} from './ai/captcha';
+import { MANUAL_OTP_ERROR } from './automation/manualStep';
 import { getBrokerReportDir, sanitizeFileName } from './reports/storage';
 import {
   applyMemberDocumentDrafts,
@@ -400,7 +393,7 @@ export function registerIpcHandlers(ipc: IpcMain): void {
 
   // Factory-reset the vault: wipes EVERYTHING on disk (vault DB, documents,
   // logs, config) and clears the OS keychain entries (field key, gmail token,
-  // anthropic API key). The user-chosen backup folder is NOT touched — that
+  // and the legacy CAPTCHA AI key if an old version left one). The user-chosen backup folder is NOT touched — that
   // lives outside our data dir and represents the user's only recovery path.
   //
   // The renderer is responsible for confirming with the user before calling
@@ -481,6 +474,7 @@ export function registerIpcHandlers(ipc: IpcMain): void {
         const keytar = require('keytar');
         await keytar.deletePassword('ipo-manager', 'field-encryption-key-v1').catch(() => {});
         await keytar.deletePassword('ipo-manager', 'gmail-refresh-token-v1').catch(() => {});
+        // Legacy: CAPTCHA AI key left by older versions (feature removed).
         await keytar.deletePassword('ipo-manager', 'anthropic-api-key-v1').catch(() => {});
       } catch { /* */ }
 
@@ -845,56 +839,6 @@ export function registerIpcHandlers(ipc: IpcMain): void {
     }
   });
 
-  ipc.handle('captchaAi:status', async () => getCaptchaAiStatus());
-
-  // CAPTCHA usage / cost guardrails ──────────────────────────────────────────
-  ipc.handle('captchaAi:getUsage', async () => {
-    const { getCaptchaUsage } = await import('./ai/usage');
-    return { ok: true, usage: getCaptchaUsage() };
-  });
-
-  ipc.handle('captchaAi:setConsent', async (_, consented: boolean) => {
-    const { setCaptchaConsent } = await import('./ai/usage');
-    return { ok: true, usage: setCaptchaConsent(!!consented) };
-  });
-
-  ipc.handle('captchaAi:setCap', async (_, cap: number) => {
-    const { setCaptchaCap } = await import('./ai/usage');
-    return { ok: true, usage: setCaptchaCap(Number(cap) || 0) };
-  });
-
-  ipc.handle('captchaAi:resetTodayCounter', async () => {
-    const { resetCaptchaTodayCounter } = await import('./ai/usage');
-    return { ok: true, usage: resetCaptchaTodayCounter() };
-  });
-
-  ipc.handle('captchaAi:setProvider', async (_, provider: CaptchaAiProvider) => {
-    try {
-      const status = await setCaptchaAiProvider(provider);
-      return { ok: true, status };
-    } catch (e: any) {
-      return { ok: false, error: e.message || String(e) };
-    }
-  });
-
-  ipc.handle('captchaAi:setKey', async (_, provider: CaptchaApiKeyProvider, apiKey: string) => {
-    try {
-      const status = await saveCaptchaApiKey(provider, apiKey);
-      return { ok: true, status };
-    } catch (e: any) {
-      return { ok: false, error: e.message || String(e) };
-    }
-  });
-
-  ipc.handle('captchaAi:clearKey', async (_, provider: CaptchaApiKeyProvider) => {
-    try {
-      const status = await clearCaptchaApiKey(provider);
-      return { ok: true, status };
-    } catch (e: any) {
-      return { ok: false, error: e.message || String(e) };
-    }
-  });
-
   ipc.handle('documents:download', async (_, payload: { memberId: number; docType: MemberDocumentType }) => {
     const db = getDb();
     const { memberId, docType } = payload || {};
@@ -921,28 +865,6 @@ export function registerIpcHandlers(ipc: IpcMain): void {
       auditInsert.run(memberId, 'DOWNLOAD_DOC', docType, 'FAILED', e.message || String(e));
       return { ok: false, error: e.message || String(e) };
     }
-  });
-
-  // ── Manual OTP dialog (for banks that send OTP to mobile only) ──────────
-
-  ipc.handle('otp:provide', (_, otp: string) => {
-    clearOtpTimeout();
-    if (pendingOtpResolve) {
-      pendingOtpResolve(otp.trim());
-      pendingOtpResolve = null;
-      pendingOtpReject  = null;
-    }
-    return { ok: true };
-  });
-
-  ipc.handle('otp:cancel', () => {
-    clearOtpTimeout();
-    if (pendingOtpReject) {
-      pendingOtpReject(new Error('OTP_CANCELLED'));
-      pendingOtpResolve = null;
-      pendingOtpReject  = null;
-    }
-    return { ok: true };
   });
 
   // ── Import / Login ───────────────────────────────────────────────────────
@@ -983,15 +905,6 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   });
 
   ipc.handle('automation:cancelCurrent', async () => {
-    clearOtpTimeout();
-    if (pendingOtpReject) {
-      pendingOtpReject(new Error('USER_CANCELLED'));
-      pendingOtpResolve = null;
-      pendingOtpReject = null;
-      const win = BrowserWindow.getAllWindows()[0];
-      if (win) win.webContents.send('otp:dismiss', {});
-    }
-
     const closedContexts = await closeAllBrowserSessions();
     return { ok: true, closedContexts };
   });
@@ -1228,59 +1141,23 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   });
 }
 
-// ── Manual OTP state ─────────────────────────────────────────────────────────
-
-let pendingOtpResolve: ((otp: string) => void) | null = null;
-let pendingOtpReject:  ((err: Error)  => void) | null = null;
-// Store the timeout handle so we can cancel it when the OTP is provided,
-// cancelled, or superseded by a new request. Without this, the old timer fires
-// 3 minutes after a superseded request and incorrectly rejects the new request
-// (because pendingOtpReject still points at the new Promise's reject function).
-let otpTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
-
-function clearOtpTimeout(): void {
-  if (otpTimeoutHandle) {
-    clearTimeout(otpTimeoutHandle);
-    otpTimeoutHandle = null;
-  }
-}
+// ── OTP sources ──────────────────────────────────────────────────────────────
 
 /**
- * Sends an 'otp:needed' event to the renderer window, which shows an input
- * dialog. Resolves when the user submits the OTP, rejects on cancel/timeout.
+ * Thrown by `fetchOtp` when there is no automatic OTP source. There is no
+ * in-app OTP popup: adapters catch this (see automation/manualStep.ts), show a
+ * hint in the bank window and wait for the user to type the OTP there.
  */
-function requestOtpFromUser(label: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    // Cancel any previous pending request AND its timer.
-    clearOtpTimeout();
-    if (pendingOtpReject) pendingOtpReject(new Error('OTP_SUPERSEDED'));
-
-    pendingOtpResolve = resolve;
-    pendingOtpReject  = reject;
-
-    const win = BrowserWindow.getAllWindows()[0];
-    if (win) win.webContents.send('otp:needed', { label });
-
-    // Auto-cancel after 3 minutes. Store handle so it can be cleared.
-    otpTimeoutHandle = setTimeout(() => {
-      otpTimeoutHandle = null;
-      if (pendingOtpReject) {
-        pendingOtpReject(new Error('OTP_TIMEOUT'));
-        pendingOtpResolve = null;
-        pendingOtpReject  = null;
-        const w = BrowserWindow.getAllWindows()[0];
-        if (w) w.webContents.send('otp:dismiss', {});
-      }
-    }, 3 * 60 * 1000);
-  });
+function manualOtpRequired(reason: string): Error {
+  return new Error(`${MANUAL_OTP_ERROR}: ${reason}`);
 }
 
 /**
  * Email-OTP fetch shared by every login path. Reads the OTP from Gmail; if
  * Gmail can't be used (not signed in, access expired/revoked, not set up) it
- * falls straight back to the in-app OTP dialog — instead of the old behaviour
- * of opening a Google sign-in tab mid-login and hanging while the bank's OTP
- * expired — and tells the renderer to refresh the Gmail status pill.
+ * throws OTP_MANUAL straight away so the adapter waits for the user to type
+ * the OTP in the bank window, and tells the renderer to refresh the Gmail
+ * status pill. A Gmail timeout is rethrown as-is; adapters treat it the same.
  */
 async function fetchEmailOtp(code: string, displayName: string, startTime: Date): Promise<string> {
   const otpPreset = getOtpPreset(code);
@@ -1292,10 +1169,10 @@ async function fetchEmailOtp(code: string, displayName: string, startTime: Date)
     BrowserWindow.getAllWindows().forEach(w => {
       try { if (!w.isDestroyed()) w.webContents.send('gmail:statusChanged', { reason: e.code }); } catch { /* */ }
     });
-    return requestOtpFromUser(
+    throw manualOtpRequired(
       e.code === 'GMAIL_NOT_CONFIGURED'
-        ? `Gmail isn't set up, so the ${displayName} OTP can't be read automatically. Enter it here (or type it in the bank window):`
-        : `Gmail needs you to sign in again, so the ${displayName} OTP can't be read automatically. Enter it here (or type it in the bank window):`
+        ? `Gmail isn't set up, so the ${displayName} OTP must be typed in the bank window.`
+        : `Gmail needs you to sign in again, so the ${displayName} OTP must be typed in the bank window.`
     );
   }
 }
@@ -1420,7 +1297,7 @@ async function runLogin(
       return (await TOTP.generate(totpSecret)).otp;
     }
     if (adapter.otpMode === 'manual') {
-      return requestOtpFromUser(`Enter the OTP sent to your mobile for ${adapter.displayName}`);
+      throw manualOtpRequired(`${adapter.displayName} sends the OTP to mobile — type it in the bank window.`);
     }
     return fetchEmailOtp(code, adapter.displayName, startTime);
   };
@@ -1536,7 +1413,7 @@ async function downloadBrokerPortfolioReport(memberId: number, brokerId: number)
       return (await TOTP.generate(totpSecret)).otp;
     }
     if (adapter.otpMode === 'manual') {
-      return requestOtpFromUser(`Enter the OTP sent to your mobile for ${adapter.displayName}`);
+      throw manualOtpRequired(`${adapter.displayName} sends the OTP to mobile — type it in the bank window.`);
     }
     return fetchEmailOtp(code, adapter.displayName, startTime);
   };
@@ -1763,7 +1640,7 @@ async function buildOtpFetcher(_kind: 'BANK' | 'BROKER', code: string, adapter: 
       return (await TOTP.generate(totpSecret)).otp;
     }
     if (adapter.otpMode === 'manual') {
-      return requestOtpFromUser(`Enter the OTP sent to your mobile for ${adapter.displayName}`);
+      throw manualOtpRequired(`${adapter.displayName} sends the OTP to mobile — type it in the bank window.`);
     }
     return fetchEmailOtp(code, adapter.displayName, startTime);
   };

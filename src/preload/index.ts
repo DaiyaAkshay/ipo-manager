@@ -23,15 +23,6 @@ const api = {
       return () => ipcRenderer.off('gmail:statusChanged', handler);
     },
   },
-  captchaAi: {
-    status: () => ipcRenderer.invoke('captchaAi:status'),
-    setKey: (apiKey: string) => ipcRenderer.invoke('captchaAi:setKey', 'anthropic', apiKey),
-    clearKey: () => ipcRenderer.invoke('captchaAi:clearKey', 'anthropic'),
-    getUsage: () => ipcRenderer.invoke('captchaAi:getUsage'),
-    setConsent: (consented: boolean) => ipcRenderer.invoke('captchaAi:setConsent', consented),
-    setCap: (cap: number) => ipcRenderer.invoke('captchaAi:setCap', cap),
-    resetTodayCounter: () => ipcRenderer.invoke('captchaAi:resetTodayCounter')
-  },
   families: {
     list: () => ipcRenderer.invoke('families:list'),
     create: (family_name: string, min_balance?: number) => ipcRenderer.invoke('families:create', { family_name, min_balance }),
@@ -185,24 +176,6 @@ const api = {
       ipcRenderer.on('account:balanceUpdated', handler);
       return () => ipcRenderer.off('account:balanceUpdated', handler);
     },
-  },
-  otp: {
-    /** Register a handler for when main needs an OTP. Returns a cleanup function. */
-    onNeeded: (cb: (data: { label: string }) => void): (() => void) => {
-      const handler = (_: Electron.IpcRendererEvent, data: { label: string }) => cb(data);
-      ipcRenderer.on('otp:needed', handler);
-      return () => ipcRenderer.off('otp:needed', handler);
-    },
-    /** Dismiss the dialog if main cancelled/timed out. Returns a cleanup function. */
-    onDismiss: (cb: () => void): (() => void) => {
-      const handler = () => cb();
-      ipcRenderer.on('otp:dismiss', handler);
-      return () => ipcRenderer.off('otp:dismiss', handler);
-    },
-    /** Submit the typed OTP back to the main process. */
-    provide: (otp: string) => ipcRenderer.invoke('otp:provide', otp),
-    /** Cancel the OTP request. */
-    cancel:  () => ipcRenderer.invoke('otp:cancel')
   },
   updater: {
     /** Subscribe to update lifecycle events. Returns a cleanup function. */
