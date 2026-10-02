@@ -45,6 +45,7 @@ src/renderer/    — React UI, no Node access
 | `automation/stubs.ts` | All other banks/brokers — just open the login URL, user fills in manually |
 | `email/gmail.ts` | Gmail API OAuth (loopback + PKCE) OTP fetcher; throws `GmailAuthError` → callers fall back to manual OTP |
 | `backup/engine.ts` | Drive-folder snapshot sync: 30 s loop, dirty-hash + lineage, conflict → user choice (policy in `backup/syncPolicy.ts`) |
+| `backup/appSettings.ts` | Carries the Gmail setup between PCs as field-key-encrypted `settings/gmail-<ms>.enc` next to the snapshots (newest wins; decision logic pure + tested) |
 | `backup/replicator.ts` + `objectStore.ts` | Cloudflare R2 target: keeps `data/r2-cache` (the engine's root in R2 mode) in step with the bucket; optional extra-copy folder. See `docs/R2_BACKUP.md` |
 | `importer/excel.ts` | SheetJS importer for `Demat_Sheet.xlsx` |
 

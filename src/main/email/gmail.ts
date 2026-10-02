@@ -636,3 +636,47 @@ export const OTP_PRESETS = {
     otpRegex: /\b(\d{6})\b/
   }
 };
+
+// ── Cross-PC settings sync ───────────────────────────────────────────────────
+// The backup engine carries the Gmail setup between PCs (encrypted with the
+// vault's field key), so a new PC doesn't need the OAuth JSON pasted and the
+// Google sign-in repeated. These two functions are the only interface it uses.
+
+export interface GmailSyncPayload {
+  /** Contents of gmail-credentials.json (the OAuth client). */
+  credentialsJson: string;
+  /** Refresh token, or null when the client is set up but not signed in. */
+  refreshToken: string | null;
+  connectedAt: string | null;
+}
+
+/** This PC's Gmail setup, or null when none is configured. */
+export async function getGmailSyncPayload(): Promise<GmailSyncPayload | null> {
+  const path = credentialsPath();
+  if (!existsSync(path)) return null;
+  let credentialsJson: string;
+  try {
+    credentialsJson = JSON.stringify(validateClientSecrets(readFileSync(path, 'utf8')));
+  } catch {
+    return null;
+  }
+  const refreshToken = await readRefreshToken().catch(() => null);
+  return { credentialsJson, refreshToken: refreshToken || null, connectedAt: readAuthInfo().connectedAt };
+}
+
+/** Adopt a Gmail setup synced from another PC (null = it was removed there). */
+export async function applyGmailSyncPayload(payload: GmailSyncPayload | null): Promise<void> {
+  if (!payload) {
+    await clearGmailCredentialsConfig();
+    return;
+  }
+  const secrets = validateClientSecrets(payload.credentialsJson);
+  writeFileSync(credentialsPath(), JSON.stringify(secrets, null, 2), 'utf8');
+  if (payload.refreshToken) {
+    await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_ACCOUNT_REFRESH, payload.refreshToken);
+  } else {
+    await clearRefreshToken();
+  }
+  writeAuthInfo({ connectedAt: payload.connectedAt, lastAuthError: null, lastAuthErrorAt: null });
+  invalidateStatusCache();
+}
