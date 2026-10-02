@@ -73,6 +73,39 @@ Safety rules (tested in `tests/backup/replicator.test.ts`):
 - Offline: data stays on the PC, the status pill shows "R2 offline — retrying", and sync resumes
   by itself.
 
+## Gmail setup travels with the backup
+
+You set up Gmail once. Its OAuth client JSON and sign-in are stored next to the snapshots as
+`settings/gmail-<time>.enc`, encrypted with the vault's field key. That key is the same on every PC
+of the vault and doesn't change when the master password does.
+
+- **New PC:** after the first unlock that pulls the vault, it gets Gmail too. There's no JSON to
+  paste and no Google sign-in to repeat.
+- **Changes on any PC:** signing in again, pasting a new JSON or removing Gmail is picked up by the
+  other PCs within about a minute. The newest change wins.
+- **No sync conflicts:** settings aren't part of snapshot history.
+
+If Google keeps asking you to sign in again about every 7 days, your OAuth app is still in
+**Testing** mode. In Google Cloud Console → Google Auth Platform → Audience, click **Publish app**,
+then sign in once. Syncing the setup can't fix an expiry that Google itself enforces.
+
+## Speed and safety notes (v0.3.9)
+
+- **Unlock:** unlocking makes one list call and downloads only the newest snapshot, with short
+  timeouts. Older history downloads in the background, newest first, a few snapshots per 30 s
+  pass. The Restore list shows backups that are only in the bucket as "in R2 only"; restoring one
+  downloads it first.
+- **Lock and quit:** if nothing changed, lock and quit do no network work at all. Quit waits at
+  most 45 s.
+- **Your clicks wait for sync:** Sync now, Restore and resolving a conflict wait for a running sync
+  pass instead of failing with "already running".
+- **Document clean-up:** documents are only deleted from the bucket once no remote snapshot uses
+  them. That includes snapshots this PC never downloaded, and ones a bucket lock still keeps. A
+  refused delete is retried at most every 6 h.
+- **Safety copies:** choosing "use the other PC's data", or unlocking with a password changed
+  elsewhere, keeps a `vault.db.pre-conflict-*` copy. Up to 10 are kept, and normal pulls don't
+  rotate them away.
+
 ## Switching back
 
 Backup & Sync → Folder → **Use this folder instead of R2**. The bucket is left untouched.

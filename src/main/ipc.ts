@@ -60,6 +60,7 @@ import {
   publishRestoredVault,
   pushBeforeClose,
   resolveSyncConflict,
+  setSyncSuspended,
   syncOnUnlock,
   syncTick,
   tryUnlockFromNewerBackup,
@@ -112,7 +113,8 @@ function broadcast(channel: string, payload: unknown): void {
  * anything else just refreshes the backup pill.
  */
 function reportSyncOutcome(outcome: SyncOutcome, reason: string): void {
-  if (outcome.newMasterKey) currentMasterKey = Buffer.from(outcome.newMasterKey);
+  // A pass that finished after the vault locked must not re-arm the session key.
+  if (outcome.newMasterKey && currentMasterKey) currentMasterKey = Buffer.from(outcome.newMasterKey);
   if (outcome.action === 'pulled') {
     console.log(`[Sync] (${reason}) pulled snapshot from ${outcome.sourceHost || 'another PC'}`);
     broadcast('vault:autoSynced', {
@@ -135,10 +137,11 @@ function reportSyncOutcome(outcome: SyncOutcome, reason: string): void {
  */
 export async function flushBackupOnExit(): Promise<void> {
   if (!currentMasterKey) return;
-  // Stop the loop and let an in-flight pass finish, so a pull can't re-open
-  // the vault after the caller closes it.
+  // Stop the loop, tell a pass that is still running not to pull, and let it
+  // finish — so nothing re-opens the vault after the caller closes it.
+  setSyncSuspended(true);
   stopSyncLoop();
-  await waitForSyncIdle(15_000);
+  await waitForSyncIdle(30_000);
   if (!currentMasterKey) return;
   try {
     const outcome = await pushBeforeClose(currentMasterKey);
@@ -168,7 +171,8 @@ async function runSyncTick(reason: string): Promise<void> {
     // Never swap the DB under an in-flight login or push mid-run: balance
     // writes from a bulk refresh land in one snapshot after it finishes.
     const idle = activeAutomations() === 0;
-    const outcome = await syncTick({ masterPassword: password, liveKey: currentMasterKey, canPull: idle, canPush: idle });
+    // A copy: locking zeroes currentMasterKey, and a pass may still be using its key.
+    const outcome = await syncTick({ masterPassword: password, liveKey: Buffer.from(currentMasterKey), canPull: idle, canPush: idle });
     reportSyncOutcome(outcome, reason);
   } catch (e: any) {
     console.warn(`[Sync] (${reason}) tick failed: ${e?.message || e}`);
@@ -184,7 +188,24 @@ async function waitForSyncIdle(timeoutMs: number): Promise<void> {
   }
 }
 
+/**
+ * Run a user-initiated backup action without colliding with the 30 s sync
+ * loop: pause it, let a running pass finish, run, resume. Before this, such
+ * clicks failed with "a backup is already running".
+ */
+async function withSyncPaused<T>(fn: () => Promise<T>): Promise<T> {
+  const wasRunning = !!syncLoopTimer;
+  stopSyncLoop();
+  await waitForSyncIdle(60_000);
+  try {
+    return await fn();
+  } finally {
+    if (wasRunning && currentMasterKey) startSyncLoop();
+  }
+}
+
 function startSyncLoop(): void {
+  setSyncSuspended(false);
   stopSyncLoop();
   syncLoopTimer = setInterval(() => { void runSyncTick('periodic'); }, SYNC_TICK_MS);
 }
@@ -1142,7 +1163,8 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   ipc.handle('backup:runNow', async () => {
     const password = getMasterPassword();
     if (!currentMasterKey || !password) return { ok: false, error: 'Vault is locked.' };
-    const result = await backupNow({ masterPassword: password, liveKey: currentMasterKey });
+    const liveKey = currentMasterKey;
+    const result = await withSyncPaused(() => backupNow({ masterPassword: password, liveKey }));
     if (result.newMasterKey) {
       currentMasterKey = Buffer.from(result.newMasterKey);
       broadcast('vault:autoSynced', { snapshotTimestamp: new Date().toISOString(), sourceHost: result.pulledFrom ?? null });
@@ -1159,14 +1181,16 @@ export function registerIpcHandlers(ipc: IpcMain): void {
     if (activeAutomations() > 0) {
       return { ok: false, error: 'Wait for the running bank/broker login to finish, then try again.' };
     }
-    const outcome = await resolveSyncConflict(choice, { masterPassword: password, liveKey: currentMasterKey });
+    const liveKey = currentMasterKey;
+    const outcome = await withSyncPaused(() => resolveSyncConflict(choice, { masterPassword: password, liveKey }));
     reportSyncOutcome(outcome, `resolve:${choice}`);
     if (outcome.action === 'pushed' || outcome.action === 'pulled') return { ok: true, action: outcome.action };
     return { ok: false, error: outcome.error || 'The conflict could not be resolved yet.' };
   });
 
   ipc.handle('backup:listSnapshots', async () => {
-    return { ok: true, snapshots: backupListSnapshots() };
+    // In R2 mode this includes backups that are only in the bucket (fetched on restore).
+    return { ok: true, snapshots: backupListSnapshots(), target: backupGetConfig().target };
   });
 
   ipc.handle('backup:listSnapshotsFromFolder', async (_, folder: string) => {
@@ -1186,28 +1210,34 @@ export function registerIpcHandlers(ipc: IpcMain): void {
     if (activeAutomations() > 0) {
       return { ok: false, error: 'Wait for the running bank/broker login to finish, then restore.' };
     }
-    const result = await backupRestoreSnapshot(payload.snapshotId, masterPwdForRestore, {
-      sourceFolder: payload.sourceFolder,
-      liveKey: currentMasterKey ?? undefined,
+    let published = true;
+    let publishError: string | undefined;
+    const result = await withSyncPaused(async () => {
+      const r = await backupRestoreSnapshot(payload.snapshotId, masterPwdForRestore, {
+        sourceFolder: payload.sourceFolder,
+        liveKey: currentMasterKey ?? undefined,
+      });
+      if (!r.ok) return r;
+      // The restored snapshot may use a different salt → the vault is now open
+      // with the key restoreSnapshot derived. Adopt it for the session.
+      currentMasterKey = Buffer.from(r.masterKey);
+      // Make the restored data the new head for every synced PC; otherwise the
+      // next sync pass would fast-forward straight back and undo the restore.
+      // A copy from another folder becomes the new data everywhere too.
+      const pub = await publishRestoredVault(currentMasterKey, payload.snapshotId, r.ancestors);
+      published = pub.ok;
+      publishError = pub.error || pub.uploadError;
+      if (!pub.ok || pub.uploadError) console.warn('[Sync] restored vault not published yet:', publishError);
+      return r;
     });
     if (!result.ok) return result;
-    // The restored snapshot may use a different salt → the vault is now open
-    // with the key restoreSnapshot derived. Adopt it for the session.
-    currentMasterKey = Buffer.from(result.masterKey);
-    // Make the restored data the new head for every synced PC; otherwise the
-    // next sync pass would fast-forward straight back and undo the restore.
-    let published = true;
-    if (!payload.sourceFolder || payload.sourceFolder === backupActiveRoot()) {
-      const pub = await publishRestoredVault(currentMasterKey, payload.snapshotId, result.ancestors);
-      published = pub.ok;
-      if (!pub.ok) console.warn('[Sync] restored vault not published:', pub.error);
-    }
     broadcast('backup:statusChanged', {});
     return {
       ok: true,
       documentsRestored: result.documentsRestored,
       dbBytes: result.dbBytes,
-      published,
+      published: published && !publishError,
+      publishError,
     };
   });
 

@@ -711,6 +711,7 @@ export default function Dashboard() {
     id: string; timestamp: string; dbBytes: number; documentCount: number; totalBlobBytes: number;
     band: 'last-24h' | 'last-7d' | 'last-30d' | 'last-6mo' | 'older';
     sourceHost?: string | null; appVersion?: string | null;
+    location?: 'local' | 'cloud'; isHead?: boolean;
   }>>([]);
   const [restoreSourceFolder, setRestoreSourceFolder] = useState<string | null>(null);
   const [backupDestTab, setBackupDestTab] = useState<'r2' | 'folder'>('r2');
@@ -2632,6 +2633,8 @@ export default function Dashboard() {
       const result: any = await window.api.backup.runNow();
       if (result?.ok && 'pulledFrom' in result) {
         showToast('info', `This PC was behind — downloaded the newer data from ${result.pulledFrom || 'your other PC'} first.`);
+      } else if (result?.ok && result.uploadError) {
+        showToast('error', result.uploadError);
       } else if (result?.ok) {
         showToast('success',
           `Uploaded · ${result.documentsCopied || 0} new docs · ${result.documentsReused || 0} reused · ${result.durationMs || 0}ms`);
@@ -2736,20 +2739,24 @@ export default function Dashboard() {
   }
 
   async function restoreSelectedSnapshot(snapshotId: string) {
-    const syncedFolder = !restoreSourceFolder
-      || (backupInfo?.config.target !== 'r2' && restoreSourceFolder === backupInfo?.config.folder);
+    const snap = backupSnapshots.find(x => x.id === snapshotId);
+    const when = snap ? new Date(snap.timestamp).toLocaleString() : snapshotId;
     if (!confirm(
-      `Restore from snapshot ${snapshotId}?\n\n` +
+      `Restore the backup from ${when}${snap?.sourceHost ? ` (${snap.sourceHost})` : ''}?\n\n` +
       'This will REPLACE your current vault' +
-      (syncedFolder && backupInfo?.config.enabled ? ' on this PC AND on every PC syncing with this backup folder' : '') +
+      (backupInfo?.config.enabled ? ' on this PC AND on every PC that syncs with it' : '') +
       '. A copy of the old vault will be saved next to vault.db as a .pre-restore-* file ' +
-      'in case you need to roll back.'
+      'in case you need to roll back.' +
+      (snap?.location === 'cloud' ? '\n\nThis backup is in Cloudflare R2 only; it will be downloaded first.' : '')
     )) return;
     setBusy('backup-restore');
     try {
       const result: any = await window.api.backup.restore(snapshotId, restoreSourceFolder || undefined);
       if (result?.ok) {
         showToast('success', `Restored · ${result.documentsRestored || 0} documents`);
+        if (result.published === false) {
+          showToast('error', `Restored on this PC, but not yet sent to the other PCs — it will retry automatically. ${result.publishError || ''}`.trim());
+        }
         setModal({ type: 'none' });
         // Reload everything from the restored DB
         setMembers({});
@@ -4900,11 +4907,14 @@ export default function Dashboard() {
                   <div style={{ marginBottom: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div className="empty-sub">
                       {restoreSourceFolder
-                        ? <>Browsing snapshots in <strong>{restoreSourceFolder}</strong></>
-                        : <>Browsing snapshots in the configured backup folder.</>}
+                        ? <>Browsing backups in <strong>{restoreSourceFolder}</strong></>
+                        : backupInfo?.config.target === 'r2'
+                          ? <>Backups in Cloudflare R2. The newest one is what every PC is using now.</>
+                          : <>Backups in the backup folder. The newest one is what every PC is using now.</>}
                     </div>
-                    <button className="btn btn-ghost" onClick={pickRestoreFolder} disabled={busy === 'backup-list'}>
-                      Restore from another machine...
+                    <button className="btn btn-ghost" onClick={pickRestoreFolder} disabled={busy === 'backup-list'}
+                      title="For example the extra-copy folder on a USB disk">
+                      Restore from a folder…
                     </button>
                   </div>
                   {(['last-24h', 'last-7d', 'last-30d', 'last-6mo', 'older'] as const).map(band => {
@@ -4936,6 +4946,8 @@ export default function Dashboard() {
                             <div>
                               <div style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
                                 {new Date(snap.timestamp).toLocaleString()}
+                                {snap.isHead && !restoreSourceFolder && <span className="empty-sub" style={{ marginLeft: 8, color: 'var(--good, inherit)' }}>· current</span>}
+                                {snap.location === 'cloud' && <span className="empty-sub" style={{ marginLeft: 8 }}>· in R2 only</span>}
                               </div>
                               <div className="empty-sub" style={{ fontSize: 11 }}>
                                 {snap.sourceHost ? `from ${snap.sourceHost} · ` : ''}

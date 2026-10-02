@@ -91,17 +91,28 @@ export function parseListObjectsV2(xml: string): { objects: StoredObject[]; next
 async function describeFailure(res: Response, what: string): Promise<Error> {
   let code = '';
   try { code = tag(await res.text(), 'Code') || ''; } catch { /* */ }
-  const hint = res.status === 403
+  const hint = what.startsWith('Deleting') && res.status === 403
+    ? ' — refused, most likely by the bucket lock (expected until it expires)'
+    : res.status === 403
     ? ' — check the API token has Object Read & Write on this bucket'
     : res.status === 404 && code === 'NoSuchBucket' ? ' — bucket not found' : '';
   return new Error(`${what} failed (HTTP ${res.status}${code ? ` ${code}` : ''})${hint}`);
 }
 
+export interface R2StoreOptions {
+  smallTimeoutMs?: number;
+  transferTimeoutMs?: number;
+  retries?: number;
+}
+
 export class R2Store implements ObjectStore {
   private readonly client: AwsClient;
   private readonly base: string;
+  private readonly smallTimeout: number;
+  private readonly transferTimeout: number;
 
-  constructor(settings: R2Settings) {
+  /** `opts` lets the unlock path use short timeouts so a bad network can't stall unlocking. */
+  constructor(settings: R2Settings, opts: R2StoreOptions = {}) {
     const problem = validateR2Settings(settings);
     if (problem) throw new Error(problem);
     this.client = new AwsClient({
@@ -109,8 +120,10 @@ export class R2Store implements ObjectStore {
       secretAccessKey: settings.secretAccessKey.trim(),
       service: 's3',
       region: 'auto',
-      retries: 3,
+      retries: opts.retries ?? 3,
     });
+    this.smallTimeout = opts.smallTimeoutMs ?? SMALL_REQUEST_TIMEOUT_MS;
+    this.transferTimeout = opts.transferTimeoutMs ?? TRANSFER_TIMEOUT_MS;
     this.base = `https://${settings.accountId}.r2.cloudflarestorage.com/${settings.bucket}`;
   }
 
@@ -125,7 +138,7 @@ export class R2Store implements ObjectStore {
       const q = new URLSearchParams({ 'list-type': '2', prefix });
       if (token) q.set('continuation-token', token);
       const res = await this.client.fetch(`${this.base}?${q.toString()}`, {
-        signal: AbortSignal.timeout(SMALL_REQUEST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(this.smallTimeout),
       });
       if (!res.ok) throw await describeFailure(res, 'Listing the bucket');
       const page = parseListObjectsV2(await res.text());
@@ -136,7 +149,7 @@ export class R2Store implements ObjectStore {
   }
 
   async get(key: string): Promise<Buffer> {
-    const res = await this.client.fetch(this.url(key), { signal: AbortSignal.timeout(TRANSFER_TIMEOUT_MS) });
+    const res = await this.client.fetch(this.url(key), { signal: AbortSignal.timeout(this.transferTimeout) });
     if (!res.ok) throw await describeFailure(res, `Downloading ${key}`);
     return Buffer.from(await res.arrayBuffer());
   }
@@ -146,7 +159,7 @@ export class R2Store implements ObjectStore {
       method: 'PUT',
       body: new Uint8Array(body.buffer, body.byteOffset, body.byteLength) as unknown as BodyInit,
       headers: { 'content-type': 'application/octet-stream' },
-      signal: AbortSignal.timeout(TRANSFER_TIMEOUT_MS),
+      signal: AbortSignal.timeout(this.transferTimeout),
     });
     if (!res.ok) throw await describeFailure(res, `Uploading ${key}`);
   }
@@ -154,7 +167,7 @@ export class R2Store implements ObjectStore {
   async delete(key: string): Promise<void> {
     const res = await this.client.fetch(this.url(key), {
       method: 'DELETE',
-      signal: AbortSignal.timeout(SMALL_REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(this.smallTimeout),
     });
     if (!res.ok && res.status !== 404) throw await describeFailure(res, `Deleting ${key}`);
   }
