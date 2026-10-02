@@ -101,6 +101,21 @@ afterEach(() => {
 });
 
 describe('backup/replicator', () => {
+  it('does not publish a snapshot whose document is missing locally and remotely', async () => {
+    writeSnapshot(pcA, S1, ['doc-1']);
+    rmSync(join(pcA, 'blobs', 'doc-1.enc'));
+    await expect(passA()).rejects.toThrow(/document.*missing/i);
+    expect(store.objects.has(`${P}/snapshots/${S1}/manifest.json`)).toBe(false);
+  });
+
+  it('does not mark a downloaded snapshot complete when a remote document is missing', async () => {
+    writeSnapshot(pcA, S1, ['doc-1']);
+    await passA();
+    store.objects.delete(`${P}/blobs/doc-1.enc`);
+    await expect(passB()).rejects.toThrow(/document.*missing/i);
+    expect(existsSync(join(pcB, 'snapshots', S1, 'manifest.json'))).toBe(false);
+  });
+
   it('uploads blobs first and the manifest last', async () => {
     writeSnapshot(pcA, S1, ['doc-1']);
     const r = await passA();

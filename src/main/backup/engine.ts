@@ -618,8 +618,8 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
       const src = getEncryptedDocumentPath(doc.file_uuid);
       const dst = join(blobsDir, `${doc.file_uuid}.enc`);
       if (!existsSync(src)) {
-        // Document file is missing on disk — skip, don't fail the whole backup.
-        continue;
+        if (existsSync(dst)) { reused += 1; continue; }
+        throw new Error(`Document ${doc.file_uuid} is missing. Backup aborted; existing backups are unchanged.`);
       }
       if (existsSync(dst)) {
         reused += 1;
@@ -1054,7 +1054,7 @@ async function restoreSnapshotInner(
     const blobsDir = getBlobsDir(root);
     for (const doc of manifest.documents) {
       const src = join(blobsDir, `${doc.file_uuid}.enc`);
-      if (!existsSync(src)) continue;
+      if (!existsSync(src)) throw new Error(`Document ${doc.file_uuid} is missing. Restore aborted; your existing vault is unchanged.`);
       const dst = join(dataDocsDir, `${doc.file_uuid}.enc`);
       if (!existsSync(dst) || statSync(dst).size !== statSync(src).size) {
         ensureDir(dirname(dst));
@@ -1102,6 +1102,15 @@ async function restoreSnapshotInner(
     if (hadLiveMeta) renameSync(liveMetaPath, metaSidecar);
     copyFileSync(snapshotMetaPath, liveMetaPath);
     openDb(snapshotMasterKey);
+    // Keychain persistence is part of recovery: if it fails, keep the old
+    // database rather than installing a vault whose fields cannot be opened.
+    if (fieldKey) {
+      const current = await readFieldKey();
+      if (!current || !current.equals(fieldKey)) {
+        await writeFieldKey(fieldKey);
+        clearFieldKeyCache();
+      }
+    }
   } catch (e: any) {
     // Roll back to exactly what we had.
     try { closeDb(); } catch { /* */ }
@@ -1116,17 +1125,6 @@ async function restoreSnapshotInner(
   const dbBytes = statSync(targetDbPath).size;
   pruneOldPreRestoreSidecars(getDataDir());
   pruneOldPreRestoreSidecars(getDataDir(), 10, '.pre-conflict-');
-
-  // 5) Field key → OS keychain, only if it actually differs (first restore onto
-  //    a new PC). Drop the in-memory copy in field.ts too, or encrypted fields
-  //    in the restored vault would be decrypted with the old key.
-  if (fieldKey) {
-    const current = await readFieldKey().catch(() => null);
-    if (!current || !current.equals(fieldKey)) {
-      await writeFieldKey(fieldKey);
-      clearFieldKeyCache();
-    }
-  }
 
   return {
     ok: true,

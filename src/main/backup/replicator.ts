@@ -317,7 +317,10 @@ export async function replicate(
     if (light || !snap.complete || remoteDone.has(snap.id)) continue;
     for (const uuid of readManifestDocs(localManifestPath(root, snap.id))) {
       const src = localBlob(uuid);
-      if (!existsSync(src)) continue;
+      if (!existsSync(src)) {
+        if (remote.blobs.has(uuid)) continue;
+        throw new Error(`Backup document ${uuid} is missing; the snapshot was not published.`);
+      }
       const size = statSync(src).size;
       if (remote.blobs.get(uuid)?.size === size) continue;
       await store.put(blobKey(uuid), readFileSync(src));
@@ -410,8 +413,11 @@ async function downloadSnapshot(
   for (const uuid of readManifestDocs(tmpManifest)) {
     const dst = join(root, 'blobs', `${uuid}.enc`);
     const obj = blobs.get(uuid);
-    if (!obj || (existsSync(dst) && statSync(dst).size === obj.size)) continue;
-    writeAtomic(dst, await store.get(`${prefix}/blobs/${uuid}.enc`));
+    if (!obj) throw new Error(`Backup document ${uuid} is missing from the bucket.`);
+    if (existsSync(dst) && statSync(dst).size === obj.size) continue;
+    const body = await store.get(`${prefix}/blobs/${uuid}.enc`);
+    if (body.length !== obj.size) throw new Error(`Download of document ${uuid} was incomplete.`);
+    writeAtomic(dst, body);
     n += 1;
   }
   for (const [file, obj] of files) {
