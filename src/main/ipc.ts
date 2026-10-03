@@ -1163,9 +1163,10 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   ipc.handle('backup:runNow', async () => {
     const password = getMasterPassword();
     if (!currentMasterKey || !password) return { ok: false, error: 'Vault is locked.' };
-    const liveKey = currentMasterKey;
+    if (activeAutomations()) return { ok: false, error: 'Wait for the running bank/broker login to finish, then try again.' };
+    const liveKey = Buffer.from(currentMasterKey);
     const result = await withSyncPaused(() => backupNow({ masterPassword: password, liveKey }));
-    if (result.newMasterKey) {
+    if (result.newMasterKey && currentMasterKey) {
       currentMasterKey = Buffer.from(result.newMasterKey);
       broadcast('vault:autoSynced', { snapshotTimestamp: new Date().toISOString(), sourceHost: result.pulledFrom ?? null });
     }
@@ -1415,7 +1416,18 @@ async function saveBrokerAccounts(db: any, memberId: number, brokers: any[], rep
   }
 }
 
-async function runLogin(
+/** Reserve before decrypting credentials or capturing the database handle. */
+async function withAutomation<T>(operation: () => Promise<T>): Promise<T> {
+  beginAutomation();
+  try { return await operation(); }
+  finally { endAutomation(); }
+}
+
+function runLogin(...args: Parameters<typeof runLoginInner>) {
+  return withAutomation(() => runLoginInner(...args));
+}
+
+async function runLoginInner(
   kind: 'BANK' | 'BROKER',
   memberId: number,
   accountId: number,
@@ -1455,7 +1467,6 @@ async function runLogin(
     return fetchEmailOtp(code, adapter.displayName, startTime);
   };
   const auditInsert = db.prepare('INSERT INTO audit_log (member_id, action, target, status, details) VALUES (?, ?, ?, ?, ?)');
-  beginAutomation();
   let contextToClose: import('playwright').BrowserContext | null = null;
   try {
     const { context, page } = await launchSession({ profileKey: `${kind}-${code}-${memberId}` });
@@ -1481,8 +1492,8 @@ async function runLogin(
         // the UI always reflects when the displayed number was actually fetched.
         balanceFetchedAt = new Date().toISOString();
         db.prepare(
-          `UPDATE ${tbl} SET balance = ?, balance_fetched_at = CURRENT_TIMESTAMP WHERE id = ?`
-        ).run(balance, accountId);
+          `UPDATE ${tbl} SET balance = ?, balance_fetched_at = ? WHERE id = ?`
+        ).run(balance, balanceFetchedAt, accountId);
       }
       // else: login worked but scraping returned nothing — leave the old balance
       // AND its timestamp untouched, so the age doesn't falsely reset on a value
@@ -1500,11 +1511,11 @@ async function runLogin(
         // stored balance and its timestamp untouched, so the "age" never resets
         // onto a value that wasn't actually refreshed.
         if (fresh) {
+          const freshAt = new Date().toISOString();
           const liveDb = getDb();
           liveDb.prepare(
-            `UPDATE ${tbl} SET balance = ?, balance_fetched_at = CURRENT_TIMESTAMP WHERE id = ?`
-          ).run(fresh, accountId);
-          const freshAt = new Date().toISOString();
+            `UPDATE ${tbl} SET balance = ?, balance_fetched_at = ? WHERE id = ?`
+          ).run(fresh, freshAt, accountId);
           BrowserWindow.getAllWindows().forEach(w => {
             try {
               w.webContents.send('account:balanceUpdated', {
@@ -1535,11 +1546,14 @@ async function runLogin(
     if (contextToClose && shouldCloseAfterFetch) {
       await contextToClose.close().catch(() => {});
     }
-    endAutomation();
   }
 }
 
-async function downloadBrokerPortfolioReport(memberId: number, brokerId: number) {
+function downloadBrokerPortfolioReport(...args: Parameters<typeof downloadBrokerPortfolioReportInner>) {
+  return withAutomation(() => downloadBrokerPortfolioReportInner(...args));
+}
+
+async function downloadBrokerPortfolioReportInner(memberId: number, brokerId: number) {
   const db = getDb();
   const account = db.prepare(`
     SELECT * FROM broker_accounts WHERE id = ? AND member_id = ?
@@ -1592,7 +1606,6 @@ async function downloadBrokerPortfolioReport(memberId: number, brokerId: number)
     throw lastError;
   };
 
-  beginAutomation();
   try {
     const { page } = await launchSession({ profileKey: `BROKER-${code}-${memberId}` });
     const report = await adapter.downloadPortfolioReport(
@@ -1671,8 +1684,6 @@ async function downloadBrokerPortfolioReport(memberId: number, brokerId: number)
   } catch (e: any) {
     auditInsert.run(memberId, 'DOWNLOAD_BROKER_PORTFOLIO', code, 'FAILED', e.message);
     return { ok: false, error: e.message || String(e) };
-  } finally {
-    endAutomation();
   }
 }
 
@@ -1799,7 +1810,11 @@ async function buildOtpFetcher(_kind: 'BANK' | 'BROKER', code: string, adapter: 
   };
 }
 
-async function prepareAuIpoBid(payload: {
+function prepareAuIpoBid(...args: Parameters<typeof prepareAuIpoBidInner>) {
+  return withAutomation(() => prepareAuIpoBidInner(...args));
+}
+
+async function prepareAuIpoBidInner(payload: {
   memberId: number;
   bankId: number;
   brokerId?: number | null;
@@ -1867,7 +1882,6 @@ async function prepareAuIpoBid(payload: {
   };
 
   const auditInsert = db.prepare('INSERT INTO audit_log (member_id, action, target, status, details) VALUES (?, ?, ?, ?, ?)');
-  beginAutomation();
   try {
     const startTime = new Date();
     const fetchOtp = await buildOtpFetcher('BANK', 'AU', adapter, null, startTime);
@@ -1970,12 +1984,14 @@ async function prepareAuIpoBid(payload: {
   } catch (e: any) {
     auditInsert.run(payload.memberId, 'AU_IPO_PREPARE', issueName, 'FAILED', e?.message || String(e));
     return { ok: false, error: e?.message || String(e) };
-  } finally {
-    endAutomation();
   }
 }
 
-async function confirmAuIpoBid(bidRunId: number) {
+function confirmAuIpoBid(...args: Parameters<typeof confirmAuIpoBidInner>) {
+  return withAutomation(() => confirmAuIpoBidInner(...args));
+}
+
+async function confirmAuIpoBidInner(bidRunId: number) {
   const db = getDb();
   const bid = db.prepare(`
     SELECT *
@@ -2053,7 +2069,6 @@ async function confirmAuIpoBid(bidRunId: number) {
   }
 
   const auditInsert = db.prepare('INSERT INTO audit_log (member_id, action, target, status, details) VALUES (?, ?, ?, ?, ?)');
-  beginAutomation();
   try {
     const startTime = new Date();
     const fetchOtp = await buildOtpFetcher('BANK', 'AU', adapter, null, startTime);
@@ -2109,8 +2124,6 @@ async function confirmAuIpoBid(bidRunId: number) {
     `).run(e?.message || String(e), bidRunId);
     auditInsert.run(bid.member_id, 'AU_IPO_SUBMIT', bid.ipo_name, 'FAILED', e?.message || String(e));
     return { ok: false, error: e?.message || String(e) };
-  } finally {
-    endAutomation();
   }
 }
 

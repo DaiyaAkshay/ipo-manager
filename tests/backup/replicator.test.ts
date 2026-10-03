@@ -430,3 +430,17 @@ describe('backup/objectStore', () => {
     expect('note' in r && r.note).toMatch(/bucket lock/);
   });
 });
+
+ it('refuses a legacy snapshot ID collision without overwriting either copy', async () => {
+  const a = tmp('collision-a'), b = tmp('collision-b'), store = new MemoryStore();
+  const id = '2026-10-02T10-00-00.000Z';
+  writeSnapshot(a, id, [], 'first-encrypted-vault');
+  await replicate(a, store, P, emptyReplicationState());
+  writeSnapshot(b, id, [], 'other-encrypted-vault');
+  const path = join(b, 'snapshots', id, 'manifest.json');
+  const manifest = JSON.parse(readFileSync(path, 'utf8')); manifest.sourceHost = 'other-pc';
+  writeFileSync(path, JSON.stringify(manifest));
+  await expect(replicate(b, store, P, emptyReplicationState())).rejects.toThrow(/collision/);
+  expect(readFileSync(join(b, 'snapshots', id, 'vault.db'), 'utf8')).toBe('other-encrypted-vault');
+  expect((await store.get(`${P}/snapshots/${id}/vault.db`)).toString()).toBe('first-encrypted-vault');
+ });

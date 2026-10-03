@@ -1,5 +1,14 @@
 let lastActivity = Date.now();
 let activeAutomationCount = 0;
+let vaultReplacementCount = 0;
+
+/** Reserve the vault before asynchronous restore preparation can yield. */
+export function beginVaultReplacement(): boolean {
+  if (activeAutomationCount || vaultReplacementCount) return false;
+  vaultReplacementCount += 1;
+  return true;
+}
+export function endVaultReplacement(): void { vaultReplacementCount = Math.max(0, vaultReplacementCount - 1); }
 
 export const AUTOLOCK_MS = 30 * 60 * 1000;
 /**
@@ -14,6 +23,7 @@ export function markActivity(): void {
 }
 
 export function beginAutomation(): void {
+  if (vaultReplacementCount) throw new Error('Vault sync is running. Try the bank/broker operation again in a moment.');
   activeAutomationCount += 1;
   markActivity();
 }

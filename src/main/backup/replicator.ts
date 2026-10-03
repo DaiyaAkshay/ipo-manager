@@ -32,11 +32,12 @@ import {
   rmSync, rmdirSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import type { ObjectStore, StoredObject } from './objectStore';
 
 export const MANIFEST = 'manifest.json';
 const META = 'meta.json';
-const SNAPSHOT_ID_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(\.\d{3})?Z$/;
+const SNAPSHOT_ID_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(\.\d{3})?Z(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$/;
 const BLOB_RE = /^[A-Za-z0-9-]+\.enc$/;
 const SNAPSHOT_FILE_RE = /^[A-Za-z0-9._-]+$/;
 /** A remote snapshot with no manifest this old is an abandoned upload. */
@@ -57,6 +58,8 @@ const SETTINGS_KEEP = 3;
 export interface ReplicationState {
   /** Snapshot ids both sides had, as of the last pass. */
   synced: string[];
+  /** Manifest identity verified against the remote listing (legacy ID collision guard). */
+  verifiedManifests?: Record<string, string>;
   /** Snapshots this PC pruned → last time a remote delete was attempted. */
   tombstones: Record<string, number>;
   /** Remote blob → when it was first seen unreferenced. */
@@ -197,6 +200,7 @@ export async function replicate(
     state: {
       synced: [], tombstones: { ...prev.tombstones }, orphanBlobsSince: { ...prev.orphanBlobsSince },
       deleteAttempts: { ...(prev.deleteAttempts || {}) },
+      verifiedManifests: {},
     },
     uploadedSnapshots: [], downloadedSnapshots: [], deletedRemote: [], deletedLocal: [],
     uploadedBlobs: 0, downloadedBlobs: 0, warnings: [], moreToDownload: false,
@@ -221,6 +225,20 @@ export async function replicate(
   const remote = groupRemote(await store.list(`${prefix}/`), prefix);
   const remoteComplete = () => new Set([...remote.snapshots].filter(([, f]) => f.has(MANIFEST)).map(([id]) => id));
   let local = localSnapshots(root);
+  // Older builds used timestamp-only IDs. Never silently adopt a different
+  // snapshot under the same ID, even when both files happen to have equal size.
+  for (const [id, snap] of local) {
+    const object = remote.snapshots.get(id)?.get(MANIFEST);
+    if (!snap.complete || !object) continue;
+    const manifest = readFileSync(localManifestPath(root, id));
+    const fingerprint = `${createHash('sha256').update(manifest).digest('hex')}:${object.lastModified}:${object.size}`;
+    if (prev.verifiedManifests?.[id] !== fingerprint) {
+      if (!manifest.equals(await store.get(object.key))) {
+        throw new Error(`Snapshot ID collision (${id}): local and cloud contents differ. Both copies have been preserved; sync stopped.`);
+      }
+    }
+    report.state.verifiedManifests![id] = fingerprint;
+  }
 
   const snapKey = (id: string, file: string) => `${prefix}/snapshots/${id}/${file}`;
   const blobKey = (uuid: string) => `${prefix}/blobs/${uuid}.enc`;

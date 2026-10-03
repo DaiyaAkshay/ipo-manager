@@ -220,3 +220,10 @@ describe('selectSnapshotsToKeep', () => {
     expect(keep.has(ancient.id)).toBe(false);
   });
 });
+
+ it('retains the lexically newest head when UUID snapshots share a timestamp', () => {
+  const now = Date.UTC(2026, 9, 3), ts = now - 200 * 86_400_000;
+  const older = '2026-03-17T00-00-00.000Z_00000000-0000-4000-8000-000000000000';
+  const head = '2026-03-17T00-00-00.000Z_ffffffff-ffff-4fff-8fff-ffffffffffff';
+  expect(selectSnapshotsToKeep([{ id: older, ts }, { id: head, ts }], now)).toEqual(new Set([head]));
+ });
