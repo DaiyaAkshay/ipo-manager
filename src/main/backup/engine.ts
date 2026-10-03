@@ -61,6 +61,8 @@ import { syncGmailSettings } from './appSettings';
 import { applyGmailSyncPayload, getGmailSyncPayload } from '../email/gmail';
 import { R2Store, normalizePrefix, testObjectStore } from './objectStore';
 import keytar from 'keytar';
+import { activeAutomations, beginVaultReplacement, endVaultReplacement } from '../activity';
+import { mergeBalancesAndAudit } from './balanceMerge';
 
 const FIELD_KEYTAR_SERVICE = 'ipo-manager';
 const FIELD_KEYTAR_ACCOUNT = 'field-encryption-key-v1';
@@ -461,12 +463,12 @@ function getSnapshotsDir(root: string): string {
 
 function newSnapshotId(atMs: number = Date.now()): string {
   // ISO with colons replaced (Windows file system can't have colons)
-  return new Date(atMs).toISOString().replace(/:/g, '-');
+  return `${new Date(atMs).toISOString().replace(/:/g, '-')}_${randomUUID()}`;
 }
 
 function parseSnapshotIdTimestamp(id: string): Date | null {
   // Reverse the colon escape
-  const iso = id.replace(/T(\d{2})-(\d{2})-(\d{2})/, 'T$1:$2:$3');
+  const iso = id.split('_')[0].replace(/T(\d{2})-(\d{2})-(\d{2})/, 'T$1:$2:$3');
   const d = new Date(iso);
   return Number.isFinite(d.getTime()) ? d : null;
 }
@@ -589,6 +591,12 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
     if (existsSync(snapshotDbPath)) unlinkSync(snapshotDbPath);
     db.prepare(`VACUUM INTO ?`).run(snapshotDbPath);
     const dbBytes = statSync(snapshotDbPath).size;
+    // Capture before any await: edits during keychain/network I/O belong to
+    // the next snapshot, never the baseline of the one already copied.
+    const snapshotLiveHash = getLocalDbHash();
+    const docs = db.prepare(`
+      SELECT file_uuid, original_name, sha256, file_size FROM documents
+    `).all() as Array<{ file_uuid: string; original_name: string; sha256: string; file_size: number }>;
 
     // 2) vault.meta.json — copy as-is. Contains the Argon2 salt + params
     //    that the master password was hashed with. Without this, a second
@@ -606,11 +614,8 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
       writeFileSync(join(snapshotDir, 'field-key.bin'), encryptedFieldKey);
     }
 
-    // 3) Documents — copy any .enc file referenced by the DB into the shared
-    //    blobs/ folder if not already present (incremental).
-    const docs = db.prepare(`
-      SELECT file_uuid, original_name, sha256, file_size FROM documents
-    `).all() as Array<{ file_uuid: string; original_name: string; sha256: string; file_size: number }>;
+    // 3) Documents — copy the references captured with the DB snapshot into
+    //    blobs/ if not already present (incremental).
     const blobsDir = getBlobsDir(root);
     let copied = 0;
     let reused = 0;
@@ -681,7 +686,7 @@ export async function createSnapshot(masterKey: Buffer, opts: CreateSnapshotOpti
       ...(uploadError ? {} : { lastBackupAt: new Date().toISOString() }),
       lastBackupError: null,
       lastSnapshotId: snapshotId,
-      lastSyncedDbHash: getLocalDbHash(),
+      lastSyncedDbHash: snapshotLiveHash,
       lineage: [snapshotId, ...ancestors].slice(0, MAX_LINEAGE),
       lastSyncError: uploadError,
       conflict: null,
@@ -936,10 +941,12 @@ export async function restoreSnapshot(
   if (_inProgress) {
     return { ok: false, error: 'A backup or sync is already running. Try again in a moment.' };
   }
+  if (!beginVaultReplacement()) return { ok: false, error: 'Wait for the running bank/broker login or vault sync to finish, then try again.' };
   _inProgress = true;
   try {
     return await restoreSnapshotInner(snapshotId, masterPassword, options);
   } finally {
+    endVaultReplacement();
     _inProgress = false;
   }
 }
@@ -1342,13 +1349,46 @@ function recordConflict(decision: Extract<SyncDecision, { kind: 'conflict' }>, h
   return { action: 'conflict', conflict, conflictIsNew: !same };
 }
 
+/** Merge only derived account observations; every other record must agree. */
+async function tryMergeBalanceConflict(remoteId: string, liveKey: Buffer): Promise<SyncOutcome | null> {
+  if (suspended || _inProgress || activeAutomations()) return null;
+  const root = getActiveRoot();
+  if (!root) return null;
+  const dir = join(getSnapshotsDir(root), remoteId);
+  let remote: Database.Database | undefined;
+  try {
+    const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8')) as SnapshotManifest;
+    const meta = JSON.parse(readFileSync(join(dir, 'vault.meta.json'), 'utf8')) as VaultMeta;
+    const liveMeta = getVaultMeta();
+    const dbPath = join(dir, 'vault.db');
+    if (!liveMeta || !sameKdf(liveMeta, meta) || !manifest.dbSha256 || sha256File(dbPath) !== manifest.dbSha256) return null;
+    const fieldKey = await readFieldKey();
+    if (!fieldKey || !fieldKey.equals(aesDecryptBuffer(liveKey, readFileSync(join(dir, 'field-key.bin'))))) return null;
+    if (suspended || activeAutomations()) return null;
+    remote = new Database(dbPath, { readonly: true });
+    remote.pragma("cipher='chacha20'");
+    remote.pragma(`key = "x'${liveKey.toString('hex')}'"`);
+    if (!mergeBalancesAndAudit(getDb(), remote)) return null;
+    remote.close(); remote = undefined;
+    // Record the union as a child of both histories, including a sibling
+    // snapshot written during an overlapping publish.
+    const res = await createSnapshot(liveKey, { supersedes: [remoteId] });
+    if (!res.ok) return { action: 'error', error: res.error };
+    updateState({ conflict: null, lastSyncError: res.uploadError ?? null });
+    return { action: 'pulled', sourceHost: manifest.sourceHost, snapshotTimestamp: manifest.timestamp };
+  } catch {
+    // Schema/key/integrity differences stay on the conservative conflict path.
+    return null;
+  } finally { remote?.close(); }
+}
+
 async function applyFastForward(
   remoteSnapshotId: string,
   masterPassword: string,
   liveKey: Buffer,
   opts: { safetyCopy?: boolean } = {},
 ): Promise<SyncOutcome> {
-  if (suspended) return { action: 'none' };
+  if (suspended || activeAutomations()) return { action: 'none' };
   const r = await restoreSnapshot(remoteSnapshotId, masterPassword, { liveKey, safetyCopy: opts.safetyCopy });
   if (!r.ok) {
     const stillSyncing = r.error === STILL_SYNCING_ERROR;
@@ -1418,7 +1458,7 @@ export async function syncOnUnlock(opts: {
       outcome = await applyFastForward(decision.remoteSnapshotId, opts.masterPassword, opts.liveKey);
       break;
     case 'conflict':
-      outcome = recordConflict(decision, head);
+      outcome = (await tryMergeBalanceConflict(decision.remoteSnapshotId, opts.liveKey)) ?? recordConflict(decision, head);
       break;
     case 'pending':
       updateState({ lastSyncError: PENDING_MESSAGE });
@@ -1491,7 +1531,7 @@ export async function syncTick(opts: {
     }
     return { action: ready.skip === 'missing' ? 'error' : 'disabled' };
   }
-  if (_inProgress || suspended) return { action: 'none' };
+  if (_inProgress || suspended || activeAutomations()) return { action: 'none' };
   await syncSettings(ready.root);
 
   // A manual restore whose publish failed earlier: finish it before anything
@@ -1512,7 +1552,8 @@ export async function syncTick(opts: {
       if (!opts.canPull) return { action: 'none' };
       return applyFastForward(decision.remoteSnapshotId, opts.masterPassword, opts.liveKey);
     case 'conflict':
-      return recordConflict(decision, head);
+      if (!opts.canPull || !opts.canPush) return { action: 'none' };
+      return (await tryMergeBalanceConflict(decision.remoteSnapshotId, opts.liveKey)) ?? recordConflict(decision, head);
     case 'pending':
       if (state.lastSyncError !== PENDING_MESSAGE) updateState({ lastSyncError: PENDING_MESSAGE });
       return { action: 'pending' };
@@ -1618,7 +1659,9 @@ export async function resolveSyncConflict(
 export async function backupNow(opts: { masterPassword: string; liveKey: Buffer }): Promise<
   CreateSnapshotResult & { pulledFrom?: string | null; newMasterKey?: Buffer }
 > {
+  if (activeAutomations()) return { ok: false, error: 'Wait for the running bank/broker login to finish, then try again.' };
   const ready = await syncRoot();
+  if (activeAutomations()) return { ok: false, error: 'Wait for the running bank/broker login to finish, then try again.' };
   if ('skip' in ready) {
     return { ok: false, error: 'message' in ready ? ready.message : 'Backup is not configured (folder not chosen).' };
   }
@@ -1631,6 +1674,9 @@ export async function backupNow(opts: { masterPassword: string; liveKey: Buffer 
   const decision = decideSync(state, head, pullDirty(state, localHash));
   if (decision.kind === 'pending') return { ok: false, error: PENDING_MESSAGE };
   if (decision.kind === 'conflict') {
+    const merged = await tryMergeBalanceConflict(decision.remoteSnapshotId, opts.liveKey);
+    if (merged?.action === 'pulled') return { ok: true, snapshotId: getBackupState().lastSnapshotId!, pulledFrom: merged.sourceHost, newMasterKey: Buffer.from(opts.liveKey) };
+    if (merged?.action === 'error') return { ok: false, error: merged.error || 'Could not publish merged balances.' };
     const outcome = recordConflict(decision, head);
     return { ok: false, error: `Sync conflict with ${outcome.conflict?.remoteHost || 'another PC'} — choose which copy to keep.` };
   }

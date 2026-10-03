@@ -155,7 +155,7 @@ export function selectSnapshotsToKeep(snaps: Array<{ id: string; ts: number }>, 
   const day = 24 * hour;
   const keep = new Set<string>();
   const buckets = new Set<string>();
-  const sorted = [...snaps].filter(s => s.ts > 0).sort((a, b) => b.ts - a.ts);
+  const sorted = [...snaps].filter(s => s.ts > 0).sort((a, b) => b.ts - a.ts || b.id.localeCompare(a.id));
   if (sorted[0]) keep.add(sorted[0].id);
 
   for (const s of sorted) {

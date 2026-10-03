@@ -96,6 +96,7 @@ async function seed() {
   for (const code of ['AU', 'HDFC']) {
     db.prepare('INSERT INTO bank_accounts (member_id, bank_code, balance) VALUES (1, ?, ?)').run(code, '₹100.00');
   }
+  db.prepare("INSERT INTO broker_accounts (member_id, broker_code, balance) VALUES (1, 'ZERODHA', '₹100.00')").run();
   expect((await engine.createSnapshot(a.key)).ok).toBe(true);
   const b = await newDevice();
   expect((await unlock(b)).action).toBe('pulled');
@@ -154,21 +155,25 @@ function balances() {
     expect(balances()).toEqual(expected);
   });
 
-  it('does not merge different bank balances fetched concurrently on different devices', async () => {
+  it('merges independent balances and login history from two devices', async () => {
     const { a, b } = await seed();
     await activate(a); fetchBalance(1, '₹11000.00');
+    connection.getDb().prepare("INSERT INTO audit_log (action, target) VALUES ('LOGIN_BANK', 'AU')").run();
     await activate(b); fetchBalance(2, '₹22000.00');
+    connection.getDb().prepare("UPDATE broker_accounts SET balance='₹300.00', balance_fetched_at='2026-10-02T10:00:00Z' WHERE id=1").run();
+    connection.getDb().prepare("INSERT INTO audit_log (action, target) VALUES ('LOGIN_BANK', 'HDFC')").run();
     await activate(a);
     expect((await engine.backupNow({ masterPassword: password, liveKey: a.key })).ok).toBe(true);
-    expect((await tick(b)).action).toBe('conflict');
-    expect(balances().map(row => row.balance)).toEqual(['₹100.00', '₹22000.00']);
-    expect((await engine.resolveSyncConflict('keep-local', { masterPassword: password, liveKey: b.key })).action).toBe('pushed');
+    expect((await tick(b)).action).toBe('pulled');
+    expect(balances().map(row => row.balance)).toEqual(['₹11000.00', '₹22000.00']);
+    expect(connection.getDb().prepare('SELECT COUNT(*) AS n FROM audit_log').get()).toEqual({ n: 2 });
     expect((await tick(a)).action).toBe('pulled');
-    // Choosing PC B's whole vault replaces A's independent AU refresh.
-    expect(balances().map(row => row.balance)).toEqual(['₹100.00', '₹22000.00']);
+    expect(balances().map(row => row.balance)).toEqual(['₹11000.00', '₹22000.00']);
+    expect(connection.getDb().prepare('SELECT balance FROM broker_accounts WHERE id=1').get()).toEqual({ balance: '₹300.00' });
+    expect((await tick(b)).action).toBe('none');
   });
 
-  it('reproduces an undetected collision when two stale caches allocate the same snapshot id', async () => {
+  it('keeps stale concurrent snapshot IDs distinct and converges both updates', async () => {
     const { a, b } = await seed();
     await activate(a); fetchBalance(1, '₹66000.00');
     await activate(b); fetchBalance(2, '₹77000.00');
@@ -182,14 +187,60 @@ function balances() {
     await activate(b);
     const bPush = await engine.createSnapshot(b.key);
     expect(bPush.ok).toBe(true);
-    expect(bPush.snapshotId).toBe(aPush.snapshotId);
-    // Existing ids are trusted without comparing content. B appears clean,
-    // but its balance update was never uploaded and no conflict is raised.
-    expect((await tick(b)).action).toBe('none');
-    expect(balances().map(row => row.balance)).toEqual(['₹100.00', '₹77000.00']);
+    expect(bPush.snapshotId).not.toBe(aPush.snapshotId);
+    // Whichever UUID sorts first is a sibling, not a lost upload. Both writers
+    // revisit the head and publish a union that every receiver can pull.
+    for (let i = 0; i < 2; i++) { await tick(a); await tick(b); }
+    expect(balances().map(row => row.balance)).toEqual(['₹66000.00', '₹77000.00']);
     const c = await newDevice();
     expect((await unlock(c)).action).toBe('pulled');
-    expect(balances().map(row => row.balance)).toEqual(['₹66000.00', '₹100.00']);
+    expect(balances().map(row => row.balance)).toEqual(['₹66000.00', '₹77000.00']);
+  });
+
+  it('keeps the newer same-account observation, even when the newer balance is smaller', async () => {
+    const { a, b } = await seed();
+    await activate(a);
+    connection.getDb().prepare("UPDATE bank_accounts SET balance='₹900.00', balance_fetched_at='2026-10-02T10:00:00.001Z' WHERE id=1").run();
+    await activate(b);
+    connection.getDb().prepare("UPDATE bank_accounts SET balance='₹800.00', balance_fetched_at='2026-10-02T10:00:00.002Z' WHERE id=1").run();
+    await activate(a);
+    expect((await engine.backupNow({ masterPassword: password, liveKey: a.key })).ok).toBe(true);
+    expect((await tick(b)).action).toBe('pulled');
+    expect(balances()[0].balance).toBe('₹800.00');
+    expect(balances()[0].balance_fetched_at).toBe('2026-10-02T10:00:00.002Z');
+    expect((await tick(a)).action).toBe('pulled');
+    expect(balances()[0].balance).toBe('₹800.00');
+  });
+
+  it('preserves local changes and asks for a choice when credential records differ', async () => {
+    const { a, b } = await seed();
+    await activate(a);
+    connection.getDb().prepare("UPDATE bank_accounts SET password_enc=? WHERE id=1").run(Buffer.from('synthetic changed credential'));
+    await activate(b); fetchBalance(2, '₹777.00');
+    await activate(a);
+    expect((await engine.backupNow({ masterPassword: password, liveKey: a.key })).ok).toBe(true);
+    expect((await tick(b)).action).toBe('conflict');
+    expect(balances()[1].balance).toBe('₹777.00');
+    expect(connection.getDb().prepare('SELECT password_enc FROM bank_accounts WHERE id=1').get()).toEqual({ password_enc: null });
+  });
+
+  it('rechecks automation state after a sync preflight yields to a new login', async () => {
+    const { a, b } = await seed();
+    await activate(a); fetchBalance(1, '₹888.00');
+    expect((await engine.backupNow({ masterPassword: password, liveKey: a.key })).ok).toBe(true);
+    await activate(b);
+    const activity = await import('../../src/main/activity');
+    const originalList = shared.list.bind(shared);
+    vi.spyOn(shared, 'list').mockImplementationOnce(async prefix => {
+      activity.beginAutomation();
+      return originalList(prefix);
+    });
+    try {
+      expect((await engine.syncTick({ masterPassword: password, liveKey: b.key, canPull: true, canPush: true })).action).toBe('none');
+      expect(connection.getDb().open).toBe(true);
+      expect(balances()[0].balance).toBe('₹100.00');
+    } finally { activity.endAutomation(); }
+    expect((await tick(b)).action).toBe('pulled');
   });
 
   it('defers incoming balances while an automation is active, then applies them', async () => {
@@ -202,7 +253,7 @@ function balances() {
     expect(balances()[0].balance).toBe('₹33000.00');
   });
 
-  it('reproduces manual sync replacing a database still held by a bank automation', async () => {
+  it('refuses manual sync while a bank automation holds the database', async () => {
     const { a, b } = await seed();
     await activate(a); fetchBalance(1, '₹88000.00');
     expect((await engine.backupNow({ masterPassword: password, liveKey: a.key })).ok).toBe(true);
@@ -212,17 +263,56 @@ function balances() {
     activity.beginAutomation();
     try {
       expect(activity.activeAutomations()).toBe(1);
-      // backup:runNow invokes this directly without checking activeAutomations.
       const result = await engine.backupNow({ masterPassword: password, liveKey: b.key });
-      expect(result.ok).toBe(true);
-      if (result.newMasterKey) b.key = result.newMasterKey;
-      expect(balances()[0].balance).toBe('₹88000.00');
-      expect(dbHeldByLogin.open).toBe(false);
-      expect(() => dbHeldByLogin.prepare('UPDATE bank_accounts SET balance = ? WHERE id = 2'))
-        .toThrow(/not open|closed/i);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toMatch(/running bank/);
+      expect(balances()[0].balance).toBe('₹100.00');
+      expect(dbHeldByLogin.open).toBe(true);
+      expect(() => dbHeldByLogin.prepare('UPDATE bank_accounts SET balance = ? WHERE id = 2')).not.toThrow();
     } finally {
       activity.endAutomation();
     }
+  });
+
+  it('blocks a new login while asynchronous restore preparation owns the vault', async () => {
+    const { a, b } = await seed();
+    await activate(a); fetchBalance(1, '₹555.00');
+    const published = await engine.backupNow({ masterPassword: password, liveKey: a.key });
+    expect(published.ok).toBe(true);
+    if (!published.ok) throw new Error(published.error);
+    await activate(b);
+    const activity = await import('../../src/main/activity');
+    const pendingRestore = engine.restoreSnapshot(published.snapshotId, password, { liveKey: b.key });
+    expect(() => activity.beginAutomation()).toThrow(/Vault sync/);
+    expect(activity.activeAutomations()).toBe(0);
+    const restored = await pendingRestore;
+    expect(restored.ok).toBe(true);
+    if (restored.ok) b.key = restored.masterKey;
+    activity.beginAutomation(); activity.endAutomation();
+    expect(balances()[0].balance).toBe('₹555.00');
+  });
+
+  it('keeps writes made during upload dirty and delivers them in the next snapshot', async () => {
+    const { a, b } = await seed();
+    await activate(a); fetchBalance(1, '₹111.00');
+    const put = shared.put.bind(shared);
+    let edited = false;
+    vi.spyOn(shared, 'put').mockImplementation(async (key, body) => {
+      if (!edited && key.endsWith('/vault.db')) {
+        edited = true; fetchBalance(2, '₹222.00');
+      }
+      return put(key, body);
+    });
+    expect((await engine.backupNow({ masterPassword: password, liveKey: a.key })).ok).toBe(true);
+    expect(edited).toBe(true);
+    expect(engine.getBackupState().lastSyncedDbHash).not.toBe(engine.getLocalDbHash());
+    expect((await tick(b)).action).toBe('pulled');
+    expect(balances().map(r => r.balance)).toEqual(['₹111.00', '₹100.00']);
+    expect((await tick(a)).action).toBe('none');
+    now += engine.PUSH_SETTLE_MS;
+    expect((await tick(a)).action).toBe('pushed');
+    expect((await tick(b)).action).toBe('pulled');
+    expect(balances().map(r => r.balance)).toEqual(['₹111.00', '₹222.00']);
   });
 
   it('keeps an offline device unchanged and catches up after reconnection', async () => {

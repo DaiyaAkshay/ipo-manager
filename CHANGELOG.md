@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.10
+
+- Merge concurrent bank/broker balance observations per account when all other vault records match; preserve login history from both PCs.
+- Use timestamp + UUID snapshot IDs and detect collisions in older timestamp-only snapshots instead of silently losing an upload.
+- Reserve the vault during restore preparation and block manual sync during bank/broker operations, including logins that start during a network request.
+- Keep changes made during keychain access or upload dirty for the next snapshot, using the live DB hash and document references captured with the snapshot.
+- Store successful balance fetch times in millisecond UTC precision. Same-time observations use a deterministic tie-break; keep Windows clocks synchronized.
+- Upgrade every Windows PC sharing the backup to 0.3.10 before concurrent use. Earlier builds cannot discover the new snapshot directory names. Existing snapshots and encrypted vault files remain readable.
+
 ## 0.3.9
 
 - Faster R2 unlock: fetch the newest snapshot first and download older history in small batches.
