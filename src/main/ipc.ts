@@ -40,6 +40,7 @@ import { parseAngelPortfolioReport } from './reports/angelWorkbook';
 import { parseDhanPortfolioReport } from './reports/dhanWorkbook';
 import { parseZerodhaPortfolioReport } from './reports/zerodhaWorkbook';
 import { listCachedIpoIssues, refreshIpoCatalog } from './ipo/catalog';
+import { addQuotaWatch, getMarketSettings, getMarketSnapshot, removeQuotaWatch, setGmpEnabled } from './market/service';
 import {
   getBackupConfig as backupGetConfig,
   setBackupConfig as backupSetConfig,
@@ -1077,6 +1078,24 @@ export function registerIpcHandlers(ipc: IpcMain): void {
   ipc.handle('ipo:refreshCatalog', async () => {
     return refreshIpoCatalog();
   });
+
+  // ── Market intelligence (IPO GMP, bonus/rights, shareholder quota) ─────────
+  ipc.handle('market:getSnapshot', async (_, payload?: { force?: boolean }) => {
+    try {
+      return { ok: true, snapshot: await getMarketSnapshot(!!payload?.force) };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || String(e) };
+    }
+  });
+
+  ipc.handle('market:getSettings', async () => getMarketSettings());
+
+  ipc.handle('market:setGmpEnabled', async (_, payload: { enabled: boolean }) => setGmpEnabled(!!payload?.enabled));
+
+  ipc.handle('market:addQuotaWatch', async (_, payload: { parentSymbol: string; ipoName: string; cutoffDate?: string | null; note?: string }) =>
+    addQuotaWatch(payload || ({} as any)));
+
+  ipc.handle('market:removeQuotaWatch', async (_, payload: { id: string }) => removeQuotaWatch(String(payload?.id || '')));
 
   // ── Backup IPC ──────────────────────────────────────────────────────────────
   ipc.handle('backup:getConfig', async () => backupGetConfig());

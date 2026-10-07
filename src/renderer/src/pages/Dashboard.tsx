@@ -16,6 +16,7 @@ import miraeLogo from '../assets/logos/mirae.png';
 import shoonyaLogo from '../assets/logos/shoonya.png';
 import fyersLogo from '../assets/logos/fyers.png';
 import growwLogo from '../assets/logos/groww.png';
+import { MarketIntelPage } from './MarketIntel';
 
 // â"€â"€ Types â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
@@ -654,7 +655,7 @@ const EMPTY_R2_FORM: R2Form = { accountId: '', bucket: '', accessKeyId: '', secr
 
 // 'all' = View All, 'spreadsheet' = every member's balances in one table,
 // 'recharge' = SIM recharge tracker, 'totp' = Zerodha TOTP, number = specific family id
-type SelectedView = 'all' | 'spreadsheet' | 'recharge' | 'totp' | number;
+type SelectedView = 'all' | 'spreadsheet' | 'recharge' | 'totp' | 'market' | number;
 
 // â"€â"€ Dashboard â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
@@ -3388,6 +3389,13 @@ export default function Dashboard() {
 
           <div className="nav-section" style={{ marginTop: 24 }}>Tools</div>
           <div
+            className={`nav-item ${selectedView === 'market' ? 'active' : ''}`}
+            onClick={() => setSelectedView('market')}
+            title="Open and upcoming IPOs with GMP and subscription, bonus/rights record dates, and shareholder-quota picks"
+          >
+            <span className="nav-item-name">Market Watch</span>
+          </div>
+          <div
             className={`nav-item ${selectedView === 'spreadsheet' ? 'active' : ''}`}
             onClick={() => setSelectedView('spreadsheet')}
             title="Every member's bank and broker balances in one sortable, filterable table"
@@ -3508,6 +3516,8 @@ export default function Dashboard() {
         )}
 
         {selectedView === 'recharge' && <RechargeTrackerPage />}
+
+        {selectedView === 'market' && <MarketIntelPage />}
 
         {/* ── Zerodha TOTP ── */}
         {selectedView === 'totp' && <ZerodhaTotpPage />}

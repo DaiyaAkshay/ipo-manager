@@ -99,3 +99,35 @@ SHA-512 and size match the rebuilt installer. Existing build notices about the
 AI usage import/chunk size, default icon and absent signing certificate remain.
 No live vault was opened or modified. Installer installation on a real profile,
 live R2/Gmail/banking integration and physical multi-PC timing are not verified.
+
+## 2026-10-07 — Market Watch and AU IPO Smart hand-off
+
+AU IPO Smart (`iposmart.au.bank.in`, page title "Easba") now only opens from
+the netbanking hand-off. Checked live without logging in: the bare host
+returns 404 and `/ipo-onnet-aub/` redirects to
+`error-view?key=NOT_VALID_HDR_PAYLOAD_MSG`. The direct-URL fallback is removed
+and that error page is reported as a hand-off failure. When the menu path
+fails, the visible dashboard controls are written to `automation.log` so the
+labels can be updated from a real run. The post-login menu and bid form were
+not seen in this change; they need one live run by the owner.
+
+Market data comes from public NSE JSON (`ipo-current-issue`,
+`all-upcoming-issues`, `ipo-detail`, `corporates-corporateActions`,
+`corporate-board-meetings`). They answered without cookies on 2026-10-07;
+`quote-equity` did not (403), so no live prices are shown. NSE reports
+`0.00` times for a category with nothing offered; that is treated as unknown,
+and the total subscription is taken from `ipo-current-issue.noOfTime`.
+
+SME issues are excluded: the owner does not bid in them.
+
+GMP is unofficial and comes from the ipowatch.in GMP table. It is on by
+default and can be turned off in the page. All scoring lives in the pure
+`market/intel.ts` with fixed point rules listed in its comment. Verdicts show
+their reasons and are a checklist, not advice. "Preferential allotment" in
+the request is read as the IPO shareholder reservation, which retail
+investors can use by holding the parent's shares on the RHP date. Real SEBI
+preferential issues go to named allottees, so they appear only as
+board-meeting signals. The quota watchlist holds symbols only and is stored
+in `data/market.json`, outside the encrypted vault. This avoids a schema
+migration that the Android viewer would also need.
+
