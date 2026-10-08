@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.15
+
+- Kotak: the overdraft appears under "Banking Accounts (INR)" as a negative balance. That is now read as Outstanding. The app opens the account to look for the available (withdrawable) amount and no longer clicks the Loans products menu.
+- Dhan: after logging into Journal by Dhan, any Journal page showing holdings and an export control is accepted, and the Journal's Holdings link is tried. The page text is logged (digits masked) if it still isn't found.
+
 ## 0.3.14
 
 - Zerodha/Dhan/Angel: after "Save & Open", the broker card shows the downloaded report's portfolio value and time when that is newer than the last login balance. Previously the older login figure always won.
