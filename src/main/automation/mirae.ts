@@ -16,6 +16,7 @@
  */
 
 import { Page, Locator } from 'playwright';
+import { otpOrManual, otpPromptOnPage } from './manualStep';
 import { LoginAdapter, LoginCredentials } from './browser';
 
 const LOGIN_URL = 'https://trade.mstock.com/';
@@ -293,20 +294,24 @@ export const miraeAdapter: LoginAdapter = {
     }
 
     try {
-      const otp = await fetchOtp();
-      console.log(`[mStock] ✓ OTP received (${otp.length} digits)`);
-      const filled = await fillDigits(page, otp, 'OTP');
-      if (!filled) {
-        console.warn('[mStock] Could not find OTP input(s) to fill.');
-        await dumpDiagnostics(page, 'otp-fill-fail');
-        return;
-      }
-
-      if (await clickPrimary(page, ['Verify', 'Submit', 'Continue', 'Confirm', 'Login'])) {
-        console.log('[mStock] ✓ OTP submitted');
+      const otp = await otpOrManual(page, fetchOtp, 'mStock', otpPromptOnPage(page));
+      if (!otp) {
+        console.log('[mStock] OTP step finished in the browser (or timed out) — continuing.');
       } else {
-        await page.keyboard.press('Enter').catch(() => {});
-        console.log('[mStock] ✓ Pressed Enter to submit OTP');
+        console.log(`[mStock] ✓ OTP received (${otp.length} digits)`);
+        const filled = await fillDigits(page, otp, 'OTP');
+        if (!filled) {
+          console.warn('[mStock] Could not find OTP input(s) to fill.');
+          await dumpDiagnostics(page, 'otp-fill-fail');
+          return;
+        }
+
+        if (await clickPrimary(page, ['Verify', 'Submit', 'Continue', 'Confirm', 'Login'])) {
+          console.log('[mStock] ✓ OTP submitted');
+        } else {
+          await page.keyboard.press('Enter').catch(() => {});
+          console.log('[mStock] ✓ Pressed Enter to submit OTP');
+        }
       }
     } catch (e: any) {
       const msg: string = e?.message ?? String(e);

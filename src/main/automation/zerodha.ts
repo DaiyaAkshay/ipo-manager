@@ -1,4 +1,5 @@
 import { Download, Locator, Page } from 'playwright';
+import { otpOrManual } from './manualStep';
 import { TOTP } from 'totp-generator';
 import { DownloadedBrokerReport, LoginAdapter, LoginCredentials, resolveBrowserDownload } from './browser';
 
@@ -210,30 +211,34 @@ async function completeZerodhaCredentialFlow(
   try {
     const otp = creds.totpSecret
       ? (await TOTP.generate(creds.totpSecret)).otp
-      : await fetchOtp();
-    console.log(`[Zerodha] TOTP generated (${otp.length} digits)`);
-    await pinField.clear();
-    await pinField.fill(otp);
-
-    const autoSubmitted = await page.waitForURL(successUrlRe, { timeout: 4_000 })
-      .then(() => true)
-      .catch(() => false);
-
-    if (autoSubmitted) {
-      console.log('[Zerodha] 2FA auto-submitted');
-      return;
-    }
-
-    const submitBtn = page.locator('button[type="submit"]').first();
-    const canClickSubmit = await submitBtn.isVisible().catch(() => false)
-      && await submitBtn.isEnabled().catch(() => false);
-
-    if (canClickSubmit) {
-      await submitBtn.click();
-      console.log('[Zerodha] 2FA submitted');
+      : await otpOrManual(page, fetchOtp, 'Zerodha', pinField);
+    if (!otp) {
+      console.log('[Zerodha] OTP step finished in the browser (or timed out) — continuing.');
     } else {
-      await pinField.press('Enter');
-      console.log('[Zerodha] Pressed Enter to submit 2FA');
+      console.log(`[Zerodha] TOTP generated (${otp.length} digits)`);
+      await pinField.clear();
+      await pinField.fill(otp);
+
+      const autoSubmitted = await page.waitForURL(successUrlRe, { timeout: 4_000 })
+        .then(() => true)
+        .catch(() => false);
+
+      if (autoSubmitted) {
+        console.log('[Zerodha] 2FA auto-submitted');
+        return;
+      }
+
+      const submitBtn = page.locator('button[type="submit"]').first();
+      const canClickSubmit = await submitBtn.isVisible().catch(() => false)
+        && await submitBtn.isEnabled().catch(() => false);
+
+      if (canClickSubmit) {
+        await submitBtn.click();
+        console.log('[Zerodha] 2FA submitted');
+      } else {
+        await pinField.press('Enter');
+        console.log('[Zerodha] Pressed Enter to submit 2FA');
+      }
     }
   } catch (e: any) {
     const msg: string = e?.message ?? String(e);

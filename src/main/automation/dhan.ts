@@ -23,6 +23,7 @@
  */
 
 import { Download, Page, Locator } from 'playwright';
+import { otpOrManual, otpPromptOnPage } from './manualStep';
 import { DownloadedBrokerReport, LoginAdapter, LoginCredentials, resolveBrowserDownload } from './browser';
 
 // Skip the platform-select screen entirely by deep-linking to the
@@ -328,20 +329,24 @@ export const dhanAdapter: LoginAdapter = {
     // ── Fetch OTP from Gmail and fill, if needed ─────────────────────────────
     if (nextStep === 'otp') {
       try {
-        const otp = await fetchOtp();
-        console.log(`[Dhan] ✓ OTP received (${otp.length} digits)`);
-        const filled = await fillDigits(page, otp, 'OTP');
-        if (!filled) {
-          console.warn('[Dhan] Could not find OTP input(s) to fill.');
-          return;
-        }
-
-        // OTP screen often auto-advances on 6 digits; click Submit if present
-        if (await clickPrimary(page, ['Verify', 'Submit', 'Continue', 'Confirm'])) {
-          console.log('[Dhan] ✓ OTP submitted');
+        const otp = await otpOrManual(page, fetchOtp, 'Dhan', otpPromptOnPage(page));
+        if (!otp) {
+          console.log('[Dhan] OTP step finished in the browser (or timed out) — continuing.');
         } else {
-          await page.keyboard.press('Enter').catch(() => {});
-          console.log('[Dhan] ✓ Pressed Enter to submit OTP');
+          console.log(`[Dhan] ✓ OTP received (${otp.length} digits)`);
+          const filled = await fillDigits(page, otp, 'OTP');
+          if (!filled) {
+            console.warn('[Dhan] Could not find OTP input(s) to fill.');
+            return;
+          }
+
+          // OTP screen often auto-advances on 6 digits; click Submit if present
+          if (await clickPrimary(page, ['Verify', 'Submit', 'Continue', 'Confirm'])) {
+            console.log('[Dhan] ✓ OTP submitted');
+          } else {
+            await page.keyboard.press('Enter').catch(() => {});
+            console.log('[Dhan] ✓ Pressed Enter to submit OTP');
+          }
         }
       } catch (e: any) {
         const msg: string = e?.message ?? String(e);

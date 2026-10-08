@@ -1,6 +1,4 @@
-import { createHash } from 'node:crypto';
 import { Page, Frame, Locator } from 'playwright';
-import { PNG } from 'pngjs';
 import {
   LoginAdapter,
   LoginCredentials,
@@ -8,99 +6,11 @@ import {
   PreparedIpoBidResult,
   SubmittedIpoBidResult
 } from './browser';
-import { solveCaptchaText, isCaptchaAiAvailable } from '../ai/captcha';
-import { recordCaptchaFeedback, type CaptchaFeedbackRecordInput } from '../ai/captchaFeedback';
-import { appendAutomationLog, writeAutomationArtifact } from '../logging';
+import { appendAutomationLog } from '../logging';
+import { clearPageHint, getOtpOrWaitForManualEntry, showPageHint, waitForManualStep } from './manualStep';
 
 const LOGIN_URL = 'https://netbanking.au.bank.in/drb/';
 const INR = '\u20B9';
-
-function makeAutomationArtifactStamp(): string {
-  return new Date().toISOString().replace(/[:.]/g, '-');
-}
-
-type AuCaptchaLearningContext = CaptchaFeedbackRecordInput & {
-  recorded?: boolean;
-  lastFilledText?: string;
-};
-
-function setAuCaptchaLearningContext(page: Page, context: AuCaptchaLearningContext): void {
-  (page as any).__auCaptchaLearning = context;
-}
-
-function getAuCaptchaLearningContext(page: Page): AuCaptchaLearningContext | null {
-  return ((page as any).__auCaptchaLearning || null) as AuCaptchaLearningContext | null;
-}
-
-async function recordAuCaptchaLearning(page: Page, outcome: 'success' | 'failure', finalText?: string): Promise<void> {
-  const context = getAuCaptchaLearningContext(page);
-  if (!context || context.recorded) return;
-  context.recorded = true;
-  recordCaptchaFeedback({
-    ...context,
-    outcome,
-    finalText: finalText || context.lastFilledText || context.primaryGuess,
-  });
-}
-
-function cropCaptchaTextCell(imageBytes: Buffer): Buffer {
-  try {
-    const source = PNG.sync.read(imageBytes);
-    const targetWidth = Math.max(80, Math.min(source.width, Math.floor(source.width * 0.78)));
-    const target = new PNG({
-      width: targetWidth,
-      height: source.height,
-      colorType: 2,
-    });
-
-    for (let y = 0; y < source.height; y += 1) {
-      for (let x = 0; x < targetWidth; x += 1) {
-        const sourceIndex = (source.width * y + x) << 2;
-        const targetIndex = (target.width * y + x) << 2;
-        target.data[targetIndex] = source.data[sourceIndex];
-        target.data[targetIndex + 1] = source.data[sourceIndex + 1];
-        target.data[targetIndex + 2] = source.data[sourceIndex + 2];
-        target.data[targetIndex + 3] = source.data[sourceIndex + 3];
-      }
-    }
-
-    return PNG.sync.write(target);
-  } catch {
-    return imageBytes;
-  }
-}
-
-function upscalePng2x(imageBytes: Buffer): Buffer {
-  try {
-    const source = PNG.sync.read(imageBytes);
-    const target = new PNG({
-      width: source.width * 2,
-      height: source.height * 2,
-      colorType: 2,
-    });
-    for (let y = 0; y < source.height; y += 1) {
-      for (let x = 0; x < source.width; x += 1) {
-        const sIdx = (source.width * y + x) << 2;
-        const r = source.data[sIdx];
-        const g = source.data[sIdx + 1];
-        const b = source.data[sIdx + 2];
-        const a = source.data[sIdx + 3];
-        for (let dy = 0; dy < 2; dy += 1) {
-          for (let dx = 0; dx < 2; dx += 1) {
-            const tIdx = (target.width * (y * 2 + dy) + (x * 2 + dx)) << 2;
-            target.data[tIdx] = r;
-            target.data[tIdx + 1] = g;
-            target.data[tIdx + 2] = b;
-            target.data[tIdx + 3] = a;
-          }
-        }
-      }
-    }
-    return PNG.sync.write(target);
-  } catch {
-    return imageBytes;
-  }
-}
 
 /**
  * Keep the AU Bank session alive while the user prepares an IPO application.
@@ -403,12 +313,13 @@ async function injectFloatingRefreshBalanceButton(
  * successful netbanking.au.bank.in login the IPO portal can demand a fresh
  * login with CAPTCHA.
  *
- * Strategy (reuses the proven trySolveAuCaptcha pipeline):
+ * Strategy:
  *   1. If the IPO listing is already visible → nothing to do.
  *   2. If a username field is visible → fill username + password.
- *   3. Call trySolveAuCaptcha (finds CAPTCHA input by proximity/scoring,
- *      screenshots the region, sends to Claude, fills + clicks Login).
- *   4. Wait up to 15 s for the IPO listing to appear.
+ *   3. Focus the CAPTCHA box, show a hint banner, and wait for the user to
+ *      type the CAPTCHA and click Login in the browser (the app never solves
+ *      CAPTCHAs).
+ *   4. Wait up to 20 s for the IPO listing to appear.
  */
 async function handleAuIpoPortalAuth(page: Page, draft: IpoBidDraft): Promise<void> {
   try {
@@ -419,7 +330,7 @@ async function handleAuIpoPortalAuth(page: Page, draft: IpoBidDraft): Promise<vo
     await page.waitForTimeout(1_500);
     if (await isAuIpoListingPage(page)) return;
 
-    appendAutomationLog('AU_CAPTCHA', 'IPO portal login gate detected — attempting auth.');
+    appendAutomationLog('AU_LOGIN', 'IPO portal login gate detected — filling credentials.');
 
     // ── Fill username ──────────────────────────────────────────────────────
     let passwordFieldRef: Locator | null = null;
@@ -445,28 +356,13 @@ async function handleAuIpoPortalAuth(page: Page, draft: IpoBidDraft): Promise<vo
       } catch { /* field might not be present */ }
     }
 
-    // ── Solve CAPTCHA using the same robust pipeline as the main login ─────
-    const captchaSolved = await trySolveAuCaptcha(page, draft.username || '', passwordFieldRef);
-    if (captchaSolved) {
-      console.log('[AU Bank][ipo-auth] CAPTCHA solved on IPO portal — waiting for listing.');
-    } else {
-      console.warn('[AU Bank][ipo-auth] CAPTCHA not auto-solved on IPO portal — showing manual overlay.');
-      // Show banner and give the user 2 minutes to solve it themselves before
-      // proceeding. The listing-page poll below will pick up successful manual
-      // completion automatically.
-      const captchaInput = await findAuCaptchaInput(page, draft.username || '', passwordFieldRef);
-      if (captchaInput) {
-        // Only surface the "Auto-CAPTCHA failed" banner when the AI was actually
-        // available to attempt a solve. With no API key configured, auto-solving
-        // never ran, so the banner is just misleading noise.
-        if (await isCaptchaAiAvailable()) {
-          await showAuCaptchaManualOverlay(
-            page,
-            'Please type the CAPTCHA shown above and click Login. The app will continue automatically once you submit.',
-          );
-        }
-        await waitForManualCaptchaSubmit(page, captchaInput, 120_000);
-      }
+    // ── CAPTCHA: the user types it in the browser ─────────────────────────
+    // Give the user 3 minutes; the listing-page poll below picks up a
+    // successful manual login automatically.
+    const captchaInput = await findAuCaptchaInput(page, draft.username || '', passwordFieldRef);
+    if (captchaInput) {
+      console.log('[AU Bank][ipo-auth] Waiting for the CAPTCHA to be typed on the IPO portal.');
+      await waitForAuCaptchaSubmit(page, captchaInput, 180_000);
     }
 
     // ── Wait for the listing page to load (up to 20 s) ────────────────────
@@ -713,526 +609,32 @@ async function findAuCaptchaInput(page: Page, username: string, passwordField?: 
   }
   if (fallback) {
     const selectedBox = await fallback.locator.boundingBox().catch(() => null);
-    appendAutomationLog('AU_CAPTCHA', `Selected CAPTCHA input candidate with score ${Math.round(fallback.score)} box=${selectedBox ? `${Math.round(selectedBox.x)},${Math.round(selectedBox.y)},${Math.round(selectedBox.width)},${Math.round(selectedBox.height)}` : 'none'}.`);
+    appendAutomationLog('AU_LOGIN', `Selected CAPTCHA input candidate with score ${Math.round(fallback.score)} box=${selectedBox ? `${Math.round(selectedBox.x)},${Math.round(selectedBox.y)},${Math.round(selectedBox.width)},${Math.round(selectedBox.height)}` : 'none'}.`);
   }
   return fallback?.locator ?? null;
 }
 
-async function clickAuLoginSubmit(page: Page): Promise<boolean> {
-  const clicked = await clickFirstVisible(page, [
-    'button:has-text("Login")',
-    'button:has-text("Sign In")',
-    '[role="button"]:has-text("Login")',
-    'input[type="submit"][value*="Login" i]',
-    'input[type="button"][value*="Login" i]',
-  ]) || await clickFirstText(page, ['Login', 'Sign In', 'Submit']);
-  return clicked;
-}
-
-async function findAuCaptchaLabelBox(page: Page): Promise<{ x: number; y: number; width: number; height: number } | null> {
-  return page.evaluate(() => {
-    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1366;
-    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 900;
-    const matches: Array<{ x: number; y: number; width: number; height: number; score: number; source: string }> = [];
-    const target = 'enter captcha code';
-
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let textNode = walker.nextNode();
-    while (textNode) {
-      const raw = textNode.textContent || '';
-      const normalized = raw.replace(/\s+/g, ' ').trim().toLowerCase();
-      const index = normalized.indexOf(target);
-      if (index >= 0) {
-        const owner = textNode.parentElement;
-        const style = owner ? window.getComputedStyle(owner) : null;
-        if (!style || (style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || '1') !== 0)) {
-          const originalLower = raw.toLowerCase();
-          const originalIndex = originalLower.indexOf('enter');
-          const range = document.createRange();
-          range.setStart(textNode, Math.max(0, originalIndex >= 0 ? originalIndex : 0));
-          range.setEnd(textNode, raw.length);
-          const rect = range.getBoundingClientRect();
-          range.detach();
-          if (rect.width && rect.height && rect.bottom >= 0 && rect.top <= viewportHeight && rect.right >= 0 && rect.left <= viewportWidth) {
-            matches.push({
-              x: rect.left,
-              y: rect.top,
-              width: rect.width,
-              height: rect.height,
-              score: 500 - Math.abs(rect.left - 70) / 8 - Math.abs(rect.width - 120) / 4,
-              source: 'text-range',
-            });
-          }
-        }
-      }
-      textNode = walker.nextNode();
-    }
-
-    for (const el of Array.from(document.querySelectorAll('label, mat-label, span, div, p'))) {
-      const text = ((el as HTMLElement).innerText || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      if (!text.includes('enter captcha code')) continue;
-      const rect = el.getBoundingClientRect();
-      if (!rect.width || !rect.height) continue;
-      if (rect.bottom < 0 || rect.top > viewportHeight || rect.right < 0 || rect.left > viewportWidth) continue;
-      const style = window.getComputedStyle(el as HTMLElement);
-      if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity || '1') === 0) continue;
-
-      const areaPenalty = Math.min(rect.width * rect.height / 100, 80);
-      const score = 200 - areaPenalty - Math.abs(rect.left - 70) / 10;
-      matches.push({ x: rect.left, y: rect.top, width: rect.width, height: rect.height, score, source: 'element' });
-    }
-
-    matches.sort((a, b) => b.score - a.score);
-    const best = matches[0];
-    return best ? { x: best.x, y: best.y, width: best.width, height: best.height, source: best.source } : null;
-  }).catch(() => null);
-}
-
-async function captureAuCaptchaDomElement(page: Page, captchaInput: Locator): Promise<Buffer | null> {
-  const stamp = `au-captcha-target-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const result = await captchaInput.evaluate((input: Element, marker: string) => {
-    const inputRect = input.getBoundingClientRect();
-    const candidates: Array<{ element: Element; score: number; rect: { x: number; y: number; width: number; height: number }; text: string }> = [];
-    const badText = /(dashboard|take me directly|username|password|enter captcha|captcha code|virtual keypad|login|forgot|apply now|offers|videos|fastag|branch|refresh)/i;
-
-    for (const element of Array.from(document.querySelectorAll('body *'))) {
-      if (element === input || element.contains(input)) continue;
-      const rect = element.getBoundingClientRect();
-      if (!rect.width || !rect.height) continue;
-      if (rect.width < 120 || rect.width > 520 || rect.height < 28 || rect.height > 115) continue;
-      if (rect.bottom > inputRect.top - 10) continue;
-      if (rect.bottom < inputRect.top - 230) continue;
-      if (rect.left < inputRect.left - 140 || rect.left > inputRect.left + 120) continue;
-
-      const style = window.getComputedStyle(element as HTMLElement);
-      if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity || '1') === 0) continue;
-      const text = ((element as HTMLElement).innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
-      if (badText.test(text)) continue;
-
-      const borderWidth =
-        parseFloat(style.borderTopWidth || '0')
-        + parseFloat(style.borderRightWidth || '0')
-        + parseFloat(style.borderBottomWidth || '0')
-        + parseFloat(style.borderLeftWidth || '0');
-      const hasBorder = borderWidth >= 2;
-      const hasMedia = !!element.querySelector('img, canvas, svg');
-      const distanceAboveInput = inputRect.top - rect.bottom;
-      const leftDistance = Math.abs(rect.left - inputRect.left);
-      const usefulSize = rect.width >= 150 && rect.height >= 36;
-
-      let score = 0;
-      if (hasBorder) score += 160;
-      if (hasMedia) score += 45;
-      if (!text) score += 30;
-      if (usefulSize) score += 40;
-      score += Math.max(0, 90 - Math.abs(distanceAboveInput - 45) * 2);
-      score += Math.max(0, 80 - leftDistance);
-      if (rect.width > 360) score -= 40;
-      if (rect.height > 85) score -= 30;
-
-      candidates.push({
-        element,
-        score,
-        rect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
-        text,
-      });
-    }
-
-    candidates.sort((a, b) => b.score - a.score);
-    const best = candidates[0];
-    if (!best || best.score < 120) return null;
-    best.element.setAttribute('data-au-captcha-target', marker);
-    return { score: best.score, rect: best.rect, text: best.text.slice(0, 80) };
-  }, stamp).catch(() => null);
-
-  if (!result) return null;
-
-  const locator = page.locator(`[data-au-captcha-target="${stamp}"]`).first();
-  const screenshot = await locator.screenshot({ type: 'png' }).catch(() => null);
-  await locator.evaluate((element) => element.removeAttribute('data-au-captcha-target')).catch(() => {});
-  if (!screenshot) return null;
-
-  appendAutomationLog(
-    'AU_CAPTCHA',
-    `Captured AU CAPTCHA DOM candidate score=${Math.round(result.score)} rect=${Math.round(result.rect.x)},${Math.round(result.rect.y)},${Math.round(result.rect.width)},${Math.round(result.rect.height)} text="${result.text}"`,
-  );
-  return cropCaptchaTextCell(screenshot);
-}
-
-async function captureAuCaptchaRegion(page: Page, captchaInput: Locator): Promise<Buffer | null> {
-  try {
-    await captchaInput.scrollIntoViewIfNeeded().catch(() => {});
-    const box = await captchaInput.boundingBox();
-    if (!box) return null;
-    const viewport = page.viewportSize() || { width: 1366, height: 900 };
-
-    const labelBox = await findAuCaptchaLabelBox(page);
-    if (labelBox) {
-      // The captcha visual sits ~50–95px above the "Enter Captcha Code" label
-      // top, left-aligned with the label, ~170px wide × ~45px tall. The wider
-      // row also contains a speaker icon and a "Refresh" link to the right of
-      // the captcha — including those (or the "Dashboard" dropdown sitting
-      // above) makes the AI hallucinate or misread characters.
-      const x = Math.max(0, Math.floor(labelBox.x));
-      const y = Math.max(0, Math.floor(labelBox.y - 95));
-      const width = Math.min(viewport.width - x, 180);
-      const height = Math.min(viewport.height - y, 55);
-      appendAutomationLog('AU_CAPTCHA', `Captured AU CAPTCHA using label anchor (${(labelBox as any).source || 'unknown'}) at label=${Math.round(labelBox.x)},${Math.round(labelBox.y)},${Math.round(labelBox.width)},${Math.round(labelBox.height)} clip=${x},${y},${width},${height}.`);
-      return page.screenshot({
-        type: 'png',
-        clip: { x, y, width, height },
-      });
-    }
-
-    const domElementImage = await captureAuCaptchaDomElement(page, captchaInput);
-    if (domElementImage) return domElementImage;
-
-    const captchaVisuals = page.locator('img, canvas');
-    const visualCount = await captchaVisuals.count().catch(() => 0);
-    let bestVisual: { x: number; y: number; width: number; height: number; score: number } | null = null;
-    for (let i = 0; i < Math.min(visualCount, 20); i += 1) {
-      const candidate = captchaVisuals.nth(i);
-      if (!(await candidate.isVisible().catch(() => false))) continue;
-      const candidateBox = await candidate.boundingBox().catch(() => null);
-      if (!candidateBox) continue;
-      if (candidateBox.width < 90 || candidateBox.height < 25) continue;
-      const candidateContext = await candidate.evaluate((el: Element) => {
-        const chunks: string[] = [];
-        let node: Element | null = el;
-        for (let depth = 0; depth < 5 && node; depth += 1) {
-          const text = (node as HTMLElement).innerText || node.textContent || '';
-          if (text) chunks.push(text);
-          const aria = node.getAttribute('aria-label') || '';
-          const title = node.getAttribute('title') || '';
-          const alt = node.getAttribute('alt') || '';
-          if (aria || title || alt) chunks.push(`${aria} ${title} ${alt}`);
-          node = node.parentElement;
-        }
-        return chunks.join(' ').toLowerCase();
-      }).catch(() => '');
-      if (/virtual\s*keypad|keyboard|use\s*virtual/i.test(candidateContext)) continue;
-
-      const aboveInput = candidateBox.y + candidateBox.height < box.y;
-      const nearInput = candidateBox.y + candidateBox.height > box.y - 170;
-      const horizontalMatch = candidateBox.x > box.x - 80 && candidateBox.x < box.x + 160;
-      if (!aboveInput || !nearInput || !horizontalMatch) continue;
-
-      const gap = box.y - (candidateBox.y + candidateBox.height);
-      const captchaContextBoost = /captcha|refresh|security|code/.test(candidateContext) ? 90 : 0;
-      const leftSideBoost = candidateBox.x <= box.x + 45 ? 80 : -80;
-      const compactBoost = candidateBox.width <= 260 && candidateBox.height <= 90 ? 35 : -35;
-      const score = candidateBox.width * 2 + candidateBox.height + captchaContextBoost + leftSideBoost + compactBoost - Math.abs(gap - 45) * 3 - Math.abs(candidateBox.x - box.x);
-      if (!bestVisual || score > bestVisual.score) {
-        bestVisual = { ...candidateBox, score };
-      }
-    }
-
-    if (bestVisual) {
-      const x = Math.max(0, Math.floor(bestVisual.x - 8));
-      const y = Math.max(0, Math.floor(bestVisual.y - 8));
-      const width = Math.min(viewport.width - x, Math.ceil(bestVisual.width + 16));
-      const height = Math.min(viewport.height - y, Math.ceil(bestVisual.height + 16));
-      appendAutomationLog('AU_CAPTCHA', `Captured AU CAPTCHA image element at ${Math.round(bestVisual.x)},${Math.round(bestVisual.y)},${Math.round(bestVisual.width)},${Math.round(bestVisual.height)}.`);
-      return page.screenshot({
-        type: 'png',
-        clip: { x, y, width, height },
-      });
-    }
-
-    const x = Math.max(0, Math.floor(box.x - 2));
-    const y = Math.max(0, Math.floor(box.y - 84));
-    const width = Math.min(viewport.width - x, 235);
-    const height = Math.min(viewport.height - y, 64);
-    appendAutomationLog('AU_CAPTCHA', `Captured strict AU CAPTCHA text fallback above input at ${x},${y},${width},${height}.`);
-    return page.screenshot({
-      type: 'png',
-      clip: { x, y, width, height },
-    });
-  } catch (e: any) {
-    console.warn('[AU Bank] CAPTCHA screenshot failed:', e?.message ?? e);
-    return null;
-  }
-}
-
-async function readLatestAuCaptchaInput(page: Page): Promise<string | null> {
-  return page.evaluate(() => {
-    const value = (window as any).__auLatestCaptchaInput;
-    return typeof value === 'string' ? value : null;
-  }).catch(() => null);
-}
-
-async function installAuCaptchaInputTracker(captchaInput: Locator): Promise<void> {
-  await captchaInput.evaluate((input: Element) => {
-    const target = input as HTMLInputElement | HTMLTextAreaElement;
-    const update = () => { (window as any).__auLatestCaptchaInput = target.value || ''; };
-    target.addEventListener('input', update);
-    target.addEventListener('change', update);
-    update();
-  }).catch(() => {});
-}
-
 /**
- * Inject a high-z-index banner into the bank page when auto-CAPTCHA fails.
- * Tells the user exactly what to do — solve it manually and click Login.
- *
- * This is the visible-handoff that stops the user from staring at a stuck
- * browser. Best-effort; if injection fails (CSP, page already navigated),
- * we silently swallow.
+ * Focus the CAPTCHA box, show a hint banner, and wait up to `timeoutMs` for
+ * the user to type the CAPTCHA and submit. Returns true when progress is seen
+ * (URL changed, CAPTCHA box gone, or the OTP boxes appeared). The browser
+ * stays open either way so the user can still finish by hand.
  */
-async function showAuCaptchaManualOverlay(page: Page, reason: string): Promise<void> {
-  try {
-    await page.evaluate((msg) => {
-      const ID = 'ipo-manager-captcha-overlay';
-      const prior = document.getElementById(ID);
-      if (prior) prior.remove();
-      const div = document.createElement('div');
-      div.id = ID;
-      div.style.cssText = [
-        'position:fixed',
-        'top:0',
-        'left:0',
-        'right:0',
-        'background:linear-gradient(90deg,#b45309,#f59e0b)',
-        'color:#fff',
-        'padding:14px 24px',
-        'z-index:2147483647',
-        'font-family:-apple-system,BlinkMacSystemFont,sans-serif',
-        'font-size:14px',
-        'box-shadow:0 4px 16px rgba(0,0,0,0.45)',
-        'display:flex',
-        'align-items:center',
-        'gap:14px',
-      ].join(';');
-      div.innerHTML =
-        '<div style="font-size:24px;line-height:1">⚠️</div>' +
-        '<div>' +
-        '<div style="font-weight:700;font-size:15px">Auto-CAPTCHA failed</div>' +
-        '<div style="opacity:0.95;margin-top:2px">' + msg + '</div>' +
-        '</div>';
-      document.body.appendChild(div);
-    }, reason);
-  } catch {
-    // Overlay is best-effort.
-  }
-}
-
-/**
- * Wait up to `timeoutMs` for the user to manually solve the CAPTCHA and submit.
- * Returns true if progress was detected (URL changed or CAPTCHA input disappeared),
- * false if we timed out. The browser window stays open either way so the user
- * can still complete the flow themselves after this returns.
- */
-async function waitForManualCaptchaSubmit(
-  page: Page,
-  captchaInput: Locator,
-  timeoutMs = 120_000,
-): Promise<boolean> {
+async function waitForAuCaptchaSubmit(page: Page, captchaInput: Locator, timeoutMs: number): Promise<boolean> {
+  await captchaInput.focus().catch(() => {});
+  await showPageHint(page, 'Type the CAPTCHA', 'Type the CAPTCHA shown on this page and click Login. The app continues automatically.');
   const startUrl = page.url();
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (page.isClosed()) return false;
-    if (page.url() !== startUrl) {
-      appendAutomationLog('AU_CAPTCHA', 'Manual CAPTCHA: detected URL change — proceeding.');
-      return true;
-    }
-    const stillVisible = await captchaInput.isVisible().catch(() => false);
-    if (!stillVisible) {
-      appendAutomationLog('AU_CAPTCHA', 'Manual CAPTCHA: CAPTCHA input no longer visible — proceeding.');
-      return true;
-    }
-    await page.waitForTimeout(800);
-  }
-  appendAutomationLog('AU_CAPTCHA', `Manual CAPTCHA: timed out after ${Math.round(timeoutMs / 1000)}s waiting for user.`);
-  return false;
-}
-
-async function clickAuCaptchaRefresh(page: Page): Promise<boolean> {
-  const selectors = [
-    '.captchareFreshBtn',
-    'a:has-text("Refresh")',
-    'button:has-text("Refresh")',
-    'span:has-text("Refresh")',
-    '[aria-label*="refresh" i]',
-    '[title*="refresh" i]',
-  ];
-  for (const selector of selectors) {
-    const locator = page.locator(selector).first();
-    if (!(await locator.isVisible().catch(() => false))) continue;
-    await locator.click({ timeout: 2_000 }).catch(() => {});
-    appendAutomationLog('AU_CAPTCHA', `Clicked CAPTCHA refresh via selector "${selector}".`);
-    return true;
-  }
-  appendAutomationLog('AU_CAPTCHA', 'Could not find a Refresh control to re-roll the CAPTCHA.');
-  return false;
-}
-
-async function trySolveAuCaptcha(page: Page, username: string, passwordField?: Locator | null): Promise<boolean> {
-  const captchaInput = await findAuCaptchaInput(page, username, passwordField);
-  if (!captchaInput) {
-    console.log('[AU Bank] CAPTCHA input was not detected for Claude solve.');
-    appendAutomationLog('AU_CAPTCHA', 'CAPTCHA input was not detected on AU page.');
-    const snapshot = await page.screenshot({ type: 'png', fullPage: true }).catch(() => null);
-    if (snapshot) {
-      const artifactPath = writeAutomationArtifact('au-captcha-miss.png', snapshot);
-      if (artifactPath) appendAutomationLog('AU_CAPTCHA', `Saved AU full-page screenshot for detection failure to ${artifactPath}`);
-    }
-    // The CAPTCHA input couldn't be located — the page may have changed.
-    // Show a banner so the user knows to look around themselves, but only when
-    // the AI was actually available; otherwise there is no "auto" step to fail
-    // and the banner would just be noise.
-    if (await isCaptchaAiAvailable()) {
-      await showAuCaptchaManualOverlay(
-        page,
-        'The CAPTCHA field could not be located automatically. Please enter the CAPTCHA below and click Login.',
-      );
-    }
-    return false;
-  }
-
-  const inputMeta = await Promise.all([
-    captchaInput.getAttribute('name').catch(() => ''),
-    captchaInput.getAttribute('id').catch(() => ''),
-    captchaInput.getAttribute('placeholder').catch(() => ''),
-    captchaInput.getAttribute('aria-label').catch(() => ''),
-  ]);
-  const captchaBox = await captchaInput.boundingBox().catch(() => null);
-  appendAutomationLog('AU_CAPTCHA', `Detected CAPTCHA input meta: name="${inputMeta[0] || ''}" id="${inputMeta[1] || ''}" placeholder="${inputMeta[2] || ''}" aria="${inputMeta[3] || ''}" box=${captchaBox ? `${Math.round(captchaBox.x)},${Math.round(captchaBox.y)},${Math.round(captchaBox.width)},${Math.round(captchaBox.height)}` : 'none'}`);
-  await installAuCaptchaInputTracker(captchaInput);
-
   const otpProbe = page.locator('input.mx-rw-input-otp').first();
-  const MAX_ATTEMPTS = 3;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-    const attemptStamp = makeAutomationArtifactStamp();
-    const pageSnapshot = await page.screenshot({ type: 'png', fullPage: false }).catch(() => null);
-    let pageHash: string | null = null;
-    if (pageSnapshot) {
-      pageHash = createHash('sha256').update(pageSnapshot).digest('hex').slice(0, 16);
-      const pageArtifactPath = writeAutomationArtifact(`au-captcha-page-${attemptStamp}-${pageHash}.png`, pageSnapshot);
-      if (pageArtifactPath) appendAutomationLog('AU_CAPTCHA', `Saved AU CAPTCHA page screenshot to ${pageArtifactPath} sha256=${pageHash}`);
-    }
-
-    const rawCrop = await captureAuCaptchaRegion(page, captchaInput);
-    if (!rawCrop) {
-      appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: failed to capture AU CAPTCHA screenshot region.`);
-      return false;
-    }
-    const image = upscalePng2x(rawCrop);
-    const imageHash = createHash('sha256').update(image).digest('hex').slice(0, 16);
-    const artifactName = `au-captcha-${attemptStamp}-${imageHash}.png`;
-    const artifactPath = writeAutomationArtifact(artifactName, image);
-    const latestArtifactPath = writeAutomationArtifact('au-captcha-last.png', image);
-    if (artifactPath) appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: saved AU CAPTCHA screenshot (2x upscaled) to ${artifactPath} sha256=${imageHash}`);
-    if (latestArtifactPath) appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: updated AU CAPTCHA latest screenshot to ${latestArtifactPath} sha256=${imageHash}`);
-
-    try {
-      appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}/${MAX_ATTEMPTS}: sending 2x upscaled crop (${image.length} bytes) sha256=${imageHash} to solver.`);
-      const solutionResult = await solveCaptchaText(image, 'image/png');
-      if (!solutionResult) {
-        console.log('[AU Bank] CAPTCHA solver returned no usable text.');
-        appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: CAPTCHA solver returned no usable text.`);
-        if (attempt < MAX_ATTEMPTS && await clickAuCaptchaRefresh(page)) {
-          await page.waitForTimeout(1_200);
-          continue;
-        }
-        return false;
-      }
-      const solution = solutionResult.text;
-      setAuCaptchaLearningContext(page, {
-        bankCode: 'AU',
-        provider: solutionResult.provider,
-        imageHash,
-        primaryGuess: solution,
-        confidence: solutionResult.confidence,
-        alternates: solutionResult.alternates,
-        outcome: 'failure',
-        inputSource: 'auto',
-        lastFilledText: solution,
-      });
-
-      await captchaInput.click({ timeout: 4_000 }).catch(() => {});
-      await captchaInput.fill('', { timeout: 2_000 }).catch(() => {});
-      await captchaInput.fill(solution, { timeout: 4_000 }).catch(() => {});
-      let accepted = await captchaInput.inputValue().then(v => v.trim()).catch(() => '');
-      if (!accepted) {
-        await captchaInput.click({ clickCount: 3, timeout: 2_000 }).catch(() => {});
-        await page.keyboard.type(solution, { delay: 25 }).catch(() => {});
-        accepted = await captchaInput.inputValue().then(v => v.trim()).catch(() => '');
-      }
-      await captchaInput.dispatchEvent('input').catch(() => {});
-      await captchaInput.dispatchEvent('change').catch(() => {});
-      await captchaInput.dispatchEvent('blur').catch(() => {});
-      if (!accepted) {
-        console.warn('[AU Bank] CAPTCHA field did not accept autofill.');
-        appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: CAPTCHA field rejected autofill (${solution.length}-char value).`);
-        return false;
-      }
-
-      console.log(`[AU Bank] CAPTCHA solved attempt ${attempt} (${solution.length} chars)`);
-      appendAutomationLog(
-        'AU_CAPTCHA',
-        `Attempt ${attempt}: CAPTCHA autofill accepted value of length ${solution.length} from ${solutionResult.provider}${typeof solutionResult.confidence === 'number' ? ` confidence=${Math.round(solutionResult.confidence)}` : ''}.`,
-      );
-
-      if (!solutionResult.shouldSubmit) {
-        appendAutomationLog('AU_CAPTCHA', 'CAPTCHA solver marked this value as fill-only; skipped automatic login click.');
-        return false;
-      }
-
-      await page.waitForTimeout(1_200);
-      const finalValue = await captchaInput.inputValue().then(v => v.trim()).catch(() => '');
-      appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: CAPTCHA field holds ${finalValue.length} chars before submit (expected ${solution.length}; match=${finalValue.toLowerCase() === solution.toLowerCase()}).`);
-      if (finalValue.toLowerCase() !== solution.toLowerCase()) {
-        console.warn('[AU Bank] CAPTCHA value changed before submit; skipping auto-submit.');
-        appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: CAPTCHA value changed before submit; skipped automatic login click.`);
-        await recordAuCaptchaLearning(page, 'failure', finalValue || solution);
-        return false;
-      }
-
-      await captchaInput.press('Tab').catch(() => {});
-      await page.waitForTimeout(500);
-
-      const clicked = await clickAuLoginSubmit(page);
-      if (!clicked) {
-        await captchaInput.press('Enter').catch(() => {});
-        appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: submitted AU login with Enter after CAPTCHA fill.`);
-      } else {
-        appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: submitted AU login using login button after CAPTCHA fill.`);
-      }
-
-      if (attempt === MAX_ATTEMPTS) {
-        appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: last allowed try; deferring success/failure detection to outer OTP wait.`);
-        return true;
-      }
-
-      const accepted2 = await otpProbe.waitFor({ state: 'visible', timeout: 6_000 }).then(() => true).catch(() => false);
-      if (accepted2) {
-        appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: OTP screen appeared — CAPTCHA accepted.`);
-        return true;
-      }
-
-      const stillVisible = await captchaInput.isVisible().catch(() => false);
-      if (!stillVisible) {
-        appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: CAPTCHA input no longer visible after submit; treating as accepted.`);
-        return true;
-      }
-
-      appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: still on CAPTCHA page after submit — assuming rejection, refreshing for retry.`);
-      await recordAuCaptchaLearning(page, 'failure', solution);
-      const refreshed = await clickAuCaptchaRefresh(page);
-      if (!refreshed) {
-        appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: Refresh control not found; bailing out of retry loop.`);
-        return false;
-      }
-      await page.waitForTimeout(1_500);
-    } catch (e: any) {
-      console.warn('[AU Bank] CAPTCHA solve failed:', e?.message ?? e);
-      appendAutomationLog('AU_CAPTCHA', `Attempt ${attempt}: CAPTCHA solve failed: ${e?.message ?? e}`);
-      return false;
-    }
-  }
-
-  return false;
+  const ok = await waitForManualStep(page, async () => {
+    if (page.url() !== startUrl) return true;
+    if (await otpProbe.isVisible().catch(() => false)) return true;
+    return !(await captchaInput.isVisible().catch(() => false));
+  }, timeoutMs);
+  await clearPageHint(page);
+  appendAutomationLog('AU_LOGIN', ok
+    ? 'Manual CAPTCHA submitted — continuing.'
+    : `Manual CAPTCHA: no submit seen within ${Math.round(timeoutMs / 1000)}s.`);
+  return ok;
 }
 
 async function readBalanceFromPage(page: Page): Promise<string | null> {
@@ -1258,20 +660,29 @@ async function readBalanceFromPage(page: Page): Promise<string | null> {
   }, { inr: INR });
 }
 
-async function waitForAuPostLogin(page: Page, timeoutMs = 180_000): Promise<void> {
-  await page.waitForFunction(() => {
-    const href = window.location.href;
-    const text = (document.body as HTMLElement | null)?.innerText?.toLowerCase() || '';
-    const stillOtp = !!document.querySelector('input.mx-rw-input-otp');
-    const hasAccountText =
-      text.includes('available balance') ||
-      text.includes('account summary') ||
-      text.includes('savings account') ||
-      text.includes('dashboard') ||
-      text.includes('accounts');
+// Runs in the page: true once AU has moved past the OTP step onto the
+// logged-in dashboard. Shared by the one-shot check and the blocking wait.
+const AU_POST_LOGIN_PREDICATE = () => {
+  const href = window.location.href;
+  const text = (document.body as HTMLElement | null)?.innerText?.toLowerCase() || '';
+  const stillOtp = !!document.querySelector('input.mx-rw-input-otp');
+  const hasAccountText =
+    text.includes('available balance') ||
+    text.includes('account summary') ||
+    text.includes('savings account') ||
+    text.includes('dashboard') ||
+    text.includes('accounts');
 
-    return (!stillOtp && hasAccountText) || (!href.includes('/drb/') && hasAccountText);
-  }, { timeout: timeoutMs });
+  return (!stillOtp && hasAccountText) || (!href.includes('/drb/') && hasAccountText);
+};
+
+async function isAuPostLoginNow(page: Page): Promise<boolean> {
+  if (page.isClosed()) return false;
+  return page.evaluate(AU_POST_LOGIN_PREDICATE).catch(() => false);
+}
+
+async function waitForAuPostLogin(page: Page, timeoutMs = 180_000): Promise<void> {
+  await page.waitForFunction(AU_POST_LOGIN_PREDICATE, undefined, { timeout: timeoutMs });
 }
 
 async function isAuLoggedIn(page: Page): Promise<boolean> {
@@ -2625,83 +2036,59 @@ export const auBankAdapter: LoginAdapter = {
       console.error('[AU Bank] Could not find password field.');
     }
 
-    const captchaAutoSubmitted = await trySolveAuCaptcha(page, creds.username, passwordFieldRef);
-    if (!captchaAutoSubmitted) {
-      console.log('[AU Bank] Type the CAPTCHA and click Login in the browser.');
-      // Show overlay + wait so the user gets a visible cue instead of a stuck
-      // browser. The OTP-screen wait below will still kick in once the user
-      // submits successfully.
-      const captchaInput = await findAuCaptchaInput(page, creds.username, passwordFieldRef);
-      if (captchaInput) {
-        // Only surface the "Auto-CAPTCHA failed" banner when the AI was actually
-        // available to attempt a solve. With no API key configured, auto-solving
-        // never ran, so the banner is just misleading noise — the user always
-        // types the CAPTCHA in manually anyway.
-        if (await isCaptchaAiAvailable()) {
-          await showAuCaptchaManualOverlay(
-            page,
-            'Please type the CAPTCHA shown above and click Login. The app will continue automatically once you submit.',
-          );
-        }
-        await waitForManualCaptchaSubmit(page, captchaInput, 120_000);
-      }
+    // ── CAPTCHA: the user types it in the browser ───────────────────────────
+    // The app never solves CAPTCHAs. Focus the box, show a hint banner, and
+    // wait for the user to type it and click Login.
+    console.log('[AU Bank] Type the CAPTCHA and click Login in the browser.');
+    const captchaInput = await findAuCaptchaInput(page, creds.username, passwordFieldRef);
+    if (captchaInput) {
+      await waitForAuCaptchaSubmit(page, captchaInput, 180_000);
     }
 
+    // ── OTP ─────────────────────────────────────────────────────────────────
+    // Either Gmail supplies it (we fill it), or the user types it in the
+    // browser. Both paths end with the dashboard, so we poll the page rather
+    // than waiting on the OTP source alone — a manually typed OTP must not
+    // leave login() stuck before the balance fetch.
     const otpBoxes = page.locator('input.mx-rw-input-otp');
-    let otpVisible = false;
-    try {
-      await otpBoxes.first().waitFor({ state: 'visible', timeout: captchaAutoSubmitted ? 25_000 : 120_000 });
-      otpVisible = true;
-    } catch {
-      if (captchaAutoSubmitted) {
-        console.log('[AU Bank] OTP boxes not found after Claude CAPTCHA submit. Complete CAPTCHA/login manually if needed.');
-        await recordAuCaptchaLearning(page, 'failure', await readLatestAuCaptchaInput(page) || undefined);
-      } else {
-        console.log('[AU Bank] OTP boxes not found within 2 minutes. Continue manually if needed.');
-      }
+    const otpVisible = await otpBoxes.first()
+      .waitFor({ state: 'visible', timeout: 120_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!otpVisible && !(await isAuPostLoginNow(page))) {
+      console.log('[AU Bank] OTP boxes not found within 2 minutes. Continue manually if needed.');
     }
 
     if (otpVisible) {
-      const finalCaptchaInput = await readLatestAuCaptchaInput(page);
-      const learningCtx = getAuCaptchaLearningContext(page);
-      const aiGuess = (learningCtx?.primaryGuess || '').toLowerCase();
-      const submitted = (finalCaptchaInput || '').toLowerCase();
-      const aiActuallyWon = !!aiGuess && !!submitted && aiGuess === submitted;
-      if (!aiActuallyWon) {
-        appendAutomationLog(
-          'AU_CAPTCHA',
-          `OTP appeared, but AI guess "${aiGuess}" != submitted value "${submitted}" — login succeeded via manual retry, recording AI attempt as failure to avoid poisoning learning data.`,
-        );
-      }
-      await recordAuCaptchaLearning(page, aiActuallyWon ? 'success' : 'failure', finalCaptchaInput || undefined);
-    }
+      const otp = await getOtpOrWaitForManualEntry(page, fetchOtp, {
+        label: 'AU Bank',
+        isOtpStepDone: () => isAuPostLoginNow(page),
+        timeoutMs: 300_000,
+      });
+      if (otp) {
+        try {
+          const boxCount = await otpBoxes.count();
+          if (boxCount > 0 && boxCount !== 6) {
+            console.log(`[AU Bank] Expected 6 OTP boxes, found ${boxCount}. Continuing with available boxes.`);
+          }
+          console.log(`[AU Bank] OTP received (${otp.length} digits)`);
+          await otpBoxes.first().click({ timeout: 5_000 });
+          await page.keyboard.type(otp.slice(0, boxCount || otp.length), { delay: 0 });
+          console.log('[AU Bank] Filled OTP digits');
 
-    const boxCount = await otpBoxes.count();
-    if (boxCount > 0 && boxCount !== 6) {
-      console.log(`[AU Bank] Expected 6 OTP boxes, found ${boxCount}. Continuing with available boxes.`);
-    }
-
-    console.log('[AU Bank] Attempting OTP autofill when possible.');
-    try {
-      if (boxCount > 0) {
-        const otp = await fetchOtp();
-        console.log(`[AU Bank] OTP received (${otp.length} digits)`);
-        await otpBoxes.first().click();
-        await page.keyboard.type(otp.slice(0, boxCount), { delay: 0 });
-        console.log('[AU Bank] Filled OTP digits');
-      } else {
-        console.log('[AU Bank] OTP UI not auto-detected; complete OTP manually.');
+          const verifyBtn = page.locator(
+            'button:has-text("Verify"), button:has-text("Submit"), button:has-text("Continue"), input[type="submit"]'
+          ).first();
+          if (await verifyBtn.isVisible().catch(() => false)) {
+            await verifyBtn.click({ timeout: 5_000 });
+            console.log('[AU Bank] Clicked verify.');
+          }
+        } catch (e) {
+          // The user may have typed the OTP themselves at the same moment —
+          // the dashboard wait below decides whether login worked.
+          console.warn('[AU Bank] OTP fill failed:', (e as Error)?.message ?? e);
+        }
       }
-
-      const verifyBtn = page.locator(
-        'button:has-text("Verify"), button:has-text("Submit"), button:has-text("Continue"), input[type="submit"]'
-      ).first();
-      if (await verifyBtn.isVisible().catch(() => false)) {
-        await verifyBtn.click();
-        console.log('[AU Bank] Clicked verify.');
-      }
-    } catch (e) {
-      console.error('[AU Bank] OTP fetch or fill failed:', e);
     }
 
     try {
@@ -2961,8 +2348,8 @@ export const auBankAdapter: LoginAdapter = {
     // The AU IPO subdomain (iposmart.au.bank.in) runs its own independent
     // session and may demand a fresh login (username + password + CAPTCHA)
     // even when the main netbanking session is already active.
-    // handleAuIpoPortalAuth reuses the proven trySolveAuCaptcha pipeline
-    // that works on the main login page — same Angular-Material form.
+    // handleAuIpoPortalAuth fills the credentials and waits for the user to
+    // type the CAPTCHA, same as the main login page.
     await handleAuIpoPortalAuth(ipoPage, draft).catch(() => {});
 
     if (await isAuIpoHandoffError(ipoPage)) {

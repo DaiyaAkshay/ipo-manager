@@ -80,26 +80,6 @@ interface GmailStatus {
   label: string;
   detail?: string;
 }
-type CaptchaAiProvider = 'anthropic';
-interface CaptchaProviderStatus {
-  provider: CaptchaAiProvider;
-  displayName: string;
-  state: 'connected' | 'not_connected' | 'error';
-  configured: boolean;
-  label: string;
-  detail?: string;
-  model: string;
-  source: 'environment' | 'keychain' | null;
-}
-interface CaptchaAiStatus {
-  state: 'connected' | 'not_connected' | 'error';
-  configured: boolean;
-  label: string;
-  detail?: string;
-  activeProvider: CaptchaAiProvider;
-  configuredProviders: CaptchaAiProvider[];
-  providers: Record<CaptchaAiProvider, CaptchaProviderStatus>;
-}
 interface BrokerPortfolioSummary {
   sheet_name: string;
   asset_scope: 'EQUITY' | 'MUTUAL_FUNDS' | 'COMBINED';
@@ -614,7 +594,7 @@ type Modal =
   | { type: 'view-portfolio'; memberId: number; brokerId: number; brokerCode: string; memberName: string }
   | { type: 'prepare-au-bid'; memberId: number; familyId: number; memberName: string }
   | { type: 'review-au-bid'; memberId: number; familyId: number; memberName: string }
-  | { type: 'service-config'; service: 'gmail' | 'captcha-anthropic' }
+  | { type: 'service-config'; service: 'gmail' }
   | { type: 'change-master-password' }
   | { type: 'backup-settings' }
   | { type: 'restore-backup' }
@@ -718,23 +698,8 @@ export default function Dashboard() {
   // of modal/member — otherwise member B's Zerodha row showed member A's code.
   const modalMemberId = (modal as { memberId?: number }).memberId;
   useEffect(() => { setTotpCode(null); }, [modal.type, modalMemberId]);
-  const [otpRequest,    setOtpRequest]    = useState<{ label: string } | null>(null);
-  const [otpValue,      setOtpValue]      = useState('');
-  const [otpSubmitting, setOtpSubmitting] = useState(false);
   const [gmailStatus,   setGmailStatus]   = useState<GmailStatus | null>(null);
-  const [captchaAiStatus, setCaptchaAiStatus] = useState<CaptchaAiStatus | null>(null);
   const [backupInfo, setBackupInfo] = useState<BackupInfo | null>(null);
-  const [captchaUsage, setCaptchaUsage] = useState<{
-    date: string;
-    calls: number;
-    inputTokens: number;
-    outputTokens: number;
-    cap: number;
-    consented: boolean;
-    totalCalls: number;
-    totalInputTokens: number;
-    totalOutputTokens: number;
-  } | null>(null);
   const [memberDetail, setMemberDetail] = useState<any | null>(null);
   const [memberDetailLoading, setMemberDetailLoading] = useState(false);
   const [backupSnapshots, setBackupSnapshots] = useState<Array<{
@@ -747,6 +712,8 @@ export default function Dashboard() {
   const [backupDestTab, setBackupDestTab] = useState<'r2' | 'folder'>('r2');
   const [r2Form, setR2Form] = useState<R2Form>(EMPTY_R2_FORM);
   const [serviceConfigValue, setServiceConfigValue] = useState('');
+  const [gmailDialogError, setGmailDialogError] = useState<string | null>(null);
+  const [gmailDialogNote, setGmailDialogNote] = useState<string | null>(null);
   const [passwordChangeForm, setPasswordChangeForm] = useState({ current: '', next: '', confirm: '' });
   const [portfolioReport, setPortfolioReport] = useState<BrokerPortfolioReport | null>(null);
   const [portfolioAssetScope, setPortfolioAssetScope] = useState<'EQUITY' | 'MUTUAL_FUNDS' | 'COMBINED'>('EQUITY');
@@ -903,34 +870,6 @@ export default function Dashboard() {
     }
   }, []);
 
-  const loadCaptchaAiStatus = useCallback(async () => {
-    try {
-      const status = await window.api.captchaAi.status();
-      setCaptchaAiStatus(status as CaptchaAiStatus);
-    } catch (e: any) {
-      setCaptchaAiStatus({
-        state: 'error',
-        configured: false,
-        label: 'CAPTCHA AI error',
-        detail: e?.message || String(e),
-        activeProvider: 'anthropic',
-        configuredProviders: [],
-        providers: {
-          anthropic: {
-            provider: 'anthropic',
-            displayName: 'Claude',
-            state: 'error',
-            configured: false,
-            label: 'Claude CAPTCHA error',
-            detail: e?.message || String(e),
-            model: 'unknown',
-            source: null,
-          },
-        },
-      });
-    }
-  }, []);
-
   const loadMembers = useCallback(async (familyId: number): Promise<Member[]> => {
     const list = await window.api.families.members(familyId);
     const typed = (list as any[]).map(member => ({
@@ -954,7 +893,7 @@ export default function Dashboard() {
   }, []);
 
   // Initial load
-  useEffect(() => { loadFamilies(); loadGmailStatus(); loadCaptchaAiStatus(); loadBackupStatus(); loadCaptchaUsage(); }, []);
+  useEffect(() => { loadFamilies(); loadGmailStatus(); loadBackupStatus(); }, []);
 
   // Sync notifications from main. A pull (at unlock or while open) replaces the
   // vault underneath the UI, so drop every cached member list — balances
@@ -980,7 +919,7 @@ export default function Dashboard() {
       // One toast a minute is enough during a bulk run (each login re-reports it).
       if (Date.now() - lastGmailToastAt.current > 60_000) {
         lastGmailToastAt.current = Date.now();
-        showToast('error', 'Gmail needs you to sign in again — OTPs will be asked for here until then.');
+        showToast('error', 'Gmail needs you to sign in again — until then, type OTPs in the bank window.');
       }
     });
     return () => { offSynced(); offConflict(); offBackup(); offGmail(); };
@@ -1118,13 +1057,6 @@ export default function Dashboard() {
     }
   }
 
-  // Refresh CAPTCHA usage + status periodically — shows today's call count and
-  // surfaces auth errors (e.g. invalid API key returning 401) in the pill.
-  useEffect(() => {
-    const t = setInterval(() => { void loadCaptchaUsage(); void loadCaptchaAiStatus(); }, 60_000);
-    return () => clearInterval(t);
-  }, []);
-
   // Ctrl+L (or Cmd+L on mac) → lock the vault immediately.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -1139,16 +1071,15 @@ export default function Dashboard() {
 
   // Escape closes the open dialog — same effect as clicking its backdrop.
   useEffect(() => {
-    if (modal.type === 'none' && !otpRequest) return;
+    if (modal.type === 'none') return;
     function onKey(e: KeyboardEvent) {
       if (e.key !== 'Escape') return;
-      if (otpRequest) { void cancelOtp(); return; }
       if (modal.type === 'prepare-au-bid' || modal.type === 'review-au-bid') cancelAuIpoBatch();
       else setModal({ type: 'none' });
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [modal.type, otpRequest]);
+  }, [modal.type]);
 
   // Poll backup status every 30s — picks up auto-backup completions
   useEffect(() => {
@@ -1167,15 +1098,6 @@ export default function Dashboard() {
       loadMembers(selectedView);
     }
   }, [selectedView]);
-
-  // OTP dialog - listen for requests from main process
-  useEffect(() => {
-    // Dashboard remounts on every unlock, so these must unsubscribe — otherwise
-    // each lock/unlock cycle stacked another permanent listener.
-    const offNeeded = window.api.otp.onNeeded(data => { setOtpValue(''); setOtpRequest(data); });
-    const offDismiss = window.api.otp.onDismiss(() => { setOtpRequest(null); setOtpValue(''); });
-    return () => { offNeeded(); offDismiss(); };
-  }, []);
 
   // Close AU IPO dropdown when clicking outside
   useEffect(() => {
@@ -1228,25 +1150,6 @@ export default function Dashboard() {
     setAuIpoQueueIndex(0);
     setPreparedAuBid(null);
     setModal({ type: 'none' });
-  }
-
-  async function submitOtp() {
-    if (!otpValue.trim() || otpSubmitting) return;
-    setOtpSubmitting(true);
-    try {
-      await window.api.otp.provide(otpValue.trim());
-    } catch (e: any) {
-      showToast('error', `Could not send the OTP: ${e?.message || e}`);
-    } finally {
-      setOtpRequest(null); setOtpValue(''); setOtpSubmitting(false);
-    }
-  }
-  async function cancelOtp() {
-    try {
-      await window.api.otp.cancel();
-    } catch { /* the request is gone either way */ } finally {
-      setOtpRequest(null); setOtpValue('');
-    }
   }
 
   // â"€â"€ View selection â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
@@ -2384,21 +2287,31 @@ export default function Dashboard() {
     }
   }
 
-  async function reconnectGmailStatus() {
+  /**
+   * Google sign-in for Gmail OTP reading. Returns true when Gmail ends up
+   * connected. Errors are shown inline in the Gmail dialog (it stays open);
+   * on success the dialog closes.
+   */
+  async function connectGmailFromDialog(): Promise<boolean> {
     setBusy('gmail-connect');
-    showToast('info', 'Complete the Google sign-in that opened in your browser…');
+    setGmailDialogError(null);
+    setGmailDialogNote('Complete the Google sign-in that opened in your browser…');
     try {
       const result: any = await window.api.gmail.connect();
-      if (result.ok && result.status) {
-        setGmailStatus(result.status as GmailStatus);
-        showToast(result.status.state === 'connected' ? 'success' : 'error',
-          result.status.state === 'connected' ? 'Gmail connected' : (result.status.detail || result.status.label));
-      } else {
-        showToast('error', result.error || 'Gmail sign-in failed');
+      const status = result?.status as GmailStatus | undefined;
+      if (status) setGmailStatus(status);
+      if (result?.ok && status?.state === 'connected') {
+        showToast('success', 'Gmail connected');
+        closeGmailDialog();
+        return true;
       }
+      setGmailDialogError(result?.error || status?.detail || status?.label || 'Gmail sign-in failed');
+      return false;
     } catch (e: any) {
-      showToast('error', e?.message || 'Gmail sign-in failed');
+      setGmailDialogError(e?.message || 'Gmail sign-in failed');
+      return false;
     } finally {
+      setGmailDialogNote(null);
       setBusy(null);
       await loadGmailStatus(true);
     }
@@ -2406,69 +2319,36 @@ export default function Dashboard() {
 
   function configureGmailCredentials() {
     setServiceConfigValue('');
+    setGmailDialogError(null);
+    setGmailDialogNote(null);
     setModal({ type: 'service-config', service: 'gmail' });
+  }
+
+  function closeGmailDialog() {
+    setModal(m => (m.type === 'service-config' ? { type: 'none' } : m));
+    setServiceConfigValue('');
+    setGmailDialogError(null);
+    setGmailDialogNote(null);
   }
 
   async function clearGmailCredentials() {
     if (!window.confirm('Remove the saved Google OAuth JSON and Gmail sign-in from this app?')) return;
     setBusy('gmail-clear');
+    setGmailDialogError(null);
     try {
       const result: any = await window.api.gmail.clearCredentials();
-      if (result.ok && result.status) {
+      if (result?.ok && result.status) {
         setGmailStatus(result.status as GmailStatus);
         showToast('success', 'Google OAuth setup removed');
+        closeGmailDialog();
       } else {
-        showToast('error', result.error || 'Could not clear Google OAuth setup');
+        setGmailDialogError(result?.error || 'Could not clear Google OAuth setup');
       }
+    } catch (e: any) {
+      setGmailDialogError(e?.message || 'Could not clear Google OAuth setup');
     } finally {
       setBusy(null);
       await loadGmailStatus();
-    }
-  }
-
-  function configureCaptchaProvider() {
-    setServiceConfigValue('');
-    setModal({ type: 'service-config', service: 'captcha-anthropic' });
-    void loadCaptchaUsage();
-  }
-
-  async function loadCaptchaUsage() {
-    try {
-      const result: any = await window.api.captchaAi.getUsage();
-      if (result?.ok) setCaptchaUsage(result.usage);
-    } catch { /* ignore */ }
-  }
-
-  async function toggleCaptchaConsent(consented: boolean) {
-    try {
-      const result: any = await window.api.captchaAi.setConsent(consented);
-      if (result?.ok) {
-        setCaptchaUsage(result.usage);
-        showToast('success', consented ? 'CAPTCHA upload consent recorded' : 'Consent revoked — no more uploads will be made');
-      }
-    } catch (e: any) {
-      showToast('error', e?.message || String(e));
-    }
-  }
-
-  async function setCaptchaCap(cap: number) {
-    try {
-      const result: any = await window.api.captchaAi.setCap(cap);
-      if (result?.ok) setCaptchaUsage(result.usage);
-    } catch (e: any) {
-      showToast('error', e?.message || String(e));
-    }
-  }
-
-  async function resetCaptchaCounter() {
-    try {
-      const result: any = await window.api.captchaAi.resetTodayCounter();
-      if (result?.ok) {
-        setCaptchaUsage(result.usage);
-        showToast('success', "Today's counter reset to 0");
-      }
-    } catch (e: any) {
-      showToast('error', e?.message || String(e));
     }
   }
 
@@ -2734,7 +2614,7 @@ export default function Dashboard() {
   async function resetVault() {
     const phrase = window.prompt(
       'This will permanently delete your vault, all credentials, all documents,\n' +
-      'all logs, all browser sessions, the Gmail token, and the CAPTCHA AI key.\n\n' +
+      'all logs, all browser sessions, and the Gmail token.\n\n' +
       'Your backup folder will NOT be touched — restore from there if you need\n' +
       'this data back later.\n\n' +
       'Type RESET (in capitals) to confirm:'
@@ -2802,80 +2682,54 @@ export default function Dashboard() {
     }
   }
 
-  async function clearCaptchaProvider() {
-    if (!window.confirm('Remove the stored Anthropic API key from Windows Credential Manager?')) return;
-    setBusy('captcha-clear-anthropic');
-    try {
-      const result: any = await window.api.captchaAi.clearKey();
-      if (result.ok && result.status) {
-        setCaptchaAiStatus(result.status as CaptchaAiStatus);
-        showToast('success', 'Claude CAPTCHA key removed');
-      } else {
-        showToast('error', result.error || 'Could not clear Anthropic API key');
-      }
-    } finally {
-      setBusy(null);
-      await loadCaptchaAiStatus();
-    }
-  }
-
+  /**
+   * Gmail dialog primary action. With pasted JSON: save it, then go straight
+   * on to Google sign-in (closing on success). Without JSON: sign in / OK.
+   */
   async function saveServiceConfig() {
     if (modal.type !== 'service-config') return;
+    if (busy === 'gmail-configure' || busy === 'gmail-connect' || busy === 'gmail-clear') return;
     const value = serviceConfigValue.trim();
-    if (!value) return;
 
-    if (modal.service === 'gmail') {
-      setBusy('gmail-configure');
-      try {
-        const result: any = await window.api.gmail.setCredentials(value);
-        if (result.ok && result.status) {
-          setGmailStatus(result.status as GmailStatus);
-          showToast('success', 'Google OAuth JSON saved');
-          setModal({ type: 'none' });
-          setServiceConfigValue('');
-        } else {
-          showToast('error', result.error || 'Could not save Google OAuth JSON');
-        }
-      } finally {
-        setBusy(null);
-        await loadGmailStatus();
-      }
+    if (!value) {
+      if (gmailStatus?.state === 'connected') { closeGmailDialog(); return; }
+      if (gmailStatus?.configured) { await connectGmailFromDialog(); return; }
+      setGmailDialogError('Paste the Google OAuth client JSON first.');
       return;
     }
 
-    setBusy('captcha-connect-anthropic');
+    setBusy('gmail-configure');
+    setGmailDialogError(null);
+    let saved: GmailStatus | null = null;
     try {
-      const result: any = await window.api.captchaAi.setKey(value);
-      if (result.ok && result.status) {
-        setCaptchaAiStatus(result.status as CaptchaAiStatus);
-        // Saving a paid API key is itself an act of consent — auto-flip the
-        // flag so the user doesn't have to find a checkbox. They can revoke
-        // any time from the same modal.
-        try { await window.api.captchaAi.setConsent(true); } catch { /* */ }
-        showToast('success', 'Claude CAPTCHA connected · uploads enabled');
-        setModal({ type: 'none' });
+      const result: any = await window.api.gmail.setCredentials(value);
+      if (result?.ok && result.status) {
+        saved = result.status as GmailStatus;
+        setGmailStatus(saved);
         setServiceConfigValue('');
       } else {
-        showToast('error', result.error || 'Could not save Anthropic API key');
+        setGmailDialogError(result?.error || 'Could not save Google OAuth JSON');
       }
+    } catch (e: any) {
+      setGmailDialogError(e?.message || 'Could not save Google OAuth JSON');
     } finally {
       setBusy(null);
-      await loadCaptchaAiStatus();
-      await loadCaptchaUsage();
     }
+    if (!saved) { await loadGmailStatus(); return; }
+
+    if (saved.state === 'connected') {
+      showToast('success', 'Google OAuth JSON saved');
+      closeGmailDialog();
+      return;
+    }
+    // JSON saved — the next step is Google sign-in, so start it right away.
+    await connectGmailFromDialog();
   }
 
   function gmailTone(state: GmailStatus['state'] | undefined): 'good' | 'warn' | 'bad' | 'muted' {
     if (state === 'connected') return 'good';
     if (state === 'not_connected' || state === 'needs_reauth') return 'warn';
     if (state === 'missing_credentials' || state === 'error') return 'bad';
-    return 'muted';
-  }
-
-  function captchaAiTone(state: CaptchaAiStatus['state'] | CaptchaProviderStatus['state'] | undefined): 'good' | 'warn' | 'bad' | 'muted' {
-    if (state === 'connected') return 'good';
-    if (state === 'not_connected') return 'warn';
-    if (state === 'error') return 'bad';
     return 'muted';
   }
 
@@ -3358,28 +3212,6 @@ export default function Dashboard() {
             >
               <span className="status-dot" />
               {gmailStatus?.label || 'Checking Gmail...'}
-            </button>
-          </div>
-          <div className="gmail-status-row">
-            <button
-              className={`gmail-status-pill ${captchaAiTone(captchaAiStatus?.state)}`}
-              onClick={configureCaptchaProvider}
-              title={
-                captchaAiStatus?.detail
-                  ? `${captchaAiStatus.detail}${captchaUsage ? ` · Today: ${captchaUsage.calls}${captchaUsage.cap > 0 ? '/' + captchaUsage.cap : ''}` : ''}`
-                  : 'Click to configure CAPTCHA AI'
-              }
-            >
-              <span className="status-dot" />
-              {captchaAiStatus?.label || 'Checking CAPTCHA AI...'}
-              {captchaUsage && captchaAiStatus?.configured && (
-                <span style={{
-                  marginLeft: 6, opacity: 0.7, fontSize: 9,
-                  color: captchaUsage.cap > 0 && captchaUsage.calls >= captchaUsage.cap ? 'var(--danger)' : undefined,
-                }}>
-                  ({captchaUsage.calls}{captchaUsage.cap > 0 ? `/${captchaUsage.cap}` : ''})
-                </span>
-              )}
             </button>
           </div>
           <div className="gmail-status-row">
@@ -4502,181 +4334,118 @@ export default function Dashboard() {
               </>
             )}
 
-            {isServiceConfigModal && (
+            {isServiceConfigModal && (() => {
+              const gmailBusy = busy === 'gmail-configure' || busy === 'gmail-connect' || busy === 'gmail-clear';
+              const hasJson = !!serviceConfigValue.trim();
+              const connected = gmailStatus?.state === 'connected';
+              const canSignIn = !!gmailStatus?.configured && !connected;
+              const primaryLabel = busy === 'gmail-configure'
+                ? 'Saving…'
+                : busy === 'gmail-connect'
+                  ? 'Waiting for Google sign-in…'
+                  : hasJson
+                    ? (connected ? 'Save' : 'Save & sign in')
+                    : connected
+                      ? 'OK'
+                      : canSignIn
+                        ? (gmailStatus?.state === 'not_connected' ? 'Sign in' : 'Reconnect')
+                        : 'Save';
+              const primaryDisabled = gmailBusy || (!hasJson && !connected && !canSignIn);
+              return (
               <>
-                <div className="modal-head">
-                  {modal.service === 'gmail' ? 'Configure Gmail OAuth' : 'Configure Claude CAPTCHA'}
+                <div className="modal-head" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <span style={{ flex: 1 }}>Configure Gmail OAuth</span>
+                  <button
+                    type="button"
+                    className="btn-icon"
+                    onClick={closeGmailDialog}
+                    title="Close (Esc)"
+                    aria-label="Close Gmail settings"
+                  >✕</button>
                 </div>
-                <div className="modal-body">
-                  {modal.service === 'gmail' ? (
-                    <>
-                      {gmailStatus && (
-                        <div
-                          className={`bm-strip-warn ${gmailStatus.state === 'connected' ? 'info' : 'stale'}`}
-                          style={{ marginBottom: 14, flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}
-                        >
-                          <strong>{gmailStatus.label}</strong>
-                          {gmailStatus.detail && <span style={{ lineHeight: 1.5 }}>{gmailStatus.detail}</span>}
-                          {gmailStatus.state === 'connected' && (
-                            <span>OTP emails are read automatically. Paste a new JSON below only to switch OAuth clients.</span>
-                          )}
-                        </div>
+                <div className="modal-body-scroll">
+                  {gmailStatus && (
+                    <div
+                      className={`bm-strip-warn ${connected ? 'info' : 'stale'}`}
+                      style={{ marginBottom: 14, flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}
+                    >
+                      <strong>{gmailStatus.label}</strong>
+                      {gmailStatus.detail && <span style={{ lineHeight: 1.5 }}>{gmailStatus.detail}</span>}
+                      {connected && (
+                        <span>OTP emails are read automatically. Paste a new JSON below only to switch OAuth clients.</span>
                       )}
-                      <div className="form-field">
-                        <label>Google OAuth Client JSON</label>
-                        <textarea
-                          autoFocus={!gmailStatus?.configured}
-                          rows={gmailStatus?.configured ? 5 : 12}
-                          value={serviceConfigValue}
-                          onChange={e => setServiceConfigValue(e.target.value)}
-                          onKeyDown={e => {
-                            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') saveServiceConfig();
-                          }}
-                          placeholder={'Paste the Desktop App OAuth JSON downloaded from Google Cloud.\n\nIt should include installed.client_id and installed.client_secret.'}
-                          style={{ width: '100%', resize: 'vertical', fontFamily: 'var(--mono)' }}
-                        />
-                      </div>
-                      <div className="empty-sub">
-                        The JSON is stored in the app data folder. Gmail sign-in still happens in your browser after this step.
-                      </div>
-                    </>
-                  ) : (
-                    <>
-                      <div className="form-field">
-                        <label>Anthropic API Key</label>
-                        <input
-                          autoFocus
-                          type="password"
-                          value={serviceConfigValue}
-                          onChange={e => setServiceConfigValue(e.target.value)}
-                          onKeyDown={e => e.key === 'Enter' && saveServiceConfig()}
-                          placeholder="sk-ant-..."
-                          style={{ fontFamily: 'var(--mono)' }}
-                        />
-                      </div>
-                      <div className="empty-sub">
-                        This key is stored securely in Windows Credential Manager and used to solve AU Bank CAPTCHA automatically.
-                      </div>
-
-                      {/* Cost guardrails ─────────────────────────────────────────────── */}
-                      <div className="form-section" style={{ marginTop: 18 }}>Cost guardrails</div>
-
-                      <div className="form-field">
-                        <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                          <input
-                            type="checkbox"
-                            checked={!!captchaUsage?.consented}
-                            onChange={e => toggleCaptchaConsent(e.target.checked)}
-                          />
-                          Allow uploading CAPTCHA images to api.anthropic.com
-                        </label>
-                        <div className="empty-sub" style={{ marginTop: 4 }}>
-                          Each solve sends one screenshot to Anthropic for OCR.
-                          Enabled automatically when an API key is configured.
-                          Uncheck to stop all uploads without removing the key.
-                        </div>
-                      </div>
-
-                      <div className="form-field">
-                        <label>Daily call cap</label>
-                        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                          <input
-                            type="number"
-                            min={0}
-                            value={captchaUsage?.cap ?? 100}
-                            onChange={e => setCaptchaCap(Number(e.target.value))}
-                            style={{ width: 120, fontFamily: 'var(--mono)' }}
-                          />
-                          <span className="empty-sub">0 = no cap (not recommended)</span>
-                        </div>
-                      </div>
-
-                      <div className="form-field">
-                        <label>Today's usage</label>
-                        <div className="empty-sub">
-                          {captchaUsage ? (
-                            <>
-                              <strong style={{
-                                color: captchaUsage.cap > 0 && captchaUsage.calls >= captchaUsage.cap
-                                  ? 'var(--danger)'
-                                  : captchaUsage.cap > 0 && captchaUsage.calls >= captchaUsage.cap * 0.8
-                                    ? 'var(--warn)'
-                                    : 'var(--text-0)'
-                              }}>
-                                {captchaUsage.calls}{captchaUsage.cap > 0 ? ` / ${captchaUsage.cap}` : ''} calls
-                              </strong>
-                              {' · '}
-                              {captchaUsage.inputTokens.toLocaleString()} in / {captchaUsage.outputTokens.toLocaleString()} out tokens
-                              <br />
-                              Lifetime: {captchaUsage.totalCalls} calls · {captchaUsage.totalInputTokens.toLocaleString()} in / {captchaUsage.totalOutputTokens.toLocaleString()} out tokens
-                            </>
-                          ) : 'Loading...'}
-                        </div>
-                        <button
-                          className="btn-row"
-                          style={{ marginTop: 6 }}
-                          onClick={resetCaptchaCounter}
-                          disabled={!captchaUsage || captchaUsage.calls === 0}
-                        >
-                          Reset today's counter
-                        </button>
-                      </div>
-                    </>
+                    </div>
+                  )}
+                  <div className="form-field">
+                    <label>Google OAuth Client JSON</label>
+                    <textarea
+                      autoFocus={!gmailStatus?.configured}
+                      rows={gmailStatus?.configured ? 5 : 10}
+                      value={serviceConfigValue}
+                      disabled={gmailBusy}
+                      onChange={e => { setServiceConfigValue(e.target.value); setGmailDialogError(null); }}
+                      onKeyDown={e => {
+                        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') void saveServiceConfig();
+                      }}
+                      placeholder={'Paste the Desktop App OAuth JSON downloaded from Google Cloud.\n\nIt should include installed.client_id and installed.client_secret.'}
+                      style={{ width: '100%', resize: 'vertical', fontFamily: 'var(--mono)' }}
+                    />
+                  </div>
+                  <div className="empty-sub">
+                    The JSON is stored in the app data folder. After saving, Google sign-in opens in your browser.
+                    Without Gmail, type bank OTPs directly in the bank window.
+                  </div>
+                  {gmailDialogNote && (
+                    <div className="bm-strip-warn info" role="status" style={{ marginTop: 12 }}>
+                      {gmailDialogNote}
+                    </div>
+                  )}
+                  {gmailDialogError && (
+                    <div
+                      className="bm-strip-warn"
+                      role="alert"
+                      style={{ marginTop: 12, color: 'var(--danger)', background: 'rgba(217,119,87,0.08)' }}
+                    >
+                      {gmailDialogError}
+                    </div>
                   )}
                 </div>
                 <div className="modal-foot">
-                  {modal.service === 'gmail' && gmailStatus?.configured && (
+                  {gmailStatus?.configured && (
                     <button
                       className="btn btn-ghost btn-danger-ghost"
                       onClick={clearGmailCredentials}
-                      disabled={busy === 'gmail-clear'}
+                      disabled={gmailBusy}
                       style={{ marginRight: 'auto' }}
                     >
-                      {busy === 'gmail-clear' ? 'Removing...' : 'Clear Gmail'}
+                      {busy === 'gmail-clear' ? 'Removing…' : 'Clear Gmail'}
                     </button>
                   )}
-                  {modal.service === 'captcha-anthropic' && captchaAiStatus?.providers?.anthropic?.source === 'keychain' && (
-                    <button
-                      className="btn btn-ghost btn-danger-ghost"
-                      onClick={clearCaptchaProvider}
-                      disabled={busy === 'captcha-clear-anthropic'}
-                      style={{ marginRight: 'auto' }}
-                    >
-                      {busy === 'captcha-clear-anthropic' ? 'Removing...' : 'Clear Key'}
-                    </button>
-                  )}
-                  {modal.service === 'gmail' && (gmailStatus?.state === 'not_connected' || gmailStatus?.state === 'needs_reauth' || gmailStatus?.state === 'error') && (
+                  {hasJson && canSignIn && (
                     <button
                       className="btn btn-ghost"
-                      onClick={reconnectGmailStatus}
-                      disabled={busy === 'gmail-connect'}
-                      title="Opens Google sign-in in your browser. Your current access keeps working until the new sign-in succeeds."
+                      onClick={() => void connectGmailFromDialog()}
+                      disabled={gmailBusy}
+                      title="Sign in with the OAuth JSON already saved, ignoring the pasted text."
                     >
-                      {busy === 'gmail-connect' ? 'Waiting for Google sign-in…' : (gmailStatus?.state === 'not_connected' ? 'Sign in' : 'Reconnect')}
+                      {gmailStatus?.state === 'not_connected' ? 'Sign in' : 'Reconnect'}
                     </button>
                   )}
-                  <button
-                    className="btn btn-ghost"
-                    onClick={() => { setModal({ type: 'none' }); setServiceConfigValue(''); }}
-                  >
-                    Cancel
+                  <button className="btn btn-ghost" onClick={closeGmailDialog}>
+                    {hasJson || gmailBusy ? 'Cancel' : 'Close'}
                   </button>
                   <button
                     className="btn"
-                    onClick={saveServiceConfig}
-                    disabled={
-                      !serviceConfigValue.trim()
-                      || busy === 'gmail-configure'
-                      || busy === 'captcha-connect-anthropic'
-                    }
+                    onClick={() => void saveServiceConfig()}
+                    disabled={primaryDisabled}
+                    title={canSignIn && !hasJson ? 'Opens Google sign-in in your browser. Your current access keeps working until the new sign-in succeeds.' : undefined}
                   >
-                    {busy === 'gmail-configure' || busy === 'captcha-connect-anthropic'
-                      ? 'Saving...'
-                      : 'Save'}
+                    {primaryLabel}
                   </button>
                 </div>
               </>
-            )}
+              );
+            })()}
 
             {modal.type === 'change-master-password' && (
               <>
@@ -5380,31 +5149,6 @@ export default function Dashboard() {
                 </div>
               </>
             )}
-          </div>
-        </div>
-      )}
-
-      {/* â"€â"€ OTP dialog â"€â"€ */}
-      {otpRequest && (
-        <div className="modal-overlay" onClick={cancelOtp}>
-          <div className="modal otp-modal" onClick={e => e.stopPropagation()}>
-            <div className="modal-head">Enter OTP</div>
-            <div className="modal-body">
-              <p className="otp-label">{otpRequest.label}</p>
-              <div className="otp-input-row">
-                <input className="otp-input" type="text" inputMode="numeric" pattern="[0-9]*"
-                  maxLength={8} autoFocus placeholder="......" value={otpValue}
-                  onChange={e => setOtpValue(e.target.value.replace(/\D/g, ''))}
-                  onKeyDown={e => e.key === 'Enter' && submitOtp()} />
-              </div>
-              <p className="otp-hint">Check your registered mobile number for the OTP.</p>
-            </div>
-            <div className="modal-foot">
-              <button className="btn btn-ghost" onClick={cancelOtp} disabled={otpSubmitting}>Cancel</button>
-              <button className="btn" onClick={submitOtp} disabled={otpSubmitting || otpValue.length < 4}>
-                {otpSubmitting ? 'Submitting...' : 'Submit OTP'}
-              </button>
-            </div>
           </div>
         </div>
       )}

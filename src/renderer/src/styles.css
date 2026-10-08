@@ -1518,48 +1518,6 @@ input, textarea { user-select: text; }
 .add-account-row select:focus { border-color: var(--accent-dim); }
 .add-account-row .btn { padding: 9px 16px; white-space: nowrap; flex-shrink: 0; }
 
-/* ── OTP dialog ── */
-
-.otp-modal { width: 400px; }
-
-.otp-label {
-  font-size: 13px;
-  color: var(--text-1);
-  margin-bottom: 18px;
-  line-height: 1.5;
-}
-
-.otp-input-row {
-  display: flex;
-  justify-content: center;
-  margin-bottom: 14px;
-}
-
-.otp-input {
-  width: 180px;
-  padding: 14px 0;
-  background: var(--bg-0);
-  border: 2px solid var(--accent-dim);
-  border-radius: var(--radius);
-  color: var(--accent);
-  font-family: var(--mono);
-  font-size: 28px;
-  font-weight: 600;
-  letter-spacing: 0.25em;
-  text-align: center;
-  outline: none;
-  transition: border-color 120ms;
-}
-.otp-input:focus { border-color: var(--accent); }
-
-.otp-hint {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--text-3);
-  text-align: center;
-  letter-spacing: 0.03em;
-}
-
 /* ── Legacy family head styles (kept for safety) ── */
 
 .family-actions {

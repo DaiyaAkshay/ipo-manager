@@ -26,6 +26,7 @@
  */
 
 import { Download, Page, Locator, BrowserContext } from 'playwright';
+import { otpOrManual, otpPromptOnPage } from './manualStep';
 import { DownloadedBrokerReport, LoginAdapter, LoginCredentials, resolveBrowserDownload } from './browser';
 
 const LOGIN_URL = 'https://trade.angelone.in/';
@@ -661,8 +662,10 @@ export const angelAdapter: LoginAdapter = {
     // 3) OTP (sent to email)
     if (step === 'otp') {
       let otp = '';
+      let typedInBrowser = false;
       try {
-        const raw = await fetchOtp();
+        const raw = await otpOrManual(page, fetchOtp, 'Angel One', otpPromptOnPage(page));
+        if (raw === null) typedInBrowser = true;
         otp = (raw || '').replace(/\D/g, '').slice(-6);
       } catch (e: any) {
         const msg = e?.message || String(e);
@@ -673,21 +676,25 @@ export const angelAdapter: LoginAdapter = {
         }
         return;
       }
-      if (otp.length < 4) {
-        console.warn(`[Angel One] OTP looks invalid: "${otp}"`);
-        return;
-      }
-      console.log(`[Angel One] OTP fetched (${otp.length} digits).`);
+      if (typedInBrowser) {
+        console.log('[Angel One] OTP entered in the browser — waiting for MPIN/dashboard…');
+      } else {
+        if (otp.length < 4) {
+          console.warn(`[Angel One] OTP looks invalid: "${otp}"`);
+          return;
+        }
+        console.log(`[Angel One] OTP fetched (${otp.length} digits).`);
 
-      if (!await fillDigits(page, otp)) {
-        console.warn('[Angel One] Could not fill OTP.');
-        await dumpDiagnostics(page, 'otp-fill-fail');
-        return;
+        if (!await fillDigits(page, otp)) {
+          console.warn('[Angel One] Could not fill OTP.');
+          await dumpDiagnostics(page, 'otp-fill-fail');
+          return;
+        }
+        // Submit using multi-strategy approach (click → Enter → submit-type
+        // button → force click → form.submit).
+        await submitOtpForm(page, 'OTP');
+        console.log('[Angel One] OTP submission attempted, waiting for MPIN/dashboard…');
       }
-      // Submit using multi-strategy approach (click → Enter → submit-type
-      // button → force click → form.submit).
-      await submitOtpForm(page, 'OTP');
-      console.log('[Angel One] OTP submission attempted, waiting for MPIN/dashboard…');
 
       // We just submitted OTP — the next screen is MPIN (or dashboard if
       // device is trusted). Hint MPIN so detectStep doesn't mistake the

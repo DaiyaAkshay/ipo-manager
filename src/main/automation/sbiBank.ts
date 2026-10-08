@@ -21,6 +21,7 @@
  */
 
 import { Locator, Page } from 'playwright';
+import { otpOrManual } from './manualStep';
 import { LoginAdapter, LoginCredentials } from './browser';
 
 const LOGIN_URL = 'https://retail.sbi.bank.in/retail/login.htm';
@@ -144,31 +145,34 @@ export const sbiBankAdapter: LoginAdapter = {
       await otpField.waitFor({ state: 'visible', timeout: 30_000 });
       console.log('[SBI] ✓ OTP page detected — requesting OTP from user…');
 
-      // ── Step 6: Get OTP from in-app dialog ─────────────────────────────────
-      const otp = await fetchOtp();   // resolves when user submits the dialog
-      console.log('[SBI] ✓ OTP received');
-
-      await otpField.clear();
-      await otpField.fill(otp);
-
-      // ── Step 7: Submit OTP ─────────────────────────────────────────────────
-      const submitBtn = page.locator([
-        'input[type="submit"]',
-        'button[type="submit"]',
-        'button:has-text("Submit")',
-        'button:has-text("SUBMIT")',
-        'button:has-text("Confirm")',
-        'button:has-text("CONFIRM")',
-        'button:has-text("Proceed")',
-        'a:has-text("Submit")',
-      ].join(', ')).first();
-
-      if (await submitBtn.isVisible().catch(() => false)) {
-        await submitBtn.click();
-        console.log('[SBI] ✓ OTP submitted — login complete.');
+      // ── Step 6: OTP from Gmail, or wait for the user to type it ────────────
+      const otp = await otpOrManual(page, fetchOtp, 'SBI', otpField);
+      if (!otp) {
+        console.log('[SBI] OTP step finished in the browser (or timed out) — continuing.');
       } else {
-        await otpField.press('Enter');
-        console.log('[SBI] ✓ Pressed Enter to submit OTP.');
+        console.log('[SBI] ✓ OTP received');
+        await otpField.clear();
+        await otpField.fill(otp);
+
+        // ── Step 7: Submit OTP ───────────────────────────────────────────────
+        const submitBtn = page.locator([
+          'input[type="submit"]',
+          'button[type="submit"]',
+          'button:has-text("Submit")',
+          'button:has-text("SUBMIT")',
+          'button:has-text("Confirm")',
+          'button:has-text("CONFIRM")',
+          'button:has-text("Proceed")',
+          'a:has-text("Submit")',
+        ].join(', ')).first();
+
+        if (await submitBtn.isVisible().catch(() => false)) {
+          await submitBtn.click();
+          console.log('[SBI] ✓ OTP submitted — login complete.');
+        } else {
+          await otpField.press('Enter');
+          console.log('[SBI] ✓ Pressed Enter to submit OTP.');
+        }
       }
 
     } catch (e: any) {

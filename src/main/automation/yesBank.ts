@@ -21,6 +21,7 @@
  */
 
 import { Locator, Page } from 'playwright';
+import { otpOrManual } from './manualStep';
 import { gotoFirstReachable, LoginAdapter, LoginCredentials } from './browser';
 
 const LOGIN_URLS = ['https://yesonline.yes.bank.in/', 'https://netbanking.yesbank.in/'];
@@ -127,27 +128,31 @@ export const yesBankAdapter: LoginAdapter = {
 
     // ── Fetch OTP from Gmail ──────────────────────────────────────────────────
     try {
-      const otp = await fetchOtp();
-      console.log(`[YES Bank] ✓ OTP received (${otp.length} digits)`);
-      await otpField.clear();
-      await otpField.fill(otp);
-
-      // ── Submit OTP ────────────────────────────────────────────────────────
-      const submitOtpBtn = page.locator([
-        'button[type="submit"]',
-        'input[type="submit"]',
-        'button:has-text("Submit")',
-        'button:has-text("Verify")',
-        'button:has-text("Confirm")',
-        'button:has-text("Proceed")',
-      ].join(', ')).first();
-
-      if (await submitOtpBtn.isVisible().catch(() => false)) {
-        await submitOtpBtn.click();
-        console.log('[YES Bank] ✓ OTP submitted');
+      const otp = await otpOrManual(page, fetchOtp, 'YES Bank', otpField);
+      if (!otp) {
+        console.log('[YES Bank] OTP step finished in the browser (or timed out) — continuing.');
       } else {
-        await otpField.press('Enter');
-        console.log('[YES Bank] ✓ Pressed Enter to submit OTP');
+        console.log(`[YES Bank] ✓ OTP received (${otp.length} digits)`);
+        await otpField.clear();
+        await otpField.fill(otp);
+
+        // ── Submit OTP ────────────────────────────────────────────────────────
+        const submitOtpBtn = page.locator([
+          'button[type="submit"]',
+          'input[type="submit"]',
+          'button:has-text("Submit")',
+          'button:has-text("Verify")',
+          'button:has-text("Confirm")',
+          'button:has-text("Proceed")',
+        ].join(', ')).first();
+
+        if (await submitOtpBtn.isVisible().catch(() => false)) {
+          await submitOtpBtn.click();
+          console.log('[YES Bank] ✓ OTP submitted');
+        } else {
+          await otpField.press('Enter');
+          console.log('[YES Bank] ✓ Pressed Enter to submit OTP');
+        }
       }
     } catch (e: any) {
       const msg: string = e?.message ?? String(e);

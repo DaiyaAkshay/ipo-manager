@@ -1,4 +1,5 @@
 import { Frame, Locator, Page } from 'playwright';
+import { otpOrManual } from './manualStep';
 import { gotoFirstReachable, LoginAdapter, LoginCredentials } from './browser';
 
 type SearchRoot = Page | Frame;
@@ -307,7 +308,8 @@ async function submitOtpIfPresent(
   if (!otpField) return false;
 
   try {
-    const otp = await fetchOtp();
+    const otp = await otpOrManual(page, fetchOtp, config.displayName, otpField);
+    if (!otp) return true; // typed in the browser (or timed out) — continue
     console.log(`[${config.displayName}] OTP received`);
     await fillField(page, otpField, otp, `${config.displayName} OTP`);
     const submitted = await clickFirst(

@@ -25,6 +25,7 @@
  */
 
 import { Page, Locator } from 'playwright';
+import { otpOrManual } from './manualStep';
 import { gotoFirstReachable, LoginAdapter, LoginCredentials } from './browser';
 import { balanceLabelLines, formatKotakLoanBalance, parseKotakLoanText } from './kotakLoan';
 
@@ -238,14 +239,18 @@ export const kotakAdapter: LoginAdapter = {
 
     // ── Step 4: Fill OTP ──────────────────────────────────────────────────────
     try {
-      const otp = await fetchOtp();
-      console.log('[Kotak] ✓ OTP received');
-      await otpLoc!.click({ timeout: 3000 }).catch(() => {});
-      await page.keyboard.type(otp, { delay: 80 });
-      await page.waitForTimeout(400);
+      const otp = await otpOrManual(page, fetchOtp, 'Kotak', otpLoc!);
+      if (!otp) {
+        console.log('[Kotak] OTP step finished in the browser (or timed out) — continuing.');
+      } else {
+        console.log('[Kotak] ✓ OTP received');
+        await otpLoc!.click({ timeout: 3000 }).catch(() => {});
+        await page.keyboard.type(otp, { delay: 80 });
+        await page.waitForTimeout(400);
 
-      const submitted = await clickByText(page, /Submit|Verify|Confirm|Proceed/i, 'OTP Submit');
-      if (!submitted) await page.keyboard.press('Enter');
+        const submitted = await clickByText(page, /Submit|Verify|Confirm|Proceed/i, 'OTP Submit');
+        if (!submitted) await page.keyboard.press('Enter');
+      }
     } catch (e: any) {
       const msg = e?.message ?? String(e);
       if (msg.includes('OTP_TIMEOUT') || msg.includes('OTP_CANCELLED')) {
