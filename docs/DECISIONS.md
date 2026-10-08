@@ -157,3 +157,16 @@ board-meeting signals. The quota watchlist holds symbols only and is stored
 in `data/market.json`, outside the encrypted vault. This avoids a schema
 migration that the Android viewer would also need.
 
+## 2026-10-08 — v0.3.12: no CAPTCHA solving, no OTP popup
+
+The owner does not want to pay for CAPTCHA solving, so `claude/remove-captcha`
+is merged. The popup used to block `fetchOtp` until the OTP was typed. Without
+it, every non-AU adapter returned at once and the balance was read before
+login finished. `manualStep.otpOrManual()` replaces the direct calls. It
+returns the Gmail/TOTP code, or waits until the OTP box is gone (brokers:
+until the page stops mentioning "OTP") and returns null. Shoonya still calls
+`fetchOtp` directly because its code needs the value; use a TOTP secret
+there. `codex/backup-review` and `codex/device-sync-audit` were not merged.
+They are Codex audit notes, and the device-sync test they carry is an older
+copy of the one fixed in v0.3.10.
+

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.12
+
+- Removed CAPTCHA auto-solving (no Anthropic API key or usage tracking) and the in-app OTP popup. You type the CAPTCHA in the bank window. OTPs come from Gmail/TOTP when available; otherwise a banner asks you to type the OTP in the bank window.
+- Every bank and broker login (HDFC, ICICI, Axis, BoB, PNB, SBI, Kotak, YES, Dhan, mStock, Angel, Zerodha) now waits for you to finish the OTP in the browser before reading the balance. Without the popup they used to read it too early.
+- Gmail sign-in dialog: Close/Cancel, Esc, and clear OK / Save & sign in / Reconnect buttons with inline errors.
+
 ## 0.3.11
 
 - YES Bank: type the Login ID and password into the visible fields. The new Oracle JET login page has hidden autofill decoys (#username/#password) that the old selectors picked first, so the Login ID was never entered.
