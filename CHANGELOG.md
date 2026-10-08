@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.14
+
+- Zerodha/Dhan/Angel: after "Save & Open", the broker card shows the downloaded report's portfolio value and time when that is newer than the last login balance. Previously the older login figure always won.
+- Dhan: Journal by Dhan has its own login now. The holdings download logs in there (mobile → OTP → PIN) instead of stalling on the login page. A login already on the dashboard (QR scanned, or done by hand) is recognised at once. The "login with mobile" switch is matched more loosely, and diagnostics reach the log.
+
 ## 0.3.13
 
 - Kotak balance: click "View balance" to unmask the amounts (and open Loans if needed) before reading Withdrawable / Outstanding. On failure, the log lists the balance-related labels on the page with digits masked.
