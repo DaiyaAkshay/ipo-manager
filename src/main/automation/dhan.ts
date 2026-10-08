@@ -34,12 +34,25 @@ const DHAN_DASHBOARD_URL_RE = /^https:\/\/web\.dhan\.co(\/|$)/i;
 const JOURNAL_HOLDINGS_URL = 'https://journal.dhan.co/holdings';
 const JOURNAL_HOLDINGS_RE = /^https:\/\/journal\.dhan\.co\/holdings(?:[/?#]|$)/i;
 
-async function waitForDhanDashboard(page: Page, timeout = 20_000): Promise<boolean> {
+/**
+ * Where a login lands. Dhan Web and Journal by Dhan are separate sessions:
+ * journal.dhan.co redirects to login.dhan.co/?location=DH_JOURNAL even while
+ * Dhan Web is logged in (checked live 2026-10-08).
+ */
+interface DhanLoginTarget { url: string; doneRe: RegExp; label: string }
+const WEB_TARGET: DhanLoginTarget = { url: LOGIN_URL, doneRe: DHAN_DASHBOARD_URL_RE, label: 'Dhan Web' };
+const JOURNAL_TARGET: DhanLoginTarget = {
+  url: 'https://login.dhan.co/?location=DH_JOURNAL',
+  doneRe: /^https:\/\/journal\.dhan\.co(\/|$)/i,
+  label: 'Journal by Dhan',
+};
+
+async function waitForDhanDashboard(page: Page, timeout = 20_000, doneRe: RegExp = DHAN_DASHBOARD_URL_RE): Promise<boolean> {
   try {
-    await page.waitForURL(DHAN_DASHBOARD_URL_RE, { timeout });
+    await page.waitForURL(doneRe, { timeout });
     return true;
   } catch {
-    return DHAN_DASHBOARD_URL_RE.test(page.url());
+    return doneRe.test(page.url());
   }
 }
 
@@ -75,9 +88,9 @@ async function dumpDiagnostics(page: Page, label: string): Promise<void> {
     });
     console.log(`[Dhan][debug:${label}] url = ${info.url}`);
     console.log(`[Dhan][debug:${label}] visible buttons/links (${info.buttons.length}):`);
-    info.buttons.forEach(b => console.log('  ' + b));
+    info.buttons.forEach(b => console.log(`[Dhan][debug:${label}]   ${b}`));
     console.log(`[Dhan][debug:${label}] visible inputs (${info.inputs.length}):`);
-    info.inputs.forEach(i => console.log('  ' + i));
+    info.inputs.forEach(i => console.log(`[Dhan][debug:${label}]   ${i}`));
   } catch (e) {
     console.warn(`[Dhan][debug:${label}] dump failed:`, (e as Error).message);
   }
@@ -161,260 +174,283 @@ async function clickPrimary(page: Page, labels: string[]): Promise<boolean> {
   return false;
 }
 
+async function dhanLogin(
+  page: Page,
+  creds: LoginCredentials,
+  fetchOtp: () => Promise<string>,
+  target: DhanLoginTarget,
+): Promise<void> {
+  // ── Navigate directly to the web-trading login (skips platform-select) ──
+  await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+  await page.waitForTimeout(800);
+
+  // ── Already-logged-in shortcut ───────────────────────────────────────────
+  // If Dhan's persistent profile has a live session, login.dhan.co immediately
+  // redirects to web.dhan.co/index/* — no QR / OTP / PIN needed.
+  if (target.doneRe.test(page.url())) {
+    console.log('[Dhan] ✓ Already logged in (session cached):', page.url());
+    return;
+  }
+
+  const MOBILE_FIELD_SEL = [
+    'input[type="tel"]',
+    'input[name="mobile"]',
+    'input[name="phone"]',
+    'input[name="mobileNumber"]',
+    'input[id*="mobile" i]',
+    'input[id*="phone" i]',
+    'input[placeholder*="mobile" i]',
+    'input[placeholder*="phone" i]',
+    'input[autocomplete="tel"]',
+    'input[maxlength="10"]',
+    'input[inputmode="numeric"]',
+  ].join(', ');
+
+  const MOBILE_SWITCH_SEL = [
+    'button:has-text("Login with Mobile Number")',
+    'button:has-text("Login with Mobile")',
+    'button:has-text("Show login with Mobile")',
+    'button:has-text("Use Mobile Number")',
+    'button:has-text("Mobile Number")',
+    'button:has-text("Use mobile")',
+    'a:has-text("Login with Mobile Number")',
+    'a:has-text("Show login with Mobile")',
+    'a:has-text("Use Mobile Number")',
+    'a:has-text("Mobile Number")',
+    '[role="button"]:has-text("Mobile Number")',
+    'div[role="button"]:has-text("Mobile")',
+  ].join(', ');
+
+  // ── Step 1: QR screen → switch to Mobile Number login ────────────────────
+  // Wait for EITHER the QR-switch button OR the mobile field to appear,
+  // whichever comes first. Some sessions skip the QR screen on cached state.
+  const mobileField  = page.locator(MOBILE_FIELD_SEL).first();
+  const mobileSwitch = page.locator(MOBILE_SWITCH_SEL).first();
+  const mobileSwitchText = page.getByText(/show\s+login\s+with\s+mobile/i).first();
+
+  let mobileFieldReady = false;
+  let alreadyIn = false;
+  const anyMobileButton = page.getByRole('button', { name: /mobile|phone/i })
+    .or(page.getByRole('link', { name: /mobile|phone/i })).first();
+  try {
+    await Promise.race([
+      mobileField.waitFor({ state: 'visible', timeout: 30_000 }).then(() => { mobileFieldReady = true; }),
+      mobileSwitch.waitFor({ state: 'visible', timeout: 30_000 }),
+      mobileSwitchText.waitFor({ state: 'visible', timeout: 30_000 }),
+      anyMobileButton.waitFor({ state: 'visible', timeout: 30_000 }),
+      // QR scanned on the phone, or logged in by hand / from a cached session.
+      page.waitForURL(target.doneRe, { timeout: 30_000 }).then(() => { alreadyIn = true; }),
+    ]);
+  } catch {
+    console.warn('[Dhan] Neither mobile field nor mobile-switch button appeared in 30s.');
+    await dumpDiagnostics(page, 'qr-screen');
+    console.warn('[Dhan] Please complete login manually — copy the diagnostic above so we can fix selectors.');
+    return;
+  }
+
+  if (alreadyIn || target.doneRe.test(page.url())) {
+    console.log(`[Dhan] ✓ ${target.label} is logged in:`, page.url());
+    return;
+  }
+
+  if (!mobileFieldReady) {
+    try {
+      const switchTarget = await mobileSwitch.isVisible().catch(() => false)
+        ? mobileSwitch
+        : await mobileSwitchText.isVisible().catch(() => false)
+          ? mobileSwitchText
+          : anyMobileButton;
+      await switchTarget.scrollIntoViewIfNeeded().catch(() => {});
+      await switchTarget.click();
+      console.log('[Dhan] ✓ Switched from QR to Mobile Number login');
+      await mobileField.waitFor({ state: 'visible', timeout: 15_000 });
+      mobileFieldReady = true;
+    } catch (e) {
+      console.warn('[Dhan] Clicked mobile-switch but mobile field never appeared:', (e as Error).message);
+      await dumpDiagnostics(page, 'after-switch');
+      return;
+    }
+  }
+
+  if (!mobileFieldReady) {
+    console.warn('[Dhan] Mobile field not ready — aborting.');
+    await dumpDiagnostics(page, 'mobile-not-ready');
+    return;
+  }
+
+  // ── Step 2: Enter Mobile Number ───────────────────────────────────────────
+  const mobile = (creds.username || '').replace(/\D/g, '').slice(-10);
+  if (mobile.length !== 10) {
+    console.warn(`[Dhan] Stored mobile number has ${creds.username.length} characters, not 10 digits — proceeding anyway.`);
+  }
+
+  try {
+    await mobileField.click();
+    await mobileField.fill(mobile || creds.username);
+    console.log('[Dhan] ✓ Mobile number filled');
+  } catch (e) {
+    console.warn('[Dhan] Could not fill mobile field:', (e as Error).message);
+    await dumpDiagnostics(page, 'mobile-fill-fail');
+    return;
+  }
+
+  // ── Click Continue (after mobile) ─────────────────────────────────────────
+  if (await clickPrimary(page, ['Continue', 'CONTINUE', 'Next', 'Get OTP', 'Send OTP', 'Proceed'])) {
+    console.log('[Dhan] ✓ Clicked Continue after mobile');
+  } else {
+    // Some pages auto-advance on Enter
+    await page.keyboard.press('Enter').catch(() => {});
+    console.log('[Dhan] ✓ Pressed Enter after mobile');
+  }
+
+  // ── Step 2: Wait for OTP or PIN screen ───────────────────────────────────
+  console.log('[Dhan] ⏳ Waiting for OTP or PIN screen…');
+  const otpProbe = page.locator([
+    'input[autocomplete="one-time-code"]',
+    'input[name="otp"]',
+    'input[id*="otp" i]',
+    'input[placeholder*="OTP" i]',
+    'input[maxlength="1"]',
+    'input[maxlength="6"]',
+  ].join(', ')).first();
+  const pinProbe = page.locator([
+    'input[type="password"]',
+    'input[name="pin"]',
+    'input[id*="pin" i]',
+    'input[placeholder*="PIN" i]',
+    'input[placeholder*="MPIN" i]',
+  ].join(', ')).first();
+
+  let nextStep: 'otp' | 'pin' | 'logged-in' = 'otp';
+
+  try {
+    await Promise.race([
+      otpProbe.waitFor({ state: 'visible', timeout: 60_000 }).then(() => {
+        nextStep = 'otp';
+      }),
+      pinProbe.waitFor({ state: 'visible', timeout: 60_000 }).then(() => {
+        nextStep = 'pin';
+      }),
+      waitForDhanDashboard(page, 60_000, target.doneRe).then((ready) => {
+        if (ready) nextStep = 'logged-in';
+        else throw new Error('dashboard-not-ready');
+      })
+    ]);
+    await page.waitForTimeout(150);
+    if (nextStep === 'otp') {
+      console.log('[Dhan] ✓ OTP screen detected');
+    } else if (nextStep === 'pin') {
+      console.log('[Dhan] ✓ PIN screen detected without a separate OTP step');
+    } else {
+      console.log('[Dhan] ✓ Logged in without an OTP/PIN prompt:', page.url());
+      console.log('[Dhan] Browser remains open for IPO application.');
+      return;
+    }
+  } catch {
+    console.warn('[Dhan] Neither OTP nor PIN screen appeared — login may have failed or selectors changed.');
+    await dumpDiagnostics(page, 'post-mobile');
+    return;
+  }
+
+  // ── Fetch OTP from Gmail and fill, if needed ─────────────────────────────
+  if (nextStep === 'otp') {
+    try {
+      const otp = await otpOrManual(page, fetchOtp, 'Dhan', otpPromptOnPage(page));
+      if (!otp) {
+        console.log('[Dhan] OTP step finished in the browser (or timed out) — continuing.');
+      } else {
+        console.log(`[Dhan] ✓ OTP received (${otp.length} digits)`);
+        const filled = await fillDigits(page, otp, 'OTP');
+        if (!filled) {
+          console.warn('[Dhan] Could not find OTP input(s) to fill.');
+          return;
+        }
+
+        // OTP screen often auto-advances on 6 digits; click Submit if present
+        if (await clickPrimary(page, ['Verify', 'Submit', 'Continue', 'Confirm'])) {
+          console.log('[Dhan] ✓ OTP submitted');
+        } else {
+          await page.keyboard.press('Enter').catch(() => {});
+          console.log('[Dhan] ✓ Pressed Enter to submit OTP');
+        }
+      }
+    } catch (e: any) {
+      const msg: string = e?.message ?? String(e);
+      if (msg.includes('OTP_TIMEOUT') || msg.includes('OTP_CANCELLED')) {
+        console.warn('[Dhan] OTP entry was cancelled or timed out.');
+      } else {
+        console.warn('[Dhan] OTP step failed:', msg);
+      }
+      return;
+    }
+  }
+
+  // ── Step 3: Wait for PIN screen ───────────────────────────────────────────
+  console.log('[Dhan] ⏳ Waiting for PIN screen…');
+  const pinWaitProbe = page.locator([
+    'input[type="password"]',
+    'input[name="pin"]',
+    'input[id*="pin" i]',
+    'input[placeholder*="PIN" i]',
+    'input[placeholder*="MPIN" i]',
+    'input[autocomplete="one-time-code"]',
+    'input[maxlength="1"]',
+  ].join(', ')).first();
+
+  try {
+    await pinWaitProbe.waitFor({ state: 'visible', timeout: 30_000 });
+    await page.waitForTimeout(150);
+    console.log('[Dhan] ✓ PIN screen detected');
+  } catch {
+    console.warn('[Dhan] PIN screen did not appear — Dhan may have logged in directly.');
+    return;
+  }
+
+  // ── Fill PIN ──────────────────────────────────────────────────────────────
+  try {
+    const pin = (creds.password || '').replace(/\D/g, '');
+    const filled = await fillDigits(page, pin, 'PIN');
+    if (!filled) {
+      console.warn('[Dhan] Could not find PIN input(s) to fill.');
+      return;
+    }
+
+    if (await clickPrimary(page, ['Login', 'LOGIN', 'Sign In', 'Continue', 'Submit'])) {
+      console.log('[Dhan] ✓ PIN submitted');
+    } else {
+      await page.keyboard.press('Enter').catch(() => {});
+      console.log('[Dhan] ✓ Pressed Enter to submit PIN');
+    }
+  } catch (e) {
+    console.warn('[Dhan] PIN step failed:', (e as Error).message);
+    return;
+  }
+
+  // ── Step 4: Wait for post-login redirect ─────────────────────────────────
+  // After PIN, Dhan typically redirects to web.dhan.co (the trading app).
+  try {
+    const ready = await waitForDhanDashboard(page, 20_000, target.doneRe);
+    if (ready) {
+      console.log('[Dhan] ✓ Post-login dashboard detected:', page.url());
+    } else {
+      console.warn('[Dhan] Post-login redirect not detected within 20s. Balance fetch may fail.');
+    }
+  } catch {
+    console.warn('[Dhan] Post-login redirect check failed. Balance fetch may fail.');
+  }
+
+  console.log('[Dhan] Browser remains open for IPO application.');
+}
+
 export const dhanAdapter: LoginAdapter = {
   code: 'DHAN',
   displayName: 'Dhan',
   otpMode: 'email',
 
   async login(page: Page, creds: LoginCredentials, fetchOtp: () => Promise<string>): Promise<void> {
-    // ── Navigate directly to the web-trading login (skips platform-select) ──
-    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    await page.waitForTimeout(800);
-
-    // ── Already-logged-in shortcut ───────────────────────────────────────────
-    // If Dhan's persistent profile has a live session, login.dhan.co immediately
-    // redirects to web.dhan.co/index/* — no QR / OTP / PIN needed.
-    if (DHAN_DASHBOARD_URL_RE.test(page.url())) {
-      console.log('[Dhan] ✓ Already logged in (session cached):', page.url());
-      return;
-    }
-
-    const MOBILE_FIELD_SEL = [
-      'input[type="tel"]',
-      'input[name="mobile"]',
-      'input[name="phone"]',
-      'input[name="mobileNumber"]',
-      'input[id*="mobile" i]',
-      'input[id*="phone" i]',
-      'input[placeholder*="mobile" i]',
-      'input[placeholder*="phone" i]',
-      'input[autocomplete="tel"]',
-      'input[maxlength="10"]',
-      'input[inputmode="numeric"]',
-    ].join(', ');
-
-    const MOBILE_SWITCH_SEL = [
-      'button:has-text("Login with Mobile Number")',
-      'button:has-text("Login with Mobile")',
-      'button:has-text("Show login with Mobile")',
-      'button:has-text("Use Mobile Number")',
-      'button:has-text("Mobile Number")',
-      'button:has-text("Use mobile")',
-      'a:has-text("Login with Mobile Number")',
-      'a:has-text("Show login with Mobile")',
-      'a:has-text("Use Mobile Number")',
-      'a:has-text("Mobile Number")',
-      '[role="button"]:has-text("Mobile Number")',
-      'div[role="button"]:has-text("Mobile")',
-    ].join(', ');
-
-    // ── Step 1: QR screen → switch to Mobile Number login ────────────────────
-    // Wait for EITHER the QR-switch button OR the mobile field to appear,
-    // whichever comes first. Some sessions skip the QR screen on cached state.
-    const mobileField  = page.locator(MOBILE_FIELD_SEL).first();
-    const mobileSwitch = page.locator(MOBILE_SWITCH_SEL).first();
-    const mobileSwitchText = page.getByText(/show\s+login\s+with\s+mobile/i).first();
-
-    let mobileFieldReady = false;
-    try {
-      await Promise.race([
-        mobileField.waitFor({ state: 'visible', timeout: 30_000 }).then(() => { mobileFieldReady = true; }),
-        mobileSwitch.waitFor({ state: 'visible', timeout: 30_000 }),
-        mobileSwitchText.waitFor({ state: 'visible', timeout: 30_000 }),
-      ]);
-    } catch {
-      console.warn('[Dhan] Neither mobile field nor mobile-switch button appeared in 30s.');
-      await dumpDiagnostics(page, 'qr-screen');
-      console.warn('[Dhan] Please complete login manually — copy the diagnostic above so we can fix selectors.');
-      return;
-    }
-
-    if (!mobileFieldReady) {
-      try {
-        const switchTarget = await mobileSwitch.isVisible().catch(() => false)
-          ? mobileSwitch
-          : mobileSwitchText;
-        await switchTarget.scrollIntoViewIfNeeded().catch(() => {});
-        await switchTarget.click();
-        console.log('[Dhan] ✓ Switched from QR to Mobile Number login');
-        await mobileField.waitFor({ state: 'visible', timeout: 15_000 });
-        mobileFieldReady = true;
-      } catch (e) {
-        console.warn('[Dhan] Clicked mobile-switch but mobile field never appeared:', (e as Error).message);
-        await dumpDiagnostics(page, 'after-switch');
-        return;
-      }
-    }
-
-    if (!mobileFieldReady) {
-      console.warn('[Dhan] Mobile field not ready — aborting.');
-      await dumpDiagnostics(page, 'mobile-not-ready');
-      return;
-    }
-
-    // ── Step 2: Enter Mobile Number ───────────────────────────────────────────
-    const mobile = (creds.username || '').replace(/\D/g, '').slice(-10);
-    if (mobile.length !== 10) {
-      console.warn(`[Dhan] Stored mobile number has ${creds.username.length} characters, not 10 digits — proceeding anyway.`);
-    }
-
-    try {
-      await mobileField.click();
-      await mobileField.fill(mobile || creds.username);
-      console.log('[Dhan] ✓ Mobile number filled');
-    } catch (e) {
-      console.warn('[Dhan] Could not fill mobile field:', (e as Error).message);
-      await dumpDiagnostics(page, 'mobile-fill-fail');
-      return;
-    }
-
-    // ── Click Continue (after mobile) ─────────────────────────────────────────
-    if (await clickPrimary(page, ['Continue', 'CONTINUE', 'Next', 'Get OTP', 'Send OTP', 'Proceed'])) {
-      console.log('[Dhan] ✓ Clicked Continue after mobile');
-    } else {
-      // Some pages auto-advance on Enter
-      await page.keyboard.press('Enter').catch(() => {});
-      console.log('[Dhan] ✓ Pressed Enter after mobile');
-    }
-
-    // ── Step 2: Wait for OTP or PIN screen ───────────────────────────────────
-    console.log('[Dhan] ⏳ Waiting for OTP or PIN screen…');
-    const otpProbe = page.locator([
-      'input[autocomplete="one-time-code"]',
-      'input[name="otp"]',
-      'input[id*="otp" i]',
-      'input[placeholder*="OTP" i]',
-      'input[maxlength="1"]',
-      'input[maxlength="6"]',
-    ].join(', ')).first();
-    const pinProbe = page.locator([
-      'input[type="password"]',
-      'input[name="pin"]',
-      'input[id*="pin" i]',
-      'input[placeholder*="PIN" i]',
-      'input[placeholder*="MPIN" i]',
-    ].join(', ')).first();
-
-    let nextStep: 'otp' | 'pin' | 'logged-in' = 'otp';
-
-    try {
-      await Promise.race([
-        otpProbe.waitFor({ state: 'visible', timeout: 60_000 }).then(() => {
-          nextStep = 'otp';
-        }),
-        pinProbe.waitFor({ state: 'visible', timeout: 60_000 }).then(() => {
-          nextStep = 'pin';
-        }),
-        waitForDhanDashboard(page, 60_000).then((ready) => {
-          if (ready) nextStep = 'logged-in';
-          else throw new Error('dashboard-not-ready');
-        })
-      ]);
-      await page.waitForTimeout(150);
-      if (nextStep === 'otp') {
-        console.log('[Dhan] ✓ OTP screen detected');
-      } else if (nextStep === 'pin') {
-        console.log('[Dhan] ✓ PIN screen detected without a separate OTP step');
-      } else {
-        console.log('[Dhan] ✓ Logged in without an OTP/PIN prompt:', page.url());
-        console.log('[Dhan] Browser remains open for IPO application.');
-        return;
-      }
-    } catch {
-      console.warn('[Dhan] Neither OTP nor PIN screen appeared — login may have failed or selectors changed.');
-      await dumpDiagnostics(page, 'post-mobile');
-      return;
-    }
-
-    // ── Fetch OTP from Gmail and fill, if needed ─────────────────────────────
-    if (nextStep === 'otp') {
-      try {
-        const otp = await otpOrManual(page, fetchOtp, 'Dhan', otpPromptOnPage(page));
-        if (!otp) {
-          console.log('[Dhan] OTP step finished in the browser (or timed out) — continuing.');
-        } else {
-          console.log(`[Dhan] ✓ OTP received (${otp.length} digits)`);
-          const filled = await fillDigits(page, otp, 'OTP');
-          if (!filled) {
-            console.warn('[Dhan] Could not find OTP input(s) to fill.');
-            return;
-          }
-
-          // OTP screen often auto-advances on 6 digits; click Submit if present
-          if (await clickPrimary(page, ['Verify', 'Submit', 'Continue', 'Confirm'])) {
-            console.log('[Dhan] ✓ OTP submitted');
-          } else {
-            await page.keyboard.press('Enter').catch(() => {});
-            console.log('[Dhan] ✓ Pressed Enter to submit OTP');
-          }
-        }
-      } catch (e: any) {
-        const msg: string = e?.message ?? String(e);
-        if (msg.includes('OTP_TIMEOUT') || msg.includes('OTP_CANCELLED')) {
-          console.warn('[Dhan] OTP entry was cancelled or timed out.');
-        } else {
-          console.warn('[Dhan] OTP step failed:', msg);
-        }
-        return;
-      }
-    }
-
-    // ── Step 3: Wait for PIN screen ───────────────────────────────────────────
-    console.log('[Dhan] ⏳ Waiting for PIN screen…');
-    const pinWaitProbe = page.locator([
-      'input[type="password"]',
-      'input[name="pin"]',
-      'input[id*="pin" i]',
-      'input[placeholder*="PIN" i]',
-      'input[placeholder*="MPIN" i]',
-      'input[autocomplete="one-time-code"]',
-      'input[maxlength="1"]',
-    ].join(', ')).first();
-
-    try {
-      await pinWaitProbe.waitFor({ state: 'visible', timeout: 30_000 });
-      await page.waitForTimeout(150);
-      console.log('[Dhan] ✓ PIN screen detected');
-    } catch {
-      console.warn('[Dhan] PIN screen did not appear — Dhan may have logged in directly.');
-      return;
-    }
-
-    // ── Fill PIN ──────────────────────────────────────────────────────────────
-    try {
-      const pin = (creds.password || '').replace(/\D/g, '');
-      const filled = await fillDigits(page, pin, 'PIN');
-      if (!filled) {
-        console.warn('[Dhan] Could not find PIN input(s) to fill.');
-        return;
-      }
-
-      if (await clickPrimary(page, ['Login', 'LOGIN', 'Sign In', 'Continue', 'Submit'])) {
-        console.log('[Dhan] ✓ PIN submitted');
-      } else {
-        await page.keyboard.press('Enter').catch(() => {});
-        console.log('[Dhan] ✓ Pressed Enter to submit PIN');
-      }
-    } catch (e) {
-      console.warn('[Dhan] PIN step failed:', (e as Error).message);
-      return;
-    }
-
-    // ── Step 4: Wait for post-login redirect ─────────────────────────────────
-    // After PIN, Dhan typically redirects to web.dhan.co (the trading app).
-    try {
-      const ready = await waitForDhanDashboard(page, 20_000);
-      if (ready) {
-        console.log('[Dhan] ✓ Post-login dashboard detected:', page.url());
-      } else {
-        console.warn('[Dhan] Post-login redirect not detected within 20s. Balance fetch may fail.');
-      }
-    } catch {
-      console.warn('[Dhan] Post-login redirect check failed. Balance fetch may fail.');
-    }
-
-    console.log('[Dhan] Browser remains open for IPO application.');
+    await dhanLogin(page, creds, fetchOtp, WEB_TARGET);
   },
+
 
   async fetchBalance(page: Page): Promise<string | null> {
     const t0 = Date.now();
@@ -478,7 +514,7 @@ export const dhanAdapter: LoginAdapter = {
     const t0 = Date.now();
     await dhanAdapter.login(page, creds, fetchOtp);
 
-    const journalPage = await ensureDhanJournalHoldingsPage(page);
+    const journalPage = await ensureDhanJournalHoldingsPage(page, creds, fetchOtp);
     const asOfDate = (await readDhanJournalDate(journalPage)) || todayIso();
     await ensureDhanHoldingsTab(journalPage);
     const downloadStartedAt = Date.now();
@@ -555,9 +591,20 @@ async function fetchDhanTabValue(page: Page, opts: {
   return value;
 }
 
-async function ensureDhanJournalHoldingsPage(page: Page): Promise<Page> {
+async function ensureDhanJournalHoldingsPage(
+  page: Page,
+  creds: LoginCredentials,
+  fetchOtp: () => Promise<string>,
+): Promise<Page> {
   try {
     await page.goto(JOURNAL_HOLDINGS_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await page.waitForTimeout(1_500);
+    // Journal has its own session: it bounces to login.dhan.co/?location=DH_JOURNAL.
+    if (/login\.dhan\.co/i.test(page.url())) {
+      console.log('[Dhan] Journal by Dhan needs its own login — logging in there.');
+      await dhanLogin(page, creds, fetchOtp, JOURNAL_TARGET);
+      await page.goto(JOURNAL_HOLDINGS_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
+    }
     // isDhanJournalHoldingsReady already waits up to 8s polling — no need for
     // an additional fixed sleep here.
     if (await isDhanJournalHoldingsReady(page)) {
