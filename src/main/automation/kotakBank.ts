@@ -3,27 +3,30 @@
  *
  * Login URL  : https://netbanking.kotak.bank.in/knb2/  (was netbanking.kotak.com)
  *
- * CONFIRMED FLOW (from DOM diagnostics):
- *   Step 1 — CRN page:
- *     • Active field : input#credentialInputField  (placeholder "CRN, Username or Card number")
- *     • "Next" button exists but is HIDDEN (visible:false). It is triggered by
- *       pressing Enter in the CRN field, NOT by a visible button click.
- *     • "Secure login" is visible but disabled at this step (no password yet).
- *   Step 2 — Password page (appears after Enter on CRN):
- *     • Password field appears in DOM
- *     • "Secure login" becomes enabled once password is valid
- *   Step 3 — OTP page
+ * CURRENT FLOW (checked live 2026-10-08, single screen):
+ *   • input#userName            label "CRN, Username or Card Number"
+ *   • input#credentialInputField label "Password" — a type="text" box masked by
+ *                                the apppasswordmask directive, so it is NOT an
+ *                                input[type=password]
+ *   • "Secure login" button, then OTP.
  *
- *   KEY FINDINGS:
- *   - fill() keeps Angular in ng-pristine — must use keyboard.type()
- *   - #userName is NOT the active field; typing there doesn't register
- *   - Enter key in CRN field triggers the hidden "Next" submission
+ * The 2025 layout was two-step (CRN in #credentialInputField, Enter, then a
+ * password box). On the new page that put the CRN into the password box and
+ * waited for a password field that never comes — the 2026-10-03 failure.
+ * The old path is kept as a fallback for when #userName is not visible.
+ *
+ *   - fill() leaves Angular inputs ng-pristine, so keys are typed.
+ *
+ * Kotak accounts in this app are loan / overdraft accounts: fetchBalance
+ * returns "Withdrawable: ₹x | Outstanding: ₹y", and the dashboard keeps Kotak
+ * out of the savings totals.
  *
  * otpMode = 'email'
  */
 
 import { Page, Locator } from 'playwright';
 import { gotoFirstReachable, LoginAdapter, LoginCredentials } from './browser';
+import { balanceLabelLines, formatKotakLoanBalance, parseKotakLoanText } from './kotakLoan';
 
 // kotak.com currently redirects to the RBI .bank.in domain (verified
 // 2026-09-26; #credentialInputField unchanged). Go there directly so the
@@ -89,9 +92,12 @@ async function typeIntoAngular(
     await page.keyboard.type(text, { delay: 80 });
     await page.waitForTimeout(400);
 
+    // Accept "has a value and Angular no longer flags it invalid": Playwright
+    // typing can leave the control ng-pristine while ng-valid (seen live).
     const dirty = await page.evaluate((sel: string) => {
       const el = document.querySelector<HTMLInputElement>(sel);
-      return !!el && el.value.length > 0 && !el.className.includes('ng-pristine');
+      if (!el || el.value.length === 0) return false;
+      return !el.className.includes('ng-pristine') || el.className.includes('ng-valid');
     }, selector);
 
     if (dirty) {
@@ -136,6 +142,39 @@ async function clickByText(page: Page, textRegex: RegExp, label: string): Promis
   return false;
 }
 
+/** 2025 layout: CRN in #credentialInputField, Enter, then a password box. */
+async function legacyTwoStepLogin(page: Page, crn: string, password: string): Promise<void> {
+  console.log('[Kotak] #userName not visible — using the older two-step login.');
+  const crnOk = await typeIntoAngular(page, 'input#credentialInputField', crn, 'CRN');
+  if (crnOk) {
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(2000);
+  } else {
+    console.warn('[Kotak] CRN not accepted. ⏳ Please type CRN manually, then press Enter.');
+  }
+
+  const PASSWORD_SEL = [
+    'input[type="password"]',
+    'input[formcontrolname="password"]',
+    'input[id*="pass" i]',
+    'input[placeholder*="Password" i]',
+  ].join(', ');
+  try {
+    await page.locator(PASSWORD_SEL).first().waitFor({ state: 'visible', timeout: 90_000 });
+  } catch {
+    console.warn('[Kotak] Password field never appeared within 90s.');
+    await dumpInputs(page, 'Legacy flow, no password field');
+    return;
+  }
+  const passOk = await typeIntoAngular(page, PASSWORD_SEL, password, 'Password');
+  if (passOk) {
+    await page.waitForTimeout(400);
+    if (!await clickByText(page, /Secure\s*login/i, 'Secure login')) {
+      console.warn('[Kotak] Could not click "Secure login". ⏳ Please click it manually.');
+    }
+  }
+}
+
 // ── Adapter ───────────────────────────────────────────────────────────────────
 
 export const kotakAdapter: LoginAdapter = {
@@ -148,76 +187,28 @@ export const kotakAdapter: LoginAdapter = {
     await page.waitForTimeout(2500);
 
     const crn = creds.customerId || creds.username;
+    const singleScreen = await page.locator('input#userName').isVisible({ timeout: 5_000 }).catch(() => false);
 
-    // ── Step 1: Enter CRN ────────────────────────────────────────────────────
-    // The active field is #credentialInputField. #userName is in the DOM but
-    // its Angular form is inactive — typing there doesn't register.
-    const crnOk = await typeIntoAngular(
-      page,
-      'input#credentialInputField',
-      crn,
-      'CRN',
-    );
+    if (singleScreen) {
+      // ── Current layout: CRN + password on one screen ──────────────────────
+      const crnOk = await typeIntoAngular(page, 'input#userName', crn, 'CRN');
+      const passOk = await typeIntoAngular(page, 'input#credentialInputField', creds.password, 'Password');
+      await dumpInputs(page, 'After CRN + password');
+      await dumpButtons(page, 'Buttons after CRN + password');
 
-    if (!crnOk) {
-      console.warn('[Kotak] CRN not accepted. ⏳ Please type CRN manually, then press Enter.');
-    }
-
-    await dumpInputs(page, 'After CRN entry');
-    await dumpButtons(page, 'Buttons after CRN entry');
-
-    // ── Step 1b: Submit CRN via Enter key ─────────────────────────────────────
-    // The "Next" button is HIDDEN (visible:false). Pressing Enter in the CRN
-    // field triggers the same Angular form action, sending CRN to the server.
-    if (crnOk) {
-      await page.keyboard.press('Enter');
-      console.log('[Kotak] ✓ Pressed Enter to submit CRN');
-      await page.waitForTimeout(2000);
-    } else {
-      console.warn('[Kotak] Waiting up to 90s for manual CRN entry + Enter…');
-    }
-
-    // ── Step 2: Wait for password field ──────────────────────────────────────
-    // After CRN is validated server-side, the password field appears on the
-    // same page (Angular conditional rendering). Give 90s to cover manual flow.
-    const PASSWORD_SEL = [
-      'input[type="password"]',
-      'input[formcontrolname="password"]',
-      'input[id*="pass" i]',
-      'input[placeholder*="Password" i]',
-    ].join(', ');
-
-    let passVisible = false;
-    try {
-      await page.locator(PASSWORD_SEL).first().waitFor({ state: 'visible', timeout: 90_000 });
-      passVisible = true;
-      console.log('[Kotak] ✓ Password field appeared');
-    } catch {
-      console.warn('[Kotak] Password field never appeared within 90s.');
-    }
-
-    await dumpInputs(page, 'After Enter / before password');
-    await dumpButtons(page, 'Buttons before password entry');
-
-    if (!passVisible) {
-      console.warn('[Kotak] Skipping to OTP detection — complete steps manually if needed.');
-    } else {
-      // ── Step 2b: Enter password ─────────────────────────────────────────────
-      const passOk = await typeIntoAngular(page, PASSWORD_SEL, creds.password, 'Password');
-
-      await dumpInputs(page, 'After password entry');
-      await dumpButtons(page, 'Buttons after password entry');
-
-      if (!passOk) {
-        console.warn('[Kotak] Password not accepted. ⏳ Please type password manually, then click "Secure login".');
+      if (!crnOk || !passOk) {
+        console.warn('[Kotak] CRN or password not accepted. ⏳ Please fix the fields and click "Secure login".');
       } else {
-        // ── Step 2c: Click "Secure login" ────────────────────────────────────
         await page.waitForTimeout(400);
-        const loginClicked = await clickByText(page, /Secure\s*login/i, 'Secure login');
-        if (!loginClicked) {
-          console.warn('[Kotak] Could not click "Secure login". ⏳ Please click it manually.');
+        const secure = page.locator('button').filter({ hasText: /Secure\s*login/i }).first();
+        const enabled = await secure.isEnabled({ timeout: 3_000 }).catch(() => false);
+        if (!(enabled && await clickByText(page, /Secure\s*login/i, 'Secure login'))) {
+          console.warn('[Kotak] "Secure login" is still disabled — pressing Enter in the password box.');
+          await page.locator('input#credentialInputField').press('Enter').catch(() => {});
         }
       }
+    } else {
+      await legacyTwoStepLogin(page, crn, creds.password);
     }
 
     // ── Step 3: Wait for OTP screen (up to 3 minutes) ────────────────────────
@@ -269,25 +260,25 @@ export const kotakAdapter: LoginAdapter = {
 
   async fetchBalance(page: Page): Promise<string | null> {
     try {
-      await page.waitForTimeout(3000);
-      const balance = await page.evaluate((): string | null => {
-        const text = (document.body as HTMLElement).innerText || '';
-        // Paise optional, but then Indian comma grouping is required, so a
-        // whole-rupee balance ("₹2,00,000") is read while dates/account numbers aren't.
-        const AMT = '(\\d{1,3}(?:,\\d{2,3})+(?:\\.\\d{1,2})?|\\d+\\.\\d{1,2})';
-        for (const re of [
-          new RegExp(`Available\\s+Balance[\\s\\S]{0,40}?₹?\\s*${AMT}`, 'i'),
-          new RegExp(`Avail(?:able)?\\.?\\s*Bal(?:ance)?\\.?[\\s\\S]{0,40}?₹?\\s*${AMT}`, 'i'),
-          new RegExp(`₹\\s*${AMT}`),
-          new RegExp(`Rs\\.?\\s*${AMT}`, 'i'),
-        ]) {
-          const m = text.match(re);
-          if (m?.[1]) return '₹' + m[1];
+      // The dashboard fills its account tiles a moment after the OTP step.
+      let text = '';
+      for (let i = 0; i < 6; i += 1) {
+        await page.waitForTimeout(2000);
+        text = await page.evaluate(() => (document.body as HTMLElement).innerText || '').catch(() => '');
+        const parsed = parseKotakLoanText(text);
+        if (parsed.withdrawable && parsed.outstanding) break;
+      }
+      const loan = parseKotakLoanText(text);
+      const balance = formatKotakLoanBalance(loan);
+      if (balance) {
+        console.log('[Kotak] ✓ Loan balance fetched:', balance);
+        if (!loan.withdrawable || !loan.outstanding) {
+          console.warn('[Kotak] Only part of the loan balance was found. Labels on page:', JSON.stringify(balanceLabelLines(text)));
         }
-        return null;
-      });
-      if (balance) console.log('[Kotak] ✓ Balance fetched:', balance);
-      return balance;
+        return balance;
+      }
+      console.warn('[Kotak] No withdrawable/outstanding amount found. Labels on page:', JSON.stringify(balanceLabelLines(text)));
+      return null;
     } catch (e: any) {
       console.warn('[Kotak] Balance fetch error:', e?.message ?? e);
       return null;

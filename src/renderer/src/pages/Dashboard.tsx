@@ -399,7 +399,17 @@ function describeDocumentDraft(doc: MemberDocumentDraft): string {
   return 'No softcopy uploaded yet.';
 }
 
-interface BalanceParts { savings: number; deposit: number; }
+interface BalanceParts {
+  savings: number;
+  deposit: number;
+  /** Loan / overdraft account (Kotak): never counted in savings or FD totals. */
+  loan: boolean;
+  withdrawable: number;
+  outstanding: number;
+}
+
+/** Banks whose accounts in this app are loan / overdraft accounts. */
+const LOAN_BANK_CODES = new Set(['KOTAK']);
 
 /**
  * Split a bank balance string into savings (liquid) and deposit (FD) amounts.
@@ -412,27 +422,44 @@ interface BalanceParts { savings: number; deposit: number; }
  * "Deposit" label  → deposit bucket (FD, Deposit Account Balance, FD Sweep-in)
  * "Savings" label  → savings bucket (Savings Account Balance, Account Balance)
  * Plain ₹X or Withdrawable only → savings bucket (no FD component)
+ *
+ * Kotak (LOAN_BANK_CODES) or any "Outstanding:" string is a loan / overdraft
+ * account: "Withdrawable: ₹x | Outstanding: ₹y" → loan=true, savings=deposit=0,
+ * so it never inflates the savings / FD totals.
  */
-function parseBalanceParts(balance: string | null): BalanceParts {
-  if (!balance) return { savings: 0, deposit: 0 };
+function parseBalanceParts(balance: string | null, bankCode?: string): BalanceParts {
+  const empty: BalanceParts = { savings: 0, deposit: 0, loan: false, withdrawable: 0, outstanding: 0 };
+  const isLoan = (!!bankCode && LOAN_BANK_CODES.has(bankCode)) || /Outstanding\s*:/i.test(balance || '');
+  if (!balance) return { ...empty, loan: isLoan };
 
   const amt = (s: string) => parseFloat(s.replace(/,/g, ''));
 
   // Named-component extraction helpers
   const find = (re: RegExp) => { const m = balance.match(re); return m ? amt(m[1]) : 0; };
 
+  // Loan / overdraft: show what can be drawn and what is owed, but keep it out
+  // of every savings / FD total.
+  if (isLoan) {
+    return {
+      ...empty,
+      loan: true,
+      withdrawable: find(/Withdrawable[^|₹]*:\s*₹\s*([\d,]+(?:\.\d{1,2})?)/i),
+      outstanding: find(/Outstanding[^|₹]*:\s*₹\s*([\d,]+(?:\.\d{1,2})?)/i),
+    };
+  }
+
   const deposit = find(/(?:FD\s*Sweep[\s-]?in|Deposit(?:\s+Account\s+Balance)?)\s*[^|₹]*:\s*₹\s*([\d,]+\.\d{2})/i);
   const savings = find(/(?:Savings(?:\s+Account\s+Balance)?|Account\s+Balance)\s*[^|₹]*:\s*₹\s*([\d,]+\.\d{2})/i);
 
   // If we found at least one named component, trust those values
-  if (savings > 0 || deposit > 0) return { savings, deposit };
+  if (savings > 0 || deposit > 0) return { ...empty, savings, deposit };
 
   // Fallback: if only "Withdrawable" or a bare ₹X.XX, treat entire amount as savings
   const withdrawable = find(/Withdrawable[^|₹]*:\s*₹\s*([\d,]+\.\d{2})/i);
-  if (withdrawable > 0) return { savings: withdrawable, deposit: 0 };
+  if (withdrawable > 0) return { ...empty, savings: withdrawable };
 
   const plain = balance.match(/₹\s*([\d,]+\.\d{2})/);
-  return { savings: plain ? amt(plain[1]) : 0, deposit: 0 };
+  return { ...empty, savings: plain ? amt(plain[1]) : 0 };
 }
 
 interface BrokerBalanceParts { funds: number | null; portfolio: number | null; positions: number | null; }
@@ -479,12 +506,14 @@ function parseBrokerBalance(balance: string | null): BrokerBalanceParts {
 function computeFamilyParts(memberList: Member[]): BalanceParts {
   return memberList.reduce((acc, m) => {
     m.banks.forEach(b => {
-      const p = parseBalanceParts(b.balance);
+      const p = parseBalanceParts(b.balance, b.bank_code);
       acc.savings += p.savings;
       acc.deposit += p.deposit;
+      acc.withdrawable += p.withdrawable;
+      acc.outstanding += p.outstanding;
     });
     return acc;
-  }, { savings: 0, deposit: 0 });
+  }, { savings: 0, deposit: 0, loan: false, withdrawable: 0, outstanding: 0 });
 }
 
 /** Format a number in Indian Rupee notation: ₹2,08,141.37 */
@@ -2905,8 +2934,14 @@ export default function Dashboard() {
   /** Grand savings + deposit totals across all families (fetched balances only). */
   const grandParts = families.reduce<BalanceParts>((acc, f) => {
     const p = computeFamilyParts(members[f.id] || []);
-    return { savings: acc.savings + p.savings, deposit: acc.deposit + p.deposit };
-  }, { savings: 0, deposit: 0 });
+    return {
+      ...acc,
+      savings: acc.savings + p.savings,
+      deposit: acc.deposit + p.deposit,
+      withdrawable: acc.withdrawable + p.withdrawable,
+      outstanding: acc.outstanding + p.outstanding,
+    };
+  }, { savings: 0, deposit: 0, loan: false, withdrawable: 0, outstanding: 0 });
 
   function LogoThumb({ kind, code }: { kind: 'bank' | 'broker'; code: string }) {
     const [failed, setFailed] = useState(false);
@@ -3096,7 +3131,7 @@ export default function Dashboard() {
                       <td colSpan={3} className="account-empty-cell">No bank accounts saved</td>
                     </tr>
                   ) : visibleBanks.map(bank => {
-                    const parts = parseBalanceParts(bank.balance);
+                    const parts = parseBalanceParts(bank.balance, bank.bank_code);
                     return (
                       <tr key={bank.id}>
                         <td>
@@ -3130,7 +3165,19 @@ export default function Dashboard() {
                                   <strong>{formatTableAmount(parts.deposit)}</strong>
                                 </span>
                               )}
-                              {parts.savings === 0 && parts.deposit === 0 && (
+                              {parts.loan && parts.withdrawable > 0 && (
+                                <span className="account-inline-metric savings" title="Loan / overdraft: amount you can still draw (not counted in savings totals)">
+                                  <span>Avail</span>
+                                  <strong>{formatTableAmount(parts.withdrawable)}</strong>
+                                </span>
+                              )}
+                              {parts.loan && parts.outstanding > 0 && (
+                                <span className="account-inline-metric deposit" title="Loan / overdraft: amount outstanding" style={{ color: 'var(--danger)' }}>
+                                  <span>O/S</span>
+                                  <strong>{formatTableAmount(parts.outstanding)}</strong>
+                                </span>
+                              )}
+                              {parts.savings === 0 && parts.deposit === 0 && !(parts.loan && (parts.withdrawable > 0 || parts.outstanding > 0)) && (
                                 <span className="account-inline-metric savings">
                                   <span>Bal</span>
                                   <strong>{formatTableAmountText(bank.balance)}</strong>
@@ -3690,7 +3737,8 @@ export default function Dashboard() {
                 m.banks.forEach(b => {
                   if (!b.has_password) return;
                   if (b.balance !== null) {
-                    const p = parseBalanceParts(b.balance);
+                    const p = parseBalanceParts(b.balance, b.bank_code);
+                    if (p.loan) return; // loan / overdraft accounts don't count toward the family minimum
                     bmRows.push({ member: m.full_name, bank: b.bank_code, savings: p.savings, deposit: p.deposit, fetchedAt: b.balance_fetched_at });
                   } else {
                     missingBal.push({ member: m.full_name, bank: b.bank_code });
@@ -6002,7 +6050,7 @@ function SpreadsheetView({
           banks[code] = {
             hasAccount: !!acc,
             balance: acc?.balance || null,
-            parts: parseBalanceParts(acc?.balance || ''),
+            parts: parseBalanceParts(acc?.balance || '', code),
           };
         }
         const brokers: SpreadsheetRow['brokers'] = {};
@@ -6129,9 +6177,10 @@ function SpreadsheetView({
                 {allBankCodes.map(code => {
                   const cell = r.banks[code];
                   if (!cell.hasAccount) return <td key={`b-${code}`} className="muted-cell">—</td>;
-                  const sum = cell.parts.savings + cell.parts.deposit;
+                  const sum = cell.parts.loan ? cell.parts.withdrawable : cell.parts.savings + cell.parts.deposit;
                   return (
-                    <td key={`b-${code}`} className="num mono-cell" title={cell.balance || 'No balance fetched'}>
+                    <td key={`b-${code}`} className="num mono-cell" title={cell.balance || 'No balance fetched'}
+                      style={cell.parts.loan ? { color: 'var(--text-2)', fontStyle: 'italic' } : undefined}>
                       {sum > 0 ? formatTableAmount(sum) : (cell.balance ? '·' : '—')}
                     </td>
                   );
