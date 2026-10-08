@@ -176,6 +176,61 @@ async function legacyTwoStepLogin(page: Page, crn: string, password: string): Pr
   }
 }
 
+/** Click every visible "View balance" / eye toggle. Returns how many were clicked. */
+async function revealKotakBalances(page: Page): Promise<number> {
+  let clicked = 0;
+  for (let pass = 0; pass < 6; pass += 1) {
+    const target = page.locator('button, a, [role="button"], span, div')
+      .filter({ hasText: /^\s*View\s+balance\s*$/i })
+      .filter({ visible: true })
+      .last(); // innermost match
+    if (!(await target.count().catch(() => 0))) break;
+    const ok = await target.click({ timeout: 3000 }).then(() => true).catch(() => false);
+    if (!ok) break;
+    clicked += 1;
+    await page.waitForTimeout(1200);
+  }
+  if (clicked) console.log(`[Kotak] Clicked "View balance" ${clicked} time(s).`);
+  return clicked;
+}
+
+async function waitForKotakAmounts(
+  page: Page,
+  readBody: () => Promise<string>,
+  complete: (t: string) => boolean,
+): Promise<string> {
+  let text = '';
+  for (let i = 0; i < 8; i += 1) {
+    text = await readBody();
+    if (complete(text)) break;
+    await page.waitForTimeout(1000);
+  }
+  return text;
+}
+
+/** Log what the page shows around balances, digits masked, so labels can be tuned. */
+async function logKotakBalanceDiagnostics(page: Page, text: string, reason: string): Promise<void> {
+  const nodes = await page.evaluate(() => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const el of Array.from(document.querySelectorAll<HTMLElement>('body *'))) {
+      if (el.children.length > 3) continue;
+      const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!t || t.length > 90 || seen.has(t)) continue;
+      if (!/₹|rs\.?|inr|balance|outstanding|available|limit|loan|due|withdraw|overdraft|unavailable|amount/i.test(t)) continue;
+      const r = el.getBoundingClientRect();
+      if (!r.width || !r.height) continue;
+      seen.add(t);
+      out.push(`${el.tagName.toLowerCase()}: ${t.replace(/\d/g, '#')}`);
+      if (out.length >= 40) break;
+    }
+    return out;
+  }).catch(() => [] as string[]);
+  console.warn(`[Kotak] ${reason}. url=${page.url().replace(/[?#].*$/, '')}`);
+  console.warn('[Kotak] Labels on page:', JSON.stringify(balanceLabelLines(text)));
+  console.warn('[Kotak] Balance-related elements:', JSON.stringify(nodes));
+}
+
 // ── Adapter ───────────────────────────────────────────────────────────────────
 
 export const kotakAdapter: LoginAdapter = {
@@ -265,24 +320,44 @@ export const kotakAdapter: LoginAdapter = {
 
   async fetchBalance(page: Page): Promise<string | null> {
     try {
-      // The dashboard fills its account tiles a moment after the OTP step.
+      const readBody = () => page.evaluate(() => (document.body as HTMLElement).innerText || '').catch(() => '');
+      const complete = (t: string) => { const p = parseKotakLoanText(t); return !!(p.withdrawable && p.outstanding); };
+
+      // The dashboard fills its tiles a moment after the OTP step.
       let text = '';
-      for (let i = 0; i < 6; i += 1) {
+      for (let i = 0; i < 4; i += 1) {
         await page.waitForTimeout(2000);
-        text = await page.evaluate(() => (document.body as HTMLElement).innerText || '').catch(() => '');
-        const parsed = parseKotakLoanText(text);
-        if (parsed.withdrawable && parsed.outstanding) break;
+        text = await readBody();
+        if (complete(text) || /view\s+balance/i.test(text)) break;
       }
+
+      // Amounts are masked behind "View balance" (seen 2026-10-08: the page
+      // showed only "Loans", "Unavailable", "View balance").
+      if (!complete(text)) {
+        const clicked = await revealKotakBalances(page);
+        if (clicked) text = await waitForKotakAmounts(page, readBody, complete);
+      }
+
+      // Still nothing: open the Loans section and reveal there.
+      if (!complete(text)) {
+        const opened = await clickByText(page, /^\s*Loans?\s*$/i, 'Loans')
+          || await page.getByText(/^\s*Loans\s*$/i).first().click({ timeout: 3000 }).then(() => true).catch(() => false);
+        if (opened) {
+          console.log('[Kotak] Opened the Loans section.');
+          await page.waitForTimeout(3000);
+          await revealKotakBalances(page);
+          text = await waitForKotakAmounts(page, readBody, complete);
+        }
+      }
+
       const loan = parseKotakLoanText(text);
       const balance = formatKotakLoanBalance(loan);
       if (balance) {
         console.log('[Kotak] ✓ Loan balance fetched:', balance);
-        if (!loan.withdrawable || !loan.outstanding) {
-          console.warn('[Kotak] Only part of the loan balance was found. Labels on page:', JSON.stringify(balanceLabelLines(text)));
-        }
+        if (!loan.withdrawable || !loan.outstanding) await logKotakBalanceDiagnostics(page, text, 'Only part of the loan balance was found');
         return balance;
       }
-      console.warn('[Kotak] No withdrawable/outstanding amount found. Labels on page:', JSON.stringify(balanceLabelLines(text)));
+      await logKotakBalanceDiagnostics(page, text, 'No withdrawable/outstanding amount found');
       return null;
     } catch (e: any) {
       console.warn('[Kotak] Balance fetch error:', e?.message ?? e);

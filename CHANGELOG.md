@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.13
+
+- Kotak balance: click "View balance" to unmask the amounts (and open Loans if needed) before reading Withdrawable / Outstanding. On failure, the log lists the balance-related labels on the page with digits masked.
+
 ## 0.3.12
 
 - Removed CAPTCHA auto-solving (no Anthropic API key or usage tracking) and the in-app OTP popup. You type the CAPTCHA in the bank window. OTPs come from Gmail/TOTP when available; otherwise a banner asks you to type the OTP in the bank window.
