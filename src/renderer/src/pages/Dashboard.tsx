@@ -347,6 +347,28 @@ function parseDbTime(value: string | null | undefined): number {
   return new Date(normalized).getTime();
 }
 
+/**
+ * A broker's portfolio figure can come from two places: the "Portfolio:" part
+ * of the last login balance fetch, or the last downloaded holdings report.
+ * Show whichever is newer — before, the login value always won, so a fresh
+ * report download changed neither the figure nor the "updated" time.
+ */
+function latestBrokerPortfolio(
+  balancePortfolio: number | null,
+  balanceAt: string | null | undefined,
+  reportPortfolio: number | null | undefined,
+  reportAt: string | null | undefined,
+): { value: number | null; updatedAt: string | null } {
+  const bt = parseDbTime(balanceAt);
+  const rt = parseDbTime(reportAt);
+  const reportNewer = Number.isFinite(rt) && (!Number.isFinite(bt) || rt >= bt);
+  const value = reportNewer
+    ? (reportPortfolio ?? balancePortfolio ?? null)
+    : (balancePortfolio ?? reportPortfolio ?? null);
+  const updatedAt = reportNewer ? (reportAt ?? null) : (balanceAt ?? reportAt ?? null);
+  return { value, updatedAt };
+}
+
 function formatAge(iso: string | null): string {
   if (!iso) return '';
   const parsed = parseDbTime(iso);
@@ -3080,8 +3102,9 @@ export default function Dashboard() {
                     </tr>
                   ) : visibleBrokers.map(broker => {
                     const bp = parseBrokerBalance(broker.balance);
-                    const portfolioValue = bp.portfolio ?? broker.portfolio_value ?? null;
-                    const brokerUpdatedAt = broker.balance_fetched_at || broker.portfolio_fetched_at || null;
+                    const latest = latestBrokerPortfolio(bp.portfolio, broker.balance_fetched_at, broker.portfolio_value, broker.portfolio_fetched_at);
+                    const portfolioValue = latest.value;
+                    const brokerUpdatedAt = latest.updatedAt;
                     return (
                       <tr key={broker.id}>
                         <td>
@@ -5814,7 +5837,7 @@ function SpreadsheetView({
           brokers[code] = {
             hasAccount: !!acc,
             balance: acc?.balance || null,
-            portfolio: bp.portfolio ?? acc?.portfolio_value ?? null,
+            portfolio: latestBrokerPortfolio(bp.portfolio, acc?.balance_fetched_at, acc?.portfolio_value, acc?.portfolio_fetched_at).value,
           };
         }
         const totalSavings = Object.values(banks).reduce((acc, b) => acc + b.parts.savings, 0);
