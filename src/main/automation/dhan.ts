@@ -32,7 +32,6 @@ import { DownloadedBrokerReport, LoginAdapter, LoginCredentials, resolveBrowserD
 const LOGIN_URL = 'https://login.dhan.co/?location=DH_WEB';
 const DHAN_DASHBOARD_URL_RE = /^https:\/\/web\.dhan\.co(\/|$)/i;
 const JOURNAL_HOLDINGS_URL = 'https://journal.dhan.co/holdings';
-const JOURNAL_HOLDINGS_RE = /^https:\/\/journal\.dhan\.co\/holdings(?:[/?#]|$)/i;
 
 /**
  * Where a login lands. Dhan Web and Journal by Dhan are separate sessions:
@@ -60,6 +59,13 @@ async function waitForDhanDashboard(page: Page, timeout = 20_000, doneRe: RegExp
  * Dump a list of visible buttons, inputs, and links on the current page —
  * helps debug when our selectors don't match Dhan's actual DOM.
  */
+/** One tagged log line with the start of the page text (digits masked). */
+async function dumpDhanPageText(page: Page, label: string): Promise<void> {
+  const text = await page.evaluate(() => (document.body as HTMLElement | null)?.innerText || '').catch(() => '');
+  const snippet = text.replace(/\s+/g, ' ').replace(/\d/g, '#').slice(0, 700);
+  console.log(`[Dhan][debug:${label}] url = ${page.url().replace(/[?#].*$/, '')} | text: ${snippet}`);
+}
+
 async function dumpDiagnostics(page: Page, label: string): Promise<void> {
   try {
     const info = await page.evaluate(() => {
@@ -611,6 +617,26 @@ async function ensureDhanJournalHoldingsPage(
       console.log('[Dhan] Journal holdings opened directly:', page.url());
       return page;
     }
+    // Logged in to the Journal but the holdings route didn't settle: try the
+    // Journal's own Holdings link, and record what the page shows (2026-10-08:
+    // login succeeded, then this check failed with no trace of the page).
+    if (/^https:\/\/journal\.dhan\.co/i.test(page.url())) {
+      await dumpDhanPageText(page, 'journal-after-login');
+      if (await clickAny(page, [
+        page.getByRole('link', { name: /^\s*holdings\s*$/i }).first(),
+        page.getByRole('tab', { name: /^\s*holdings\s*$/i }).first(),
+        page.getByRole('button', { name: /^\s*holdings\s*$/i }).first(),
+        page.getByText(/^\s*holdings\s*$/i).first(),
+      ])) {
+        await page.waitForTimeout(1_500);
+        if (await isDhanJournalHoldingsReady(page)) {
+          console.log('[Dhan] Journal holdings opened via its Holdings link:', page.url());
+          return page;
+        }
+      }
+      await dumpDiagnostics(page, 'journal-holdings-not-ready');
+      await dumpDhanPageText(page, 'journal-holdings-not-ready');
+    }
   } catch (e) {
     console.warn('[Dhan] Direct journal holdings open failed:', (e as Error).message);
   }
@@ -666,14 +692,14 @@ async function ensureDhanHoldingsTab(page: Page): Promise<void> {
 }
 
 async function isDhanJournalHoldingsReady(page: Page): Promise<boolean> {
-  if (!JOURNAL_HOLDINGS_RE.test(page.url())) return false;
+  // Any Journal page that shows holdings with a way to export them. The old
+  // check also required the words "Investment" and "Current value" and the
+  // exact /holdings path, which no longer matched after the Journal login.
+  if (!/^https:\/\/journal\.dhan\.co/i.test(page.url())) return false;
   try {
     return await page.waitForFunction(() => {
       const text = (document.body as HTMLElement | null)?.innerText || '';
-      return /holdings/i.test(text)
-        && /investment/i.test(text)
-        && /current value/i.test(text)
-        && /(excel|xlsx|csv)/i.test(text);
+      return /holdings/i.test(text) && /(excel|xlsx|csv|download|export)/i.test(text);
     }, { timeout: 8_000, polling: 250 }).then(() => true).catch(() => false);
   } catch {
     return false;
@@ -690,6 +716,8 @@ async function triggerDhanHoldingsDownload(page: Page): Promise<Download> {
     page.getByRole('link', { name: /xlsx/i }).first(),
     page.getByText(/^csv$/i).first(),
     page.getByRole('button', { name: /^csv$/i }).first(),
+    page.getByRole('button', { name: /download|export/i }).first(),
+    page.getByRole('link', { name: /download|export/i }).first(),
   ];
 
   for (const candidate of candidates) {
