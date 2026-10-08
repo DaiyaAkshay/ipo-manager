@@ -81,3 +81,29 @@ export function balanceLabelLines(text: string): string[] {
     .map(l => l.replace(/\d/g, '#'))
     .slice(0, 25);
 }
+
+/** 1234567.8 → "12,34,567.80" (Indian digit grouping). */
+export function formatInrAmount(value: number): string {
+  const [int, dec] = Math.abs(value).toFixed(2).split('.');
+  const last3 = int.slice(-3);
+  const rest = int.slice(0, -3).replace(/\B(?=(\d{2})+(?!\d))/g, ',');
+  return `${value < 0 ? '-' : ''}${rest ? `${rest},${last3}` : last3}.${dec}`;
+}
+
+/**
+ * Cells read from the "Withdrawable" column of Accounts/Deposits →
+ * Savings / Current account ("815567.96", no ₹ or commas). Sums every account
+ * row; ignores anything that isn't a plain amount (headers, "Unable to fetch",
+ * account numbers without a decimal point). Null when no amount was found.
+ */
+export function sumWithdrawableCells(cells: string[]): string | null {
+  let total = 0;
+  let found = 0;
+  for (const raw of cells) {
+    const t = raw.replace(/[₹\s]/g, '').replace(/^INR/i, '');
+    if (!/^-?[\d,]*\d\.\d{1,2}$/.test(t)) continue; // amounts always carry paise here
+    total += Number(t.replace(/,/g, ''));
+    found += 1;
+  }
+  return found ? formatInrAmount(total) : null;
+}

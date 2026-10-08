@@ -27,7 +27,7 @@
 import { Page, Locator } from 'playwright';
 import { otpOrManual } from './manualStep';
 import { gotoFirstReachable, LoginAdapter, LoginCredentials } from './browser';
-import { balanceLabelLines, formatKotakLoanBalance, parseKotakLoanText } from './kotakLoan';
+import { balanceLabelLines, formatKotakLoanBalance, parseKotakLoanText, sumWithdrawableCells } from './kotakLoan';
 
 // kotak.com currently redirects to the RBI .bank.in domain (verified
 // 2026-09-26; #credentialInputField unchanged). Go there directly so the
@@ -208,6 +208,72 @@ async function waitForKotakAmounts(
   return text;
 }
 
+/**
+ * Open Accounts/Deposits → "Savings / Current account" and sum the cells under
+ * the "Withdrawable" heading. Column found by geometry (cells horizontally
+ * under the heading, below it, in the same card), so it works for <table> and
+ * div-based grids alike.
+ */
+async function readKotakWithdrawableColumn(page: Page): Promise<{ amount: string | null; pageText: string }> {
+  const nav = page.getByText(/^\s*Accounts\s*\/\s*Deposits\s*$/i).first();
+  if (await nav.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await nav.click({ timeout: 4000 }).catch(() => {});
+    console.log('[Kotak] Opened Accounts/Deposits.');
+    await page.waitForTimeout(2500);
+  }
+  const tab = page.getByText(/^\s*Savings\s*\/\s*Current\s+account\s*$/i).first();
+  if (await tab.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await tab.click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+  await revealKotakBalances(page);
+
+  let cells: string[] = [];
+  for (let i = 0; i < 8 && !cells.length; i += 1) {
+    cells = await page.evaluate(() => {
+      const visible = (el: Element) => {
+        const r = el.getBoundingClientRect();
+        const st = window.getComputedStyle(el as HTMLElement);
+        return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+      };
+      const headers = Array.from(document.querySelectorAll<HTMLElement>('body *'))
+        .filter(el => visible(el) && (el.innerText || '').trim().toLowerCase() === 'withdrawable');
+      // Innermost header elements; take the lowest one on the page — the
+      // Savings / Current table sits below the overdraft summary row.
+      const header = headers
+        .filter(h => !headers.some(o => o !== h && h.contains(o)))
+        .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0];
+      if (!header) return [];
+      const hr = header.getBoundingClientRect();
+      // Smallest ancestor that also holds something below the header.
+      let box: HTMLElement | null = header.parentElement;
+      while (box && box !== document.body) {
+        if (box.getBoundingClientRect().bottom > hr.bottom + 20) break;
+        box = box.parentElement;
+      }
+      const scope = box || document.body;
+      const left = hr.left - 30, right = hr.right + 30;
+      const out: string[] = [];
+      for (const el of Array.from(scope.querySelectorAll<HTMLElement>('*'))) {
+        if (!visible(el) || el.children.length > 0) continue;
+        const r = el.getBoundingClientRect();
+        const cx = r.left + r.width / 2;
+        if (r.top <= hr.bottom || cx < left || cx > right || r.top > hr.bottom + 600) continue;
+        const t = (el.innerText || el.textContent || '').trim();
+        if (t) out.push(t);
+      }
+      return out;
+    }).catch(() => [] as string[]);
+    if (!cells.length) await page.waitForTimeout(1000);
+  }
+
+  const amount = sumWithdrawableCells(cells);
+  if (amount) console.log(`[Kotak] Withdrawable column: ${cells.length} cell(s) read.`);
+  else console.warn(`[Kotak] Withdrawable column not read (${cells.length} cell(s) under the heading).`);
+  const pageText = await page.evaluate(() => (document.body as HTMLElement).innerText || '').catch(() => '');
+  return { amount, pageText };
+}
+
 /** Log what the page shows around balances, digits masked, so labels can be tuned. */
 async function logKotakBalanceDiagnostics(page: Page, text: string, reason: string): Promise<void> {
   const nodes = await page.evaluate(() => {
@@ -338,30 +404,22 @@ export const kotakAdapter: LoginAdapter = {
         if (clicked) text = await waitForKotakAmounts(page, readBody, complete);
       }
 
-      // The overdraft sits under "Banking Accounts (INR)" with a negative
-      // balance (the outstanding). The amount still available to draw is on
-      // the account's own page, so open the Banking Accounts tile for it.
-      // (The "Loans" menu is Kotak's loan-products list — not useful.)
+      // Outstanding: the overdraft's negative balance on the dashboard
+      // (confirmed correct by the owner 2026-10-08).
+      // Withdrawable: Accounts/Deposits → "Savings / Current account" table,
+      // "Withdrawable" column (plain "815567.96", no ₹/commas). Read by column
+      // position — the text matcher would grab the account number there.
       const dashboard = parseKotakLoanText(text);
-      let details = { withdrawable: null as string | null, outstanding: null as string | null };
-      let detailsText = '';
-      if (!dashboard.withdrawable) {
-        const opened = await page.locator('app-summary-asset').first().click({ timeout: 4000 }).then(() => true).catch(() => false)
-          || await page.getByText(/Banking\s+Accounts\s*\(INR\)/i).first().click({ timeout: 4000 }).then(() => true).catch(() => false);
-        if (opened) {
-          console.log('[Kotak] Opened Banking Accounts for the available amount.');
-          await page.waitForTimeout(3000);
-          await revealKotakBalances(page);
-          detailsText = await waitForKotakAmounts(page, readBody, t => !!parseKotakLoanText(t).withdrawable);
-          details = parseKotakLoanText(detailsText);
-        }
+      let withdrawable = dashboard.withdrawable;
+      let accountsText = '';
+      if (!withdrawable) {
+        const res = await readKotakWithdrawableColumn(page);
+        withdrawable = res.amount;
+        accountsText = res.pageText;
       }
 
-      const loan = {
-        withdrawable: dashboard.withdrawable ?? details.withdrawable,
-        outstanding: dashboard.outstanding ?? details.outstanding,
-      };
-      if (detailsText && !loan.withdrawable) text = detailsText; // diagnose the page we ended on
+      const loan = { withdrawable, outstanding: dashboard.outstanding };
+      if (accountsText && !loan.withdrawable) text = accountsText; // diagnose the page we ended on
       const balance = formatKotakLoanBalance(loan);
       if (balance) {
         console.log('[Kotak] ✓ Loan balance fetched:', balance);

@@ -597,19 +597,29 @@ async function fetchDhanTabValue(page: Page, opts: {
   return value;
 }
 
+/** Navigate without failing on a slow load event; give the SPA time to render. */
+async function gotoLoose(page: Page, url: string): Promise<void> {
+  await page.goto(url, { waitUntil: 'commit', timeout: 30_000 }).catch((e) => {
+    console.warn('[Dhan] Navigation to', url, 'was slow:', (e as Error).message.split('\n')[0]);
+  });
+  await page.waitForLoadState('domcontentloaded', { timeout: 20_000 }).catch(() => {});
+}
+
 async function ensureDhanJournalHoldingsPage(
   page: Page,
   creds: LoginCredentials,
   fetchOtp: () => Promise<string>,
 ): Promise<Page> {
   try {
-    await page.goto(JOURNAL_HOLDINGS_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    // 'domcontentloaded' timed out at 45s on the Journal (2026-10-08) and the
+    // whole step was abandoned. Wait for the response only, then check the page.
+    await gotoLoose(page, JOURNAL_HOLDINGS_URL);
     await page.waitForTimeout(1_500);
     // Journal has its own session: it bounces to login.dhan.co/?location=DH_JOURNAL.
     if (/login\.dhan\.co/i.test(page.url())) {
       console.log('[Dhan] Journal by Dhan needs its own login — logging in there.');
       await dhanLogin(page, creds, fetchOtp, JOURNAL_TARGET);
-      await page.goto(JOURNAL_HOLDINGS_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
+      await gotoLoose(page, JOURNAL_HOLDINGS_URL);
     }
     // isDhanJournalHoldingsReady already waits up to 8s polling — no need for
     // an additional fixed sleep here.

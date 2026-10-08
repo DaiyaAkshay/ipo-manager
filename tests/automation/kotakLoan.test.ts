@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { balanceLabelLines, formatKotakLoanBalance, parseKotakLoanText } from '../../src/main/automation/kotakLoan';
+import { balanceLabelLines, formatInrAmount, formatKotakLoanBalance, parseKotakLoanText, sumWithdrawableCells } from '../../src/main/automation/kotakLoan';
 
 describe('parseKotakLoanText', () => {
   it('reads withdrawable and outstanding on separate lines', () => {
@@ -51,5 +51,19 @@ describe('balanceLabelLines', () => {
     expect(balanceLabelLines('Total Outstanding\n₹1,234.00\nHello\nAvailable Limit 5000')).toEqual([
       'Total Outstanding', 'Available Limit ####',
     ]);
+  });
+});
+
+describe('sumWithdrawableCells', () => {
+  it('reads the Withdrawable column of the Savings / Current table (live 2026-10-08 layout)', () => {
+    expect(sumWithdrawableCells(['815567.96'])).toBe('8,15,567.96');
+  });
+  it('sums several accounts and ignores non-amounts', () => {
+    expect(sumWithdrawableCells(['1000.50', 'Unable to fetch', '3813163924', '₹2,000.00', ''])).toBe('3,000.50');
+    expect(sumWithdrawableCells(['Withdrawable', '—'])).toBeNull();
+  });
+  it('formats Indian grouping', () => {
+    expect(formatInrAmount(1008858.04)).toBe('10,08,858.04');
+    expect(formatInrAmount(512)).toBe('512.00');
   });
 });

@@ -31,7 +31,16 @@ import { DownloadedBrokerReport, LoginAdapter, LoginCredentials, resolveBrowserD
 
 const LOGIN_URL = 'https://trade.angelone.in/';
 
+// Angel's web app moved to www.angelone.in/trade/tradeone/* (seen 2026-10-08:
+// after MPIN it lands on /trade/tradeone/chart). These sub-paths are the
+// likely equivalents; the old trade.angelone.in routes stay as fallbacks, and
+// navigateOrClick tries the visible Funds / Holdings / Positions tabs first.
+const TRADEONE = 'https://www.angelone.in/trade/tradeone';
+
 const ANGEL_PORTFOLIO_URLS = [
+  `${TRADEONE}/portfolio/holdings`,
+  `${TRADEONE}/holdings`,
+  `${TRADEONE}/portfolio`,
   'https://trade.angelone.in/portfolio',
   'https://trade.angelone.in/holdings',
   'https://trade.angelone.in/portfolio/holdings',
@@ -128,7 +137,7 @@ async function detectStep(page: Page, hint: StepHint = null): Promise<LoginStep>
     // WEAK signals (the word "PIN" alone — could be either depending on context).
     const hasWeakPinText = /\bpin\b|enter\s+(?:your\s+|the\s+)?pin/i.test(text) && !hasStrongOtpText;
 
-    const insideApp = /\/(dashboard|home|watchlist|portfolio|holdings|positions|funds|orders|order-book|markets|investments|account)(?:[/?#]|$)/i.test(path);
+    const insideApp = /\/(dashboard|home|watchlist|portfolio|holdings|positions|funds|orders|order-book|markets|investments|account|chart|tradeone)(?:[/?#]|$)/i.test(path);
     const dashboardText = /(get\s+ready\s+to\s+invest|watchlist|holdings|positions|net\s+worth|markets|news\s+discovery|open\s+ipo)/i.test(text);
 
     // 1) Dashboard wins if URL is inside the app AND there's no login form.
@@ -767,7 +776,7 @@ export const angelAdapter: LoginAdapter = {
     page = await findAngelPage(context, page);
     if (await navigateOrClick(
       page,
-      ['https://trade.angelone.in/funds', 'https://trade.angelone.in/account/funds', 'https://trade.angelone.in/portfolio/funds'],
+      [`${TRADEONE}/funds`, `${TRADEONE}/account/funds`, 'https://trade.angelone.in/funds', 'https://trade.angelone.in/account/funds', 'https://trade.angelone.in/portfolio/funds'],
       ['Funds', 'Fund', 'Cash', 'Margin'],
       /fund|margin|cash/i,
     )) {
@@ -810,7 +819,7 @@ export const angelAdapter: LoginAdapter = {
     page = await findAngelPage(context, page);
     if (await navigateOrClick(
       page,
-      ['https://trade.angelone.in/positions', 'https://trade.angelone.in/portfolio/positions', 'https://trade.angelone.in/order-and-trades/positions'],
+      [`${TRADEONE}/positions`, `${TRADEONE}/portfolio/positions`, 'https://trade.angelone.in/positions', 'https://trade.angelone.in/portfolio/positions', 'https://trade.angelone.in/order-and-trades/positions'],
       ['Positions', 'Position'],
       /position/i,
     )) {
@@ -844,6 +853,8 @@ export const angelAdapter: LoginAdapter = {
 
     // Navigate to portfolio/holdings
     if (!await navigateOrClick(page, ANGEL_PORTFOLIO_URLS, ['Holdings', 'Portfolio'], /holding|portfolio/i)) {
+      console.warn(`[Angel One] Portfolio / holdings page not found from ${safeUrl(page)}`);
+      await dumpDiagnostics(page, 'portfolio-page-missing');
       throw new Error('Angel One portfolio / holdings page not found');
     }
     await page.waitForTimeout(1_500);
