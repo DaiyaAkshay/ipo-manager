@@ -2,10 +2,11 @@
  * Kotak loan / overdraft balance parsing — pure, no Playwright imports, so it
  * is unit-tested in tests/automation/kotakLoan.test.ts.
  *
- * The logged-in Kotak page has not been captured yet, so the labels below are
- * the usual net-banking wordings for a loan/OD account. kotakBank.ts logs the
- * label lines it saw when nothing matches, so the list can be tightened from
- * a real run.
+ * Seen live 2026-10-08: the owner's Kotak account is an overdraft that the
+ * dashboard lists under "Banking Accounts (INR)" with a NEGATIVE balance
+ * ("Assets -₹xx,xx,xxx.xx"), while "Liabilities" reads "Unavailable". The
+ * negative balance is the outstanding amount. Explicit loan labels are still
+ * tried first. kotakBank.ts logs the page's labels when something is missing.
  */
 
 const AMOUNT = String.raw`(-?)\s*(?:₹|INR|Rs\.?)?\s*(-?)\s*(\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)\s*(Dr|Cr)?\b`;
@@ -32,22 +33,34 @@ export interface KotakLoanBalance {
   outstanding: string | null;
 }
 
-function findAfterLabel(text: string, labels: string[]): string | null {
+interface Found { amount: string; negative: boolean }
+
+function findAfterLabel(text: string, labels: string[]): Found | null {
   for (const label of labels) {
     // Label, up to 60 non-digit characters (":", newline, "₹" …), then the amount.
-    const re = new RegExp(`(?:${label})[^\\d₹\\n]{0,40}\\n?[^\\d₹]{0,20}${AMOUNT}`, 'i');
+    const re = new RegExp(`(?:${label})[^\\d₹\\n-]{0,40}\\n?[^\\d₹-]{0,20}${AMOUNT}`, 'i');
     const m = text.match(re);
-    if (m?.[3]) return m[3];
+    if (m?.[3]) return { amount: m[3], negative: m[1] === '-' || m[2] === '-' || /^dr$/i.test(m[4] || '') };
   }
   return null;
 }
 
+/** Overdraft shown as a negative banking balance: "Banking Accounts (INR) … -₹x". */
+function negativeBankingBalance(text: string): string | null {
+  const AMT = String.raw`(\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)`;
+  const m = text.match(new RegExp(String.raw`Banking\s+Accounts[^₹]{0,80}?-\s*₹\s*` + AMT, 'i'))
+    || text.match(new RegExp(String.raw`Assets\s*-\s*₹\s*` + AMT, 'i'));
+  return m?.[1] ?? null;
+}
+
 export function parseKotakLoanText(text: string): KotakLoanBalance {
   const flat = text.replace(/ /g, ' ');
-  return {
-    withdrawable: findAfterLabel(flat, WITHDRAWABLE_LABELS),
-    outstanding: findAfterLabel(flat, OUTSTANDING_LABELS),
-  };
+  const w = findAfterLabel(flat, WITHDRAWABLE_LABELS);
+  const o = findAfterLabel(flat, OUTSTANDING_LABELS);
+  // A negative "Available balance" on an OD is money owed, not money available.
+  const withdrawable = w && !w.negative ? w.amount : null;
+  const outstanding = o?.amount ?? (w?.negative ? w.amount : null) ?? negativeBankingBalance(flat);
+  return { withdrawable, outstanding };
 }
 
 /** "Withdrawable: ₹x | Outstanding: ₹y" — the format the dashboard parses. */

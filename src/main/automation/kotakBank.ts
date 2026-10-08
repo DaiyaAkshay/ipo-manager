@@ -338,19 +338,30 @@ export const kotakAdapter: LoginAdapter = {
         if (clicked) text = await waitForKotakAmounts(page, readBody, complete);
       }
 
-      // Still nothing: open the Loans section and reveal there.
-      if (!complete(text)) {
-        const opened = await clickByText(page, /^\s*Loans?\s*$/i, 'Loans')
-          || await page.getByText(/^\s*Loans\s*$/i).first().click({ timeout: 3000 }).then(() => true).catch(() => false);
+      // The overdraft sits under "Banking Accounts (INR)" with a negative
+      // balance (the outstanding). The amount still available to draw is on
+      // the account's own page, so open the Banking Accounts tile for it.
+      // (The "Loans" menu is Kotak's loan-products list — not useful.)
+      const dashboard = parseKotakLoanText(text);
+      let details = { withdrawable: null as string | null, outstanding: null as string | null };
+      let detailsText = '';
+      if (!dashboard.withdrawable) {
+        const opened = await page.locator('app-summary-asset').first().click({ timeout: 4000 }).then(() => true).catch(() => false)
+          || await page.getByText(/Banking\s+Accounts\s*\(INR\)/i).first().click({ timeout: 4000 }).then(() => true).catch(() => false);
         if (opened) {
-          console.log('[Kotak] Opened the Loans section.');
+          console.log('[Kotak] Opened Banking Accounts for the available amount.');
           await page.waitForTimeout(3000);
           await revealKotakBalances(page);
-          text = await waitForKotakAmounts(page, readBody, complete);
+          detailsText = await waitForKotakAmounts(page, readBody, t => !!parseKotakLoanText(t).withdrawable);
+          details = parseKotakLoanText(detailsText);
         }
       }
 
-      const loan = parseKotakLoanText(text);
+      const loan = {
+        withdrawable: dashboard.withdrawable ?? details.withdrawable,
+        outstanding: dashboard.outstanding ?? details.outstanding,
+      };
+      if (detailsText && !loan.withdrawable) text = detailsText; // diagnose the page we ended on
       const balance = formatKotakLoanBalance(loan);
       if (balance) {
         console.log('[Kotak] ✓ Loan balance fetched:', balance);

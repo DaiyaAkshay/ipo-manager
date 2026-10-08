@@ -21,6 +21,17 @@ describe('parseKotakLoanText', () => {
     expect(r.outstanding).toBe('9,999.00');
   });
 
+  it('reads an overdraft shown as a negative banking balance (live 2026-10-08 layout)', () => {
+    const text = 'Assets\n-₹12,34,567.89\nBanking Accounts (INR)\n1 PRIMARY . 1 JOINT\n-₹12,34,567.89\nLiabilities\nUnavailable';
+    expect(parseKotakLoanText(text)).toEqual({ withdrawable: null, outstanding: '12,34,567.89' });
+  });
+
+  it('treats a negative available balance as outstanding, a positive one as withdrawable', () => {
+    expect(parseKotakLoanText('Available Balance\n-₹50,000.00')).toEqual({ withdrawable: null, outstanding: '50,000.00' });
+    expect(parseKotakLoanText('Available Balance\n₹1,50,000.00\nBanking Accounts (INR) -₹3,50,000.00'))
+      .toEqual({ withdrawable: '1,50,000.00', outstanding: '3,50,000.00' });
+  });
+
   it('returns nulls when nothing matches', () => {
     expect(parseKotakLoanText('Welcome back\nLast login 12:30')).toEqual({ withdrawable: null, outstanding: null });
   });
