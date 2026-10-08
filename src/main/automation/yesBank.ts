@@ -2,25 +2,42 @@
  * YES Bank NetBanking login adapter.
  *
  * Login URL  : https://yesonline.yes.bank.in/  (RBI .bank.in domain). The old
- *              netbanking.yesbank.in stopped resolving (verified 2026-09-26),
- *              so every YES login failed at the first navigation.
- * Step 1     : input#txtUserName  (Customer ID / Login ID)
- * Password   : input#txtPassword
- * Submit     : button or input[type="submit"] on the form
+ *              netbanking.yesbank.in stopped resolving (verified 2026-09-26).
+ *              The page is an Oracle JET app that redirects itself to
+ *              index.html?module=login after load.
+ * Login ID   : input[name="username"]  (id "login_username|input", visible)
+ * Password   : input[name="password"]  (id "login_password|input", visible)
+ * Submit     : "LOGIN" button
+ *
+ * Checked live 2026-10-08: the page also carries HIDDEN autofill decoys
+ * #username / #password (class "hide"). They come first in the DOM, so a broad
+ * selector + .first() picked the hidden box and the Login ID was never typed.
+ * Every locator here is restricted to :visible for that reason.
  *
  * After submit YES Bank sends an OTP to the registered email (and mobile).
  * This adapter fetches the OTP from Gmail automatically.
  *
- * Selectors to verify: Open https://netbanking.yesbank.in/ in DevTools
- * and inspect the actual element IDs/names before first use.
- *
  * otpMode = 'email'  (default)
  */
 
-import { Page } from 'playwright';
+import { Locator, Page } from 'playwright';
 import { gotoFirstReachable, LoginAdapter, LoginCredentials } from './browser';
 
 const LOGIN_URLS = ['https://yesonline.yes.bank.in/', 'https://netbanking.yesbank.in/'];
+
+/**
+ * Oracle JET inputs update their bound value on input/change and validate on
+ * blur. fill() sets the value but some JET builds keep the old (empty) value
+ * until a key event arrives, so type it and blur. Falls back to fill().
+ */
+async function typeIntoJet(field: Locator, value: string): Promise<void> {
+  await field.click({ timeout: 5_000 }).catch(() => {});
+  await field.fill('');
+  await field.pressSequentially(value, { delay: 40 });
+  if ((await field.inputValue().catch(() => '')) !== value) await field.fill(value);
+  await field.dispatchEvent('change').catch(() => {});
+  await field.blur().catch(() => {});
+}
 
 export const yesBankAdapter: LoginAdapter = {
   code: 'YES',
@@ -30,23 +47,25 @@ export const yesBankAdapter: LoginAdapter = {
   async login(page: Page, creds: LoginCredentials, fetchOtp: () => Promise<string>): Promise<void> {
     // ── Navigate ─────────────────────────────────────────────────────────────
     await gotoFirstReachable(page, LOGIN_URLS, { label: 'YES Bank' });
-    await page.waitForTimeout(2000);
+    // The JET shell redirects to ?module=login and renders the form late.
+    await page.waitForURL(/module=login/i, { timeout: 20_000 }).catch(() => {});
+    await page.waitForTimeout(1500);
 
     // ── Fill Customer ID / Login ID ──────────────────────────────────────────
     try {
       const userField = page.locator([
+        'input[name="username"]',
+        'input[id^="login_username"]',
         'input#txtUserName',
         'input[name="txtUserName"]',
         'input[placeholder*="Customer ID" i]',
         'input[placeholder*="Login ID" i]',
-        'input[placeholder*="User ID" i]',
         'input[name*="user" i]:not([type="hidden"])',
         'input[id*="user" i]:not([type="hidden"])',
-        'input[type="text"]',
-      ].join(', ')).first();
-      await userField.waitFor({ state: 'visible', timeout: 15_000 });
-      await userField.fill(creds.username);
-      console.log('[YES Bank] ✓ Customer ID filled');
+      ].map(sel => `${sel}:visible`).join(', ')).first();
+      await userField.waitFor({ state: 'visible', timeout: 20_000 });
+      await typeIntoJet(userField, creds.username);
+      console.log('[YES Bank] ✓ Login ID filled');
     } catch {
       console.warn('[YES Bank] Could not find username field — check selectors.');
     }
@@ -54,13 +73,13 @@ export const yesBankAdapter: LoginAdapter = {
     // ── Fill Password ─────────────────────────────────────────────────────────
     try {
       const passField = page.locator([
+        'input[name="password"]',
+        'input[id^="login_password"]',
         'input#txtPassword',
-        'input[name="txtPassword"]',
         'input[type="password"]',
-        'input[placeholder*="Password" i]',
-      ].join(', ')).first();
+      ].map(sel => `${sel}:visible`).join(', ')).first();
       await passField.waitFor({ state: 'visible', timeout: 10_000 });
-      await passField.fill(creds.password);
+      await typeIntoJet(passField, creds.password);
       console.log('[YES Bank] ✓ Password filled');
     } catch {
       console.warn('[YES Bank] Could not find password field — check selectors.');
@@ -69,7 +88,8 @@ export const yesBankAdapter: LoginAdapter = {
     // ── Click Login ───────────────────────────────────────────────────────────
     try {
       const submitBtn = page.locator([
-        'button[type="submit"]',
+        'button:has-text("LOGIN"):visible',
+        'button[type="submit"]:visible',
         'input[type="submit"]',
         'button:has-text("Login")',
         'button:has-text("LOG IN")',
