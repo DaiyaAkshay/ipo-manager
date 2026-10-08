@@ -99,3 +99,30 @@ SHA-512 and size match the rebuilt installer. Existing build notices about the
 AI usage import/chunk size, default icon and absent signing certificate remain.
 No live vault was opened or modified. Installer installation on a real profile,
 live R2/Gmail/banking integration and physical multi-PC timing are not verified.
+
+## 2026-10-08 — Bank login check; Kotak as a loan account
+
+Every bank login page was opened without signing in. YES and PNB were also
+loaded in the app's own Chrome launch setup. YES serves a blank page to
+bundled Playwright Chromium, but the installed-Chrome setup gets the form.
+Changes:
+
+- YES (Oracle JET): visible `input[name=username]` / `input[name=password]`.
+  The hidden decoys `#username` / `#password` (class `hide`) come first in the
+  DOM. The new locators were checked live with dummy values, without
+  submitting.
+- Kotak: `#userName` is now the CRN box and `#credentialInputField` the
+  password box (masked `type=text`). The 2026-10-03 log shows the 11-character
+  CRN in the password box. "Secure login" stayed disabled with dummy values;
+  if real values also leave it disabled, the adapter presses Enter.
+- PNB: the direct `iretail.pnb.bank.in` login URL. The landing link uses
+  `target=_blank`.
+- HDFC, ICICI, Axis, BoB and SBI (YONO) selectors still match their live
+  pages. Nothing past the first screen was checked for any bank.
+
+Kotak accounts are treated as loan/overdraft accounts on the owner's
+instruction (`LOAN_BANK_CODES` in Dashboard.tsx). The logged-in Kotak page has
+not been seen. `automation/kotakLoan.ts` accepts common labels (Withdrawable,
+Available Limit, Drawing Power / Outstanding, Principal Outstanding, Utilised)
+and logs the page's label lines with digits masked when a value is missing.
+

@@ -372,8 +372,15 @@ export function createRetailBankAdapter(config: RetailBankConfig): LoginAdapter 
       await gotoFirstReachable(page, urls, { label: config.displayName });
       await page.waitForTimeout(1_500);
 
+      // Only click a "Retail users" style link when the login form isn't
+      // already on screen — on a direct login URL that link could navigate away.
       if (config.preLoginSelectors?.length) {
-        await clickFirst(page, config.preLoginSelectors, config.displayName);
+        // Bank-specific selectors only: the generic list ends in a catch-all
+        // input[type=text] that a landing-page search box would satisfy.
+        const formAlreadyThere = config.usernameSelectors?.length
+          ? await firstVisibleEnabled(page, config.usernameSelectors, 3_000)
+          : null;
+        if (!formAlreadyThere) await clickFirst(page, config.preLoginSelectors, config.displayName);
       }
 
       const username = creds.customerId || creds.username;

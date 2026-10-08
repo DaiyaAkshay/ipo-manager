@@ -3,7 +3,13 @@ import { createRetailBankAdapter } from './genericBank';
 export const pnbBankAdapter = createRetailBankAdapter({
   code: 'PNB',
   displayName: 'Punjab National Bank',
-  loginUrl: 'https://ibanking.pnb.bank.in/',
+  // ibanking.pnb.bank.in is a landing page whose "Retail Internet Banking"
+  // link opens the login in a NEW tab (target=_blank), which the adapter never
+  // saw (checked live 2026-10-08). Open the retail login form directly.
+  loginUrl: [
+    'https://iretail.pnb.bank.in/corp/AuthenticationController?FORMSGROUP_ID__=AuthenticationFG&__START_TRAN_FLAG__=Y&__FG_BUTTONS__=LOAD&ACTION.LOAD=Y&AuthenticationFG.LOGIN_FLAG=1&BANK_ID=024',
+    'https://ibanking.pnb.bank.in/',
+  ],
   usernameLabel: 'User ID',
   otpMode: 'manual',
   preLoginSelectors: [

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- YES Bank: type the Login ID and password into the visible fields. The new Oracle JET login page has hidden autofill decoys (#username/#password) that the old selectors picked first, so the Login ID was never entered.
+- Kotak: the login is now one screen. The CRN goes in #userName and the password in #credentialInputField (a masked text box), then "Secure login". The old two-step flow remains as a fallback.
+- Kotak balance is read as a loan/overdraft: "Withdrawable: ₹x | Outstanding: ₹y". Kotak is left out of savings, FD, family minimum-balance and grand totals, and shows Avail / O/S chips.
+- PNB: open the retail login form directly. The landing page's link opens a new tab that the automation never saw. Generic adapters now click a "Retail users" link only when the login form isn't already on screen.
+
 ## 0.3.10
 
 - Merge concurrent bank/broker balance observations per account when all other vault records match; preserve login history from both PCs.
