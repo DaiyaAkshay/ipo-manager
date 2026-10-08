@@ -48,6 +48,7 @@ src/renderer/    — React UI, no Node access
 | `backup/appSettings.ts` | Carries the Gmail setup between PCs as field-key-encrypted `settings/gmail-<ms>.enc` next to the snapshots (newest wins; decision logic pure + tested) |
 | `backup/replicator.ts` + `objectStore.ts` | Cloudflare R2 target: keeps `data/r2-cache` (the engine's root in R2 mode) in step with the bucket; optional extra-copy folder. See `docs/R2_BACKUP.md` |
 | `importer/excel.ts` | SheetJS importer for `Demat_Sheet.xlsx` |
+| `market/intel.ts` + `market/service.ts` | Market Watch (mainboard only): NSE IPO/subscription, GMP (ipowatch, optional), bonus/rights ex-dates, board-meeting proposals, shareholder-quota watchlist (`data/market.json`). Keep `intel.ts` pure — tested in `tests/market` |
 
 ### Preload (`src/preload/index.ts`)
 

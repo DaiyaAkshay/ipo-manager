@@ -1,11 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.3.11
 
 - YES Bank: type the Login ID and password into the visible fields. The new Oracle JET login page has hidden autofill decoys (#username/#password) that the old selectors picked first, so the Login ID was never entered.
 - Kotak: the login is now one screen. The CRN goes in #userName and the password in #credentialInputField (a masked text box), then "Secure login". The old two-step flow remains as a fallback.
 - Kotak balance is read as a loan/overdraft: "Withdrawable: ₹x | Outstanding: ₹y". Kotak is left out of savings, FD, family minimum-balance and grand totals, and shows Avail / O/S chips.
 - PNB: open the retail login form directly. The landing page's link opens a new tab that the automation never saw. Generic adapters now click a "Retail users" link only when the login form isn't already on screen.
+- Market Watch page (sidebar → Tools): open and upcoming NSE mainboard IPOs (SME issues are left out on purpose) with category-wise subscription, unofficial GMP (ipowatch.in, can be switched off), a transparent APPLY / CONSIDER / AVOID / WAIT checklist and rough retail allotment odds.
+- Upcoming bonus, rights and split ex-dates with the last day to buy (T+1), plus board meetings proposing bonus, rights or preferential issues.
+- Shareholder-quota picks: NSE-detected shareholder reservations and a local watchlist (parent symbol, subsidiary IPO, RHP date) that tells you which parent share to buy in each demat and by when. Stored in `data/market.json`, outside the vault; does not sync.
+- AU Bank: reload past the "Session Expired" login interstitial; recognise the new CAPTCHA refresh control; stop the direct `iposmart.au.bank.in` fallback (root is now a 404 and deep links reject without the netbanking hand-off) and report the hand-off error instead; look for the "Service Request" menu.
 
 ## 0.3.10
 

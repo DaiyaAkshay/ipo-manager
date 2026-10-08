@@ -485,6 +485,42 @@ async function handleAuIpoPortalAuth(page: Page, draft: IpoBidDraft): Promise<vo
 }
 
 /**
+ * A stale cookie from a previous run makes /drb/ open on a "Session Expired"
+ * interstitial with no login form. Reloading the login URL clears it (checked
+ * live 2026-10-07); clicking its Login button alone did not.
+ */
+async function recoverAuSessionExpired(page: Page): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const expired = await page.evaluate(() =>
+      /session has expired/i.test((document.body as HTMLElement | null)?.innerText || '')
+      && !document.querySelector('input[type="text"]'),
+    ).catch(() => false);
+    if (!expired) return;
+    appendAutomationLog('AU_LOGIN', `Session-expired interstitial on login page; reloading (attempt ${attempt + 1}).`);
+    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
+    await page.waitForTimeout(2_000);
+  }
+}
+
+/**
+ * IPO Smart (iposmart.au.bank.in, titled "Easba") accepts only the signed
+ * hand-off from netbanking. Opened any other way it lands on
+ * /ipo-onnet-aub/error-view?key=NOT_VALID_HDR_PAYLOAD_MSG ("Not a valid
+ * payload data. Kindly re-login the system."); its bare root is a 404.
+ */
+async function isAuIpoHandoffError(page: Page): Promise<boolean> {
+  if (page.isClosed()) return false;
+  if (/iposmart\.au\.bank\.in\/ipo-onnet-aub\/error-view/i.test(page.url())) return true;
+  return page.evaluate(() =>
+    /not a valid payload|kindly re-login/i.test((document.body as HTMLElement | null)?.innerText || ''),
+  ).catch(() => false);
+}
+
+const AU_HANDOFF_WARNING =
+  'AU IPO Smart rejected the hand-off ("Not a valid payload data"). It only opens from inside netbanking: '
+  + 'log in again, then use the IPO / ASBA menu and click Continue. Direct links to iposmart.au.bank.in no longer work.';
+
+/**
  * Returns true ONLY when the page is showing the actual IPO issue listing
  * table (not the login form, not an error page, not a captcha gate).
  *
@@ -1012,6 +1048,7 @@ async function waitForManualCaptchaSubmit(
 
 async function clickAuCaptchaRefresh(page: Page): Promise<boolean> {
   const selectors = [
+    '.captchareFreshBtn',
     'a:has-text("Refresh")',
     'button:has-text("Refresh")',
     'span:has-text("Refresh")',
@@ -2369,8 +2406,12 @@ async function openAuIpoArea(page: Page, warnings: string[]): Promise<Page | nul
       '[role="button"]:has-text("Services")',
       'a:has-text("e-Services")',
       'button:has-text("e-Services")',
+      // "Service Request" is a top-level destination on the 2026 login page.
+      'a:has-text("Service Request")',
+      'button:has-text("Service Request")',
+      '[role="button"]:has-text("Service Request")',
     ]) || await clickVisibleLabeledTile(page, [
-      'Investments', 'Invest & Trade', 'Invest', 'Investment', 'Services', 'e-Services',
+      'Investments', 'Invest & Trade', 'Invest', 'Investment', 'Services', 'e-Services', 'Service Request',
     ]) || await clickFirstText(page, [
       'Investments', 'Invest & Trade', 'Investment',
     ]);
@@ -2430,13 +2471,13 @@ async function openAuIpoArea(page: Page, warnings: string[]): Promise<Page | nul
     });
 
     if (openedPage) {
-      if (await isAuIpoPage(openedPage)) {
+      if (await isAuIpoHandoffError(openedPage)) {
+        warnings.push(AU_HANDOFF_WARNING);
+        appendAutomationLog('AU_IPO', `Hand-off rejected: ${openedPage.url().replace(/\?.*$/, '')}`);
+      } else if (await isAuIpoPage(openedPage)) {
         await openedPage.bringToFront().catch(() => {});
         console.log('[AU Bank] Opened AU IPO page via dashboard handoff:', openedPage.url());
         return openedPage;
-      }
-      if (openedPage.url().includes('/error-view')) {
-        warnings.push('AU IPO Smart opened an error page. The dashboard handoff token may not have completed.');
       }
     }
 
@@ -2453,44 +2494,22 @@ async function openAuIpoArea(page: Page, warnings: string[]): Promise<Page | nul
     console.warn('[AU Bank] IPO/ASBA sub-menu was not found after opening Investments.');
   }
 
-  // ── Path C: direct URL navigation to the IPO portal ─────────────────────
-  // If both menu paths failed, navigate the current tab directly.
-  // The portal may open on the same tab or in a new popup.
-  console.warn('[AU Bank] Dashboard navigation failed — falling back to direct URL: https://iposmart.au.bank.in/');
-  appendAutomationLog('AU_IPO', 'Dashboard navigation failed; navigating directly to iposmart.au.bank.in.');
+  // ── No direct-URL fallback ──────────────────────────────────────────────
+  // iposmart.au.bank.in only accepts the signed netbanking hand-off (root is
+  // a 404, deep links show "Not a valid payload"), so a goto() here cannot
+  // work. Record what the dashboard offered instead, so the menu labels above
+  // can be updated from the log the next time AU renames them.
+  console.warn('[AU Bank] Dashboard navigation to IPO / ASBA failed; dumping visible menu items.');
+  appendAutomationLog('AU_IPO', 'Dashboard navigation to IPO/ASBA failed; see diagnostics below.');
+  await dumpAuListingDiagnostics(page).catch(() => {});
 
-  try {
-    const directPage = await clickForAuIpoPage(page, async () => {
-      await page.goto('https://iposmart.au.bank.in/', {
-        waitUntil: 'domcontentloaded',
-        timeout: 20_000,
-      }).catch(() => {});
-      return true;
-    });
-
-    if (directPage && await isAuIpoPage(directPage)) {
-      await directPage.bringToFront().catch(() => {});
-      console.log('[AU Bank] Opened AU IPO page via direct URL navigation.');
-      return directPage;
-    }
-  } catch (e) {
-    console.warn('[AU Bank] Direct URL navigation error:', (e as Error).message);
-  }
-
-  // Check if current page is now the IPO portal (even if not yet showing the listing —
-  // handleAuIpoPortalAuth will handle the login gate on iposmart.au.bank.in)
-  const curUrl = page.url().toLowerCase();
-  if (curUrl.includes('iposmart.au.bank.in')) {
-    console.log('[AU Bank] Current page is iposmart.au.bank.in — passing to auth handler.');
-    return page;
-  }
   const finalCheck = await findOpenAuIpoPage(page);
   if (finalCheck) {
     await finalCheck.bringToFront().catch(() => {});
     return finalCheck;
   }
 
-  warnings.push('AU IPO portal could not be opened automatically. Please navigate to iposmart.au.bank.in manually or use the Investments → IPO/ASBA menu.');
+  warnings.push('AU IPO portal could not be opened automatically. In the AU window, open the IPO / ASBA menu yourself and click Continue, then run "Open AU & Prepare" again.');
   return null;
 }
 
@@ -2582,6 +2601,7 @@ export const auBankAdapter: LoginAdapter = {
 
     await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     await page.waitForTimeout(2_000);
+    await recoverAuSessionExpired(page);
 
     try {
       await page.waitForSelector('input[type="text"]', { timeout: 15_000 });
@@ -2944,6 +2964,19 @@ export const auBankAdapter: LoginAdapter = {
     // handleAuIpoPortalAuth reuses the proven trySolveAuCaptcha pipeline
     // that works on the main login page — same Angular-Material form.
     await handleAuIpoPortalAuth(ipoPage, draft).catch(() => {});
+
+    if (await isAuIpoHandoffError(ipoPage)) {
+      if (!warnings.includes(AU_HANDOFF_WARNING)) warnings.push(AU_HANDOFF_WARNING);
+      return {
+        pageUrl: ipoPage.url(),
+        readyToSubmit: false,
+        blockedAmount: draft.blockedAmount,
+        warnings,
+        detectedIssueName: null,
+        detectedDemat: null,
+        detectedAmount: null,
+      };
+    }
 
     const issueRe = issueRegex(draft.issueName);
 

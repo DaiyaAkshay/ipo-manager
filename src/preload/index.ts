@@ -77,6 +77,18 @@ const api = {
     openLatestBrokerPortfolioFolder: (memberId: number, brokerId: number) =>
       ipcRenderer.invoke('broker:openLatestPortfolioFolder', { memberId, brokerId })
   },
+  market: {
+    getSnapshot: (force = false) =>
+      ipcRenderer.invoke('market:getSnapshot', { force }),
+    getSettings: () =>
+      ipcRenderer.invoke('market:getSettings'),
+    setGmpEnabled: (enabled: boolean) =>
+      ipcRenderer.invoke('market:setGmpEnabled', { enabled }),
+    addQuotaWatch: (entry: { parentSymbol: string; ipoName: string; cutoffDate?: string | null; note?: string }) =>
+      ipcRenderer.invoke('market:addQuotaWatch', entry),
+    removeQuotaWatch: (id: string) =>
+      ipcRenderer.invoke('market:removeQuotaWatch', { id }),
+  },
   ipo: {
     getMemberDraftOptions: (memberId: number) =>
       ipcRenderer.invoke('ipo:getMemberDraftOptions', { memberId }),
