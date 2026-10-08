@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.16
+
+- Kotak: Withdrawable comes from Accounts/Deposits → Savings / Current account (Withdrawable column). Outstanding stays the overdraft's negative balance. The dashboard shows both (Avail / O/S).
+- Angel One: the new TradeOne screens (www.angelone.in/trade/tradeone/…) count as logged in. Funds, holdings and positions are looked up there first, and a missing holdings page is logged.
+- Dhan: Journal by Dhan opens without waiting for its slow page-load event. That wait timed out after 45 s and stopped the holdings download.
+
 ## 0.3.15
 
 - Kotak: the overdraft appears under "Banking Accounts (INR)" as a negative balance. That is now read as Outstanding. The app opens the account to look for the available (withdrawable) amount and no longer clicks the Loans products menu.
