@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.17
+
+- Dhan: after the separate Journal by Dhan login, open Holdings from inside the Journal. Jumping straight to the holdings address sent it back to the login page. A remembered device that shows only "Proceed Ahead to Trade" is now clicked through instead of waiting for a mobile-number box.
+- Angel One: funds, holdings and positions use Angel's current web pages (www.angelone.in/trade/account/trading-balance-summary, /trade/portfolio/equity, /trade/orders/positions), taken from Angel's own app. The TradeOne addresses guessed in 0.3.16 don't exist.
+
 ## 0.3.16
 
 - Kotak: Withdrawable comes from Accounts/Deposits → Savings / Current account (Withdrawable column). Outstanding stays the overdraft's negative balance. The dashboard shows both (Avail / O/S).
