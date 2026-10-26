@@ -31,16 +31,17 @@ import { DownloadedBrokerReport, LoginAdapter, LoginCredentials, resolveBrowserD
 
 const LOGIN_URL = 'https://trade.angelone.in/';
 
-// Angel's web app moved to www.angelone.in/trade/tradeone/* (seen 2026-10-08:
-// after MPIN it lands on /trade/tradeone/chart). These sub-paths are the
-// likely equivalents; the old trade.angelone.in routes stay as fallbacks, and
-// navigateOrClick tries the visible Funds / Holdings / Positions tabs first.
-const TRADEONE = 'https://www.angelone.in/trade/tradeone';
+// Angel's web app now lives at www.angelone.in/trade/* (after MPIN it lands on
+// /trade/tradeone/chart, seen 2026-10-08). Routes below are taken from the
+// public app bundle (checked 2026-10-27): portfolio/equity, portfolio/summary,
+// orders/positions, account/trading-balance-summary. TradeOne itself is only
+// the chart / option-chain screen. Old trade.angelone.in routes stay as fallbacks.
+const ANGEL_WEB = 'https://www.angelone.in/trade';
 
 const ANGEL_PORTFOLIO_URLS = [
-  `${TRADEONE}/portfolio/holdings`,
-  `${TRADEONE}/holdings`,
-  `${TRADEONE}/portfolio`,
+  `${ANGEL_WEB}/portfolio/equity`,
+  `${ANGEL_WEB}/portfolio/summary`,
+  `${ANGEL_WEB}/portfolio`,
   'https://trade.angelone.in/portfolio',
   'https://trade.angelone.in/holdings',
   'https://trade.angelone.in/portfolio/holdings',
@@ -776,9 +777,9 @@ export const angelAdapter: LoginAdapter = {
     page = await findAngelPage(context, page);
     if (await navigateOrClick(
       page,
-      [`${TRADEONE}/funds`, `${TRADEONE}/account/funds`, 'https://trade.angelone.in/funds', 'https://trade.angelone.in/account/funds', 'https://trade.angelone.in/portfolio/funds'],
+      [`${ANGEL_WEB}/account/trading-balance-summary`, `${ANGEL_WEB}/account`, 'https://trade.angelone.in/funds', 'https://trade.angelone.in/account/funds', 'https://trade.angelone.in/portfolio/funds'],
       ['Funds', 'Fund', 'Cash', 'Margin'],
-      /fund|margin|cash/i,
+      /fund|margin|cash|trading-balance|\/trade\/account/i,
     )) {
       await waitForAmount(page, 6_000);
       const v = await scrapeValue(page, [
@@ -819,7 +820,7 @@ export const angelAdapter: LoginAdapter = {
     page = await findAngelPage(context, page);
     if (await navigateOrClick(
       page,
-      [`${TRADEONE}/positions`, `${TRADEONE}/portfolio/positions`, 'https://trade.angelone.in/positions', 'https://trade.angelone.in/portfolio/positions', 'https://trade.angelone.in/order-and-trades/positions'],
+      [`${ANGEL_WEB}/orders/positions`, 'https://trade.angelone.in/positions', 'https://trade.angelone.in/portfolio/positions', 'https://trade.angelone.in/order-and-trades/positions'],
       ['Positions', 'Position'],
       /position/i,
     )) {
