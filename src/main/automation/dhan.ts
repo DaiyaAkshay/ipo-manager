@@ -236,14 +236,19 @@ async function dhanLogin(
 
   let mobileFieldReady = false;
   let alreadyIn = false;
+  let resumeSession = false;
   const anyMobileButton = page.getByRole('button', { name: /mobile|phone/i })
     .or(page.getByRole('link', { name: /mobile|phone/i })).first();
+  // Remembered device: login.dhan.co shows only "Proceed Ahead to Trade"
+  // (seen 2026-10-10; logged as the "qr-screen" with 1 button, 0 inputs).
+  const proceedAhead = page.getByRole('button', { name: /proceed\s+ahead/i }).first();
   try {
     await Promise.race([
       mobileField.waitFor({ state: 'visible', timeout: 30_000 }).then(() => { mobileFieldReady = true; }),
       mobileSwitch.waitFor({ state: 'visible', timeout: 30_000 }),
       mobileSwitchText.waitFor({ state: 'visible', timeout: 30_000 }),
       anyMobileButton.waitFor({ state: 'visible', timeout: 30_000 }),
+      proceedAhead.waitFor({ state: 'visible', timeout: 30_000 }).then(() => { resumeSession = true; }),
       // QR scanned on the phone, or logged in by hand / from a cached session.
       page.waitForURL(target.doneRe, { timeout: 30_000 }).then(() => { alreadyIn = true; }),
     ]);
@@ -252,6 +257,17 @@ async function dhanLogin(
     await dumpDiagnostics(page, 'qr-screen');
     console.warn('[Dhan] Please complete login manually — copy the diagnostic above so we can fix selectors.');
     return;
+  }
+
+  if (resumeSession && !mobileFieldReady && !alreadyIn) {
+    await proceedAhead.click({ timeout: 5_000 }).catch(() => {});
+    console.log('[Dhan] Clicked "Proceed Ahead to Trade" (remembered session).');
+    alreadyIn = await waitForDhanDashboard(page, 30_000, target.doneRe);
+    if (!alreadyIn) {
+      console.warn(`[Dhan] "Proceed Ahead" did not reach ${target.label}.`);
+      await dumpDiagnostics(page, 'after-proceed-ahead');
+      return;
+    }
   }
 
   if (alreadyIn || target.doneRe.test(page.url())) {
@@ -605,6 +621,23 @@ async function gotoLoose(page: Page, url: string): Promise<void> {
   await page.waitForLoadState('domcontentloaded', { timeout: 20_000 }).catch(() => {});
 }
 
+/** Click the Journal's own Holdings entry (link, tab, menu or plain text). */
+async function clickJournalHoldings(page: Page): Promise<boolean> {
+  const clicked = await clickAny(page, [
+    page.getByRole('link', { name: /^\s*holdings\s*$/i }).first(),
+    page.getByRole('tab', { name: /^\s*holdings\s*$/i }).first(),
+    page.getByRole('button', { name: /^\s*holdings\s*$/i }).first(),
+    page.getByRole('menuitem', { name: /holdings/i }).first(),
+    page.getByText(/^\s*holdings\s*$/i).first(),
+  ]);
+  if (!clicked) {
+    console.warn('[Dhan] No Holdings link found on the Journal page.');
+    return false;
+  }
+  await page.waitForTimeout(1_500);
+  return isDhanJournalHoldingsReady(page);
+}
+
 async function ensureDhanJournalHoldingsPage(
   page: Page,
   creds: LoginCredentials,
@@ -619,7 +652,11 @@ async function ensureDhanJournalHoldingsPage(
     if (/login\.dhan\.co/i.test(page.url())) {
       console.log('[Dhan] Journal by Dhan needs its own login — logging in there.');
       await dhanLogin(page, creds, fetchOtp, JOURNAL_TARGET);
-      await gotoLoose(page, JOURNAL_HOLDINGS_URL);
+      // Stay on the page the login lands on (journal.dhan.co/?<session params>).
+      // Jumping straight to /holdings from here sent the browser back to the
+      // login page on 2026-10-10 — the Journal seems to set up its session
+      // from that landing URL. Navigate inside the app instead.
+      await page.waitForTimeout(3_000);
     }
     // isDhanJournalHoldingsReady already waits up to 8s polling — no need for
     // an additional fixed sleep here.
@@ -627,22 +664,17 @@ async function ensureDhanJournalHoldingsPage(
       console.log('[Dhan] Journal holdings opened directly:', page.url());
       return page;
     }
-    // Logged in to the Journal but the holdings route didn't settle: try the
-    // Journal's own Holdings link, and record what the page shows (2026-10-08:
-    // login succeeded, then this check failed with no trace of the page).
     if (/^https:\/\/journal\.dhan\.co/i.test(page.url())) {
       await dumpDhanPageText(page, 'journal-after-login');
-      if (await clickAny(page, [
-        page.getByRole('link', { name: /^\s*holdings\s*$/i }).first(),
-        page.getByRole('tab', { name: /^\s*holdings\s*$/i }).first(),
-        page.getByRole('button', { name: /^\s*holdings\s*$/i }).first(),
-        page.getByText(/^\s*holdings\s*$/i).first(),
-      ])) {
-        await page.waitForTimeout(1_500);
-        if (await isDhanJournalHoldingsReady(page)) {
-          console.log('[Dhan] Journal holdings opened via its Holdings link:', page.url());
-          return page;
-        }
+      if (await clickJournalHoldings(page)) {
+        console.log('[Dhan] Journal holdings opened via its Holdings link:', page.url());
+        return page;
+      }
+      // Last try: the direct route, now that the session has had time to settle.
+      await gotoLoose(page, JOURNAL_HOLDINGS_URL);
+      if (await isDhanJournalHoldingsReady(page)) {
+        console.log('[Dhan] Journal holdings opened after login settled:', page.url());
+        return page;
       }
       await dumpDiagnostics(page, 'journal-holdings-not-ready');
       await dumpDhanPageText(page, 'journal-holdings-not-ready');
